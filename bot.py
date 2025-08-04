@@ -54,20 +54,38 @@ REF_TEXT = (
     "Пригласи друзей по ссылке https://t.me/reshalabot?start={id} и получи бонусы."
 )
 
-MAIN_KB = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("Баланс", callback_data="balance"),
-            InlineKeyboardButton("Купить", callback_data="buy"),
-        ],
-        [
-            InlineKeyboardButton("Как это работает", callback_data="how"),
-            InlineKeyboardButton("Рефералы", callback_data="ref"),
-        ],
-    ]
-)
+SUPPORT_TEXT = "Если возникли сложности — пиши @support"
 
 BACK_KB = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
+
+
+def build_main_kb(uid: int) -> InlineKeyboardMarkup:
+    """Главное меню с динамическими подсказками."""
+    free_text = 1 if can_use_daily_text(uid) else 0
+    photos = get_photo_credits(uid)
+    credits = get_credits(uid, ADMIN_IDS)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Текстовый запрос ({free_text})", callback_data="ask_text"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Фото запрос ({photos})", callback_data="ask_photo"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Пополнить счёт ({credits})", callback_data="buy"
+                )
+            ],
+            [InlineKeyboardButton("Как это работает", callback_data="how")],
+            [InlineKeyboardButton("Пригласить друга", callback_data="ref")],
+            [InlineKeyboardButton("Техподдержка", callback_data="support")],
+        ]
+    )
 
 
 def build_balance_text(uid: int) -> str:
@@ -99,7 +117,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             set_referral(uid, parent)
         except ValueError:
             pass
-    await update.message.reply_text(MAIN_TEXT, reply_markup=MAIN_KB)
+    await update.message.reply_text(MAIN_TEXT, reply_markup=build_main_kb(uid))
     ctx.user_data["stage"] = "main"
 
 
@@ -115,7 +133,46 @@ async def buy(update: Update, ctx):
 # ── Обработка текстов и фото ─────────────────────────
 async def handle_text(update: Update, ctx):
     uid = update.effective_user.id
+    stage = ctx.user_data.get("stage")
     text = update.message.text
+
+    # Завершение анализа фото (этап текста)
+    if stage == "await_photo_text":
+        photo_bytes = ctx.user_data.pop("photo_bytes", None)
+        if not photo_bytes:
+            await update.message.reply_text("Сначала пришлите фото.")
+            return
+        if get_photo_credits(uid) > 0:
+            dec_photo_credit(uid)
+        else:
+            if get_credits(uid, ADMIN_IDS) < PHOTO_COST:
+                await update.message.reply_text("Недостаточно баллов. /buy")
+                return
+            dec_credits(uid, PHOTO_COST, ADMIN_IDS)
+        await update.message.chat.send_action("typing")
+        try:
+            resp = await asyncio.to_thread(analyze_photo, photo_bytes, text)
+        except Exception:
+            log.exception("vision error")
+            await update.message.reply_text("Ошибка обработки фото.")
+            return
+        await update.message.reply_text(resp)
+        ctx.user_data["stage"] = "main"
+        await update.message.chat.send_message(
+            MAIN_TEXT, reply_markup=build_main_kb(uid)
+        )
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+
+    # Обычный текстовый запрос
+    if stage != "await_text":
+        await update.message.reply_text(
+            "Используйте кнопку ‘Текстовый запрос’ в меню."
+        )
+        return
     if can_use_daily_text(uid):
         mark_text_used(uid)
     else:
@@ -126,11 +183,15 @@ async def handle_text(update: Update, ctx):
     await update.message.chat.send_action("typing")
     try:
         resp = await asyncio.to_thread(ask_deepseek, text)
-    except Exception as e:
+    except Exception:
         log.exception("deepseek error")
         await update.message.reply_text("Ошибка запроса.")
         return
-    sent = await update.message.reply_text(resp)
+    await update.message.reply_text(resp)
+    ctx.user_data["stage"] = "main"
+    await update.message.chat.send_message(
+        MAIN_TEXT, reply_markup=build_main_kb(uid)
+    )
     try:
         await update.message.delete()
     except Exception:
@@ -139,30 +200,20 @@ async def handle_text(update: Update, ctx):
 
 async def handle_photo(update: Update, ctx):
     uid = update.effective_user.id
-    photo = update.message.photo[-1]
-    caption = update.message.caption or ""
-    if not caption:
-        await update.message.reply_text("Добавь подпись с описанием ситуации.")
+    stage = ctx.user_data.get("stage")
+    if stage != "await_photo":
+        await update.message.reply_text(
+            "Сначала выберите ‘Фото запрос’ в меню."
+        )
         return
+    photo = update.message.photo[-1]
     bio = io.BytesIO()
     file = await photo.get_file()
     await file.download(out=bio)
     bio.seek(0)
-    if get_photo_credits(uid) > 0:
-        dec_photo_credit(uid)
-    else:
-        if get_credits(uid, ADMIN_IDS) < PHOTO_COST:
-            await update.message.reply_text("Недостаточно баллов. /buy")
-            return
-        dec_credits(uid, PHOTO_COST, ADMIN_IDS)
-    await update.message.chat.send_action("typing")
-    try:
-        resp = await asyncio.to_thread(analyze_photo, bio.getvalue(), caption)
-    except Exception:
-        log.exception("vision error")
-        await update.message.reply_text("Ошибка обработки фото.")
-        return
-    sent = await update.message.reply_text(resp)
+    ctx.user_data["photo_bytes"] = bio.getvalue()
+    ctx.user_data["stage"] = "await_photo_text"
+    await update.message.reply_text("Теперь напишите проблему.")
     try:
         await update.message.delete()
     except Exception:
@@ -174,9 +225,30 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
     data = query.data
     uid = query.from_user.id
-    if data == "balance":
-        await query.message.edit_text(build_balance_text(uid), reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "balance"
+    if data == "ask_text":
+        await query.message.delete()
+        credits = get_credits(uid, ADMIN_IDS)
+        free = 1 if can_use_daily_text(uid) else 0
+        msg = (
+            "Рассказывай, в чем проблема, я её решу.\n"
+            f"Стоимость: {TEXT_COST} баллов. Баланс: {credits}.\n"
+            f"Бесплатных текстов сегодня: {free}.\n"
+            "Напишите текст снизу."
+        )
+        await query.message.chat.send_message(msg, reply_markup=BACK_KB)
+        ctx.user_data["stage"] = "await_text"
+    elif data == "ask_photo":
+        await query.message.delete()
+        credits = get_credits(uid, ADMIN_IDS)
+        photos = get_photo_credits(uid)
+        msg = (
+            "Пришли фотографию, я помогу разобраться.\n"
+            f"Стоимость: {PHOTO_COST} баллов. Баланс: {credits}.\n"
+            f"Бесплатных фото: {photos}.\n"
+            "Присылай фотографию."
+        )
+        await query.message.chat.send_message(msg, reply_markup=BACK_KB)
+        ctx.user_data["stage"] = "await_photo"
     elif data == "buy":
         await query.message.edit_text(build_buy_text(), reply_markup=BACK_KB)
         ctx.user_data["stage"] = "buy"
@@ -186,8 +258,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "ref":
         await query.message.edit_text(REF_TEXT.format(id=uid), reply_markup=BACK_KB)
         ctx.user_data["stage"] = "ref"
+    elif data == "support":
+        await query.message.edit_text(SUPPORT_TEXT, reply_markup=BACK_KB)
+        ctx.user_data["stage"] = "support"
     elif data == "back":
-        await query.message.edit_text(MAIN_TEXT, reply_markup=MAIN_KB)
+        await query.message.edit_text(
+            MAIN_TEXT, reply_markup=build_main_kb(uid)
+        )
         ctx.user_data["stage"] = "main"
 
 
