@@ -71,8 +71,9 @@ ADMINS = {
 
 TEXT_COST = 10
 PHOTO_COST = 20
-PRICE_PACKS_RUB = {100: 100_00, 300: 300_00, 500: 500_00}
-PRICE_PACKS_STARS = {100: 55, 300: 170, 500: 280}
+# Ключ словаря — количество баллов, значение — цена
+PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
+PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
 
 MAIN_TEXT = (
     "Я — Решало. Отправь текстовый вопрос или фото с подписью — и я подскажу, как действовать.\n"
@@ -220,7 +221,8 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["stage"] = "pay"
     elif data == "ref":
         alias = await get_alias(uid)
-        link = f"https://t.me/reshalabot?start={alias or uid}"
+        bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
+        link = f"https://t.me/{bot_name}?start={alias or uid}"
         refs = await get_ref_count(uid)
         msg = f"Поделись ссылкой: {link}\nДрузей по ссылке: {refs}"
         await send_menu(q.message.chat, uid, msg, KB_BACK, ctx)
@@ -416,7 +418,8 @@ async def cmd_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     ok = await set_alias(uid, name)
     if ok:
-        link = f"https://t.me/reshalabot?start={name}"
+        bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
+        link = f"https://t.me/{bot_name}?start={name}"
         await update.message.reply_text(f"Ваша ссылка: {link}")
     else:
         await update.message.reply_text("Имя занято")
@@ -484,6 +487,7 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         level=logging.INFO,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     app = (
         Application.builder()
