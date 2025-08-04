@@ -16,7 +16,8 @@ async def create_tables():
               ref_parent    INTEGER    DEFAULT 0,
               text_cnt      INTEGER    DEFAULT 0,
               photo_cnt     INTEGER    DEFAULT 0,
-              menu_msg      INTEGER    DEFAULT 0
+              menu_msg      INTEGER    DEFAULT 0,
+              alias         TEXT       UNIQUE
             );
             """
         )
@@ -33,6 +34,19 @@ async def create_tables():
             await db.execute("ALTER TABLE users ADD COLUMN menu_msg INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN alias TEXT UNIQUE")
+        except Exception:
+            pass
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+              uid   INTEGER,
+              rub   INTEGER DEFAULT 0,
+              stars INTEGER DEFAULT 0
+            );
+            """
+        )
         await db.commit()
 
 async def _ensure_user(db, uid: int):
@@ -128,7 +142,7 @@ async def grant_start_bonus(uid: int):
 async def grant_referral_bonus(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_user(db, uid)
-        await db.execute("UPDATE users SET free_photo = free_photo + 2 WHERE id=?", (uid,))
+        await db.execute("UPDATE users SET free_photo = free_photo + 1 WHERE id=?", (uid,))
         await db.commit()
 
 async def set_ref_parent(child_uid: int, parent_uid: int):
@@ -167,4 +181,85 @@ async def get_ref_count(uid: int) -> int:
         cur = await db.execute("SELECT COUNT(*) FROM users WHERE ref_parent=?", (uid,))
         row = await cur.fetchone()
         return row[0] if row else 0
+
+async def set_free_photo(uid: int, qty: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET free_photo=? WHERE id=?", (qty, uid))
+        await db.commit()
+
+async def set_alias(uid: int, alias: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        try:
+            await db.execute("UPDATE users SET alias=? WHERE id=?", (alias, uid))
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+async def get_uid_by_alias(alias: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM users WHERE alias=?", (alias,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+async def get_alias(uid: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT alias FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+        return row[0] if row else ''
+
+async def log_payment(uid: int, rub: int = 0, stars: int = 0):
+    if rub <= 0 and stars <= 0:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute(
+            "INSERT INTO payments(uid, rub, stars) VALUES(?,?,?)",
+            (uid, rub, stars),
+        )
+        await db.commit()
+
+async def get_referral_stats() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT p.id, p.alias, COUNT(c.id) AS cnt,
+                   IFNULL(SUM(pay.rub),0) AS rub,
+                   IFNULL(SUM(pay.stars),0) AS stars
+            FROM users AS c
+            JOIN users AS p ON c.ref_parent = p.id
+            LEFT JOIN payments AS pay ON pay.uid = c.id
+            GROUP BY p.id
+            """
+        )
+        rows = await cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "alias": r[1] or "",
+                "count": r[2],
+                "rub": r[3],
+                "stars": r[4],
+            }
+            for r in rows
+        ]
+
+async def get_alias_stats(uid: int) -> tuple[int, int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT COUNT(c.id) AS cnt,
+                   IFNULL(SUM(pay.rub),0) AS rub,
+                   IFNULL(SUM(pay.stars),0) AS stars
+            FROM users AS c
+            LEFT JOIN payments AS pay ON pay.uid = c.id
+            WHERE c.ref_parent=?
+            """,
+            (uid,),
+        )
+        row = await cur.fetchone()
+        return row if row else (0, 0, 0)
 

@@ -7,7 +7,7 @@
 асинхронную SQLite-базу.
 """
 
-import os, io, asyncio, logging
+import os, io, asyncio, logging, json
 from dotenv import load_dotenv
 from PIL import Image
 from telegram import (
@@ -50,6 +50,13 @@ from db import (
     set_menu_msg,
     get_menu_msg,
     get_ref_count,
+    set_free_photo,
+    set_alias,
+    get_uid_by_alias,
+    get_alias,
+    log_payment,
+    get_referral_stats,
+    get_alias_stats,
 )
 
 # ── Глобальные настройки ─────────────────────────────
@@ -65,11 +72,7 @@ ADMINS = {
 TEXT_COST = 10
 PHOTO_COST = 20
 PRICE_PACKS_RUB = {100: 100_00, 300: 300_00, 500: 500_00}
-PRICE_PACKS_STARS = {
-    100: round(100 / 1.79),
-    300: round(300 / 1.79),
-    500: round(500 / 1.79),
-}
+PRICE_PACKS_STARS = {100: 55, 300: 170, 500: 280}
 
 MAIN_TEXT = (
     "Я — Решало. Отправь текстовый вопрос или фото с подписью — и я подскажу, как действовать.\n"
@@ -77,7 +80,7 @@ MAIN_TEXT = (
 )
 HOW_IT_WORKS = (
     "Бесплатно: 1 текст в день\n"
-    "Фото-анализ: 1 бонус при старте и +2 за друга\n"
+    "Фото-анализ: 1 стартовый, 2 по ссылке, +1 за друга\n"
     "Текст = 10 баллов, Фото = 20 баллов\n"
     "100₽→100⚡ | 300₽→350⚡ | 500₽→600⚡\n"
     "Команда /profile — статистика и рефералы"
@@ -85,6 +88,11 @@ HOW_IT_WORKS = (
 FOOTER = "\n\n— Решала"
 
 KB_BACK = Mk([[Btn("◀️ Назад", callback_data="back")]])
+
+def clean_md(text: str) -> str:
+    for ch in "#*🔹":
+        text = text.replace(ch, "")
+    return text
 
 async def clear_menu(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Удалить текущее меню и убрать кнопку у ответа."""
@@ -134,13 +142,24 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
     if ctx.args:
+        arg = ctx.args[0]
+        parent = 0
+        alias_mode = False
         try:
-            parent = int(ctx.args[0])
-            if parent != uid:
-                await set_ref_parent(uid, parent)
-                await grant_referral_bonus(parent)
+            parent = int(arg)
         except ValueError:
-            pass
+            parent = await get_uid_by_alias(arg)
+            alias_mode = parent > 0
+        if parent and parent != uid:
+            await set_ref_parent(uid, parent)
+            await grant_referral_bonus(parent)
+            link = f"tg://user?id={uid}"
+            try:
+                await ctx.bot.send_message(parent, f"По вашей ссылке зарегистрировался {uid}: {link}")
+            except Exception:
+                pass
+            if alias_mode:
+                await set_free_photo(uid, 2)
     await grant_start_bonus(uid)
     await show_main(update.message.chat, uid, ctx)
     ctx.user_data["stage"] = "main"
@@ -189,14 +208,19 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "pay":
         kb_rows = []
         for c, price in PRICE_PACKS_RUB.items():
-            kb_rows.append([Btn(f"{price/100:.0f}₽ → {c} баллов", callback_data=f"buy_{c}_card")])
-        for c, stars in PRICE_PACKS_STARS.items():
-            kb_rows.append([Btn(f"{stars}⭐ → {c} баллов", callback_data=f"buy_{c}_stars")])
+            stars = PRICE_PACKS_STARS[c]
+            kb_rows.append(
+                [
+                    Btn(f"{price/100:.0f}₽ → {c} баллов", callback_data=f"buy_{c}_card"),
+                    Btn(f"{stars}⭐ → {c} баллов", callback_data=f"buy_{c}_stars"),
+                ]
+            )
         kb_rows.append([Btn("◀️ Назад", callback_data="back")])
         await send_menu(q.message.chat, uid, "Выбери пакет пополнения", Mk(kb_rows), ctx)
         ctx.user_data["stage"] = "pay"
     elif data == "ref":
-        link = f"https://t.me/reshalabot?start={uid}"
+        alias = await get_alias(uid)
+        link = f"https://t.me/reshalabot?start={alias or uid}"
         refs = await get_ref_count(uid)
         msg = f"Поделись ссылкой: {link}\nДрузей по ссылке: {refs}"
         await send_menu(q.message.chat, uid, msg, KB_BACK, ctx)
@@ -250,7 +274,9 @@ async def handle_text(update: Update, ctx):
                     await send_menu(update.message.chat, uid, "Нет баллов", kb_topup, ctx)
                     ctx.user_data["stage"] = "main"
                     return
-        ans = await ask_deepseek(text)
+        wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
+        ans = clean_md(await ask_deepseek(text))
+        await wait.delete()
         max_len = 1200 - len(FOOTER)
         msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_BACK)
         await inc_text_cnt(uid)
@@ -280,7 +306,9 @@ async def handle_text(update: Update, ctx):
                     await send_menu(update.message.chat, uid, "Нет баллов", kb_topup, ctx)
                     ctx.user_data["stage"] = "main"
                     return
-        ans = await analyze_photo(photo, text)
+        wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
+        ans = clean_md(await analyze_photo(photo, text))
+        await wait.delete()
         max_len = 1200 - len(FOOTER)
         msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_BACK)
         await inc_photo_cnt(uid)
@@ -318,8 +346,13 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     payload = update.message.successful_payment.invoice_payload
     parts = payload.split("_")
     credits = int(parts[1])
+    method = parts[2]
     uid = update.effective_user.id
     await add_credits(uid, credits)
+    if method == "card":
+        await log_payment(uid, rub=PRICE_PACKS_RUB[credits] // 100)
+    else:
+        await log_payment(uid, stars=PRICE_PACKS_STARS[credits])
     total = "∞" if uid in ADMINS else await get_credits(uid)
     await update.message.reply_text(f"✅ Платёж прошёл! На счету {total} баллов")
     ctx.user_data["stage"] = "main"
@@ -354,6 +387,58 @@ async def grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await add_credits(target, qty)
     await update.message.reply_text("OK")
+
+async def decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    if uid not in ADMINS:
+        return
+    try:
+        target = int(ctx.args[0])
+        qty = int(ctx.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /decredits <id> <qty>")
+        return
+    try:
+        await dec_credits(target, qty)
+    except ValueError:
+        await update.message.reply_text("Not enough")
+        return
+    await update.message.reply_text("OK")
+
+async def cmd_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    try:
+        name = ctx.args[0]
+    except IndexError:
+        await update.message.reply_text("Usage: /alias <name>")
+        return
+    ok = await set_alias(uid, name)
+    if ok:
+        link = f"https://t.me/reshalabot?start={name}"
+        await update.message.reply_text(f"Ваша ссылка: {link}")
+    else:
+        await update.message.reply_text("Имя занято")
+
+async def stats_referrals(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    if uid not in ADMINS:
+        return
+    data = await get_referral_stats()
+    await update.message.reply_text(json.dumps(data, ensure_ascii=False))
+
+async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    alias = await get_alias(uid)
+    if not alias:
+        await update.message.reply_text("У вас нет alias")
+        return
+    cnt, rub, stars = await get_alias_stats(uid)
+    data = {"alias": alias, "count": cnt, "rub": rub, "stars": stars}
+    await update.message.reply_text(json.dumps(data, ensure_ascii=False))
 
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
@@ -413,6 +498,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CommandHandler("decredits", decredits))
+    app.add_handler(CommandHandler("alias", cmd_alias))
+    app.add_handler(CommandHandler("stats_referrals", stats_referrals))
+    app.add_handler(CommandHandler("stats_alias", stats_alias))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(router))
