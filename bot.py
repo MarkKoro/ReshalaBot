@@ -1,289 +1,264 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Простой бот «Решало».
 
-Удалены функции тарологии и номерологии. Бот отвечает на текстовые
-вопросы через DeepSeek и может анализировать фотографию через GPT‑4o.
+Бот отвечает на текстовые вопросы через DeepSeek и умеет анализировать
+фотографии через GPT‑4o. Логика оплаты и бонусов реализована через
+асинхронную SQLite-базу.
 """
 
-import os, io, logging, asyncio
+import os, io, asyncio, logging
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from PIL import Image
+from telegram import (
+    Update,
+    InlineKeyboardButton as Btn,
+    InlineKeyboardMarkup as Mk,
+    LabeledPrice,
+)
+from telegram.error import NetworkError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    PreCheckoutQueryHandler,
     ContextTypes,
+    JobQueue,
+    AIORateLimiter,
     filters,
 )
+
 from utils.llm import ask_deepseek, analyze_photo
 from db import (
-    get_credits,
-    dec_credits,
-    can_use_daily_text,
-    mark_text_used,
-    get_photo_credits,
-    dec_photo_credit,
-    set_referral,
+    get_credits, add_credits, dec_credits,
+    can_use_daily_text, mark_daily_text,
+    get_free_photo, use_free_photo,
+    grant_start_bonus, grant_referral_bonus,
+    set_ref_parent, create_tables,
 )
 
-# ── Настройки ─────────────────────────────────────────
+# ── Глобальные настройки ─────────────────────────────
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x}
+YK_TOKEN = os.getenv("YK_TOKEN", "")
 
 TEXT_COST = 10
 PHOTO_COST = 20
-PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
-PACKS_STARS = {100: 56, 350: 168, 600: 280}
-
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
+PRICE_PACKS_RUB = {100: 100_00, 300: 300_00, 500: 500_00}
+PRICE_PACKS_STARS = {
+    100: round(100 / 1.79),
+    300: round(300 / 1.79),
+    500: round(500 / 1.79),
+}
 
 MAIN_TEXT = (
-    "Я — Решало. Отправь текстовый вопрос или фото с подписью, и я подскажу, как действовать.\n"
-    "Каждый день 1 бесплатный текстовый вопрос, фото стоит 20 баллов (1 бесплатно при регистрации)."
+    "Я — Решало. Отправь текстовый вопрос или фото с подписью — и я подскажу, как действовать.\n"
+    "Каждый день доступен один бесплатный текстовый вопрос. Фотоанализ стоит 20 баллов."
 )
-
-HOW_TEXT = (
-    "1️⃣ Отправь текстовый вопрос или фото с подписью.\n"
-    "2️⃣ Получи краткий совет от Решалы."
+HOW_IT_WORKS = (
+    "Бесплатно: 1 текст в день\n"
+    "Фото-анализ: 1 бонус при старте и +2 за друга\n"
+    "Текст = 10 баллов, Фото = 20 баллов\n"
+    "100₽→100⚡ | 300₽→350⚡ | 500₽→600⚡"
 )
+FOOTER = "\n\n— Решала"
 
-REF_TEXT = (
-    "Пригласи друзей по ссылке https://t.me/reshalabot?start={id} и получи бонусы."
-)
+KB_BACK = Mk([[Btn("◀️ Назад", callback_data="back")]])
 
-SUPPORT_TEXT = "Если возникли сложности — пиши @support"
-
-BACK_KB = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
-
-
-def build_main_kb(uid: int) -> InlineKeyboardMarkup:
-    """Главное меню с динамическими подсказками."""
-    free_text = 1 if can_use_daily_text(uid) else 0
-    photos = get_photo_credits(uid)
-    credits = get_credits(uid, ADMIN_IDS)
-    return InlineKeyboardMarkup(
+def kb_main(free_txt: bool, free_ph: int, credits: int) -> Mk:
+    """Главное меню."""
+    return Mk(
         [
-            [
-                InlineKeyboardButton(
-                    f"Текстовый запрос ({free_text})", callback_data="ask_text"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Фото запрос ({photos})", callback_data="ask_photo"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Пополнить счёт ({credits})", callback_data="buy"
-                )
-            ],
-            [InlineKeyboardButton("Как это работает", callback_data="how")],
-            [InlineKeyboardButton("Пригласить друга", callback_data="ref")],
-            [InlineKeyboardButton("Техподдержка", callback_data="support")],
+            [Btn(f"📝 Текстовый вопрос ({'1' if free_txt else '0'})", callback_data="ask_text")],
+            [Btn(f"📷 Фото + вопрос ({free_ph})", callback_data="ask_photo")],
+            [Btn(f"💳 Пополнить счёт ({credits})", callback_data="pay")],
+            [Btn("🎁 Пригласить друга", callback_data="ref")],
+            [Btn("ℹ️ Как это работает", callback_data="how")],
         ]
     )
 
-
-def build_balance_text(uid: int) -> str:
-    credits = get_credits(uid, ADMIN_IDS)
-    free_text = "✅" if can_use_daily_text(uid) else "❌"
-    photos = get_photo_credits(uid)
-    return (
-        f"Баланс: {credits} баллов\n"
-        f"Свободный текст сегодня: {free_text}\n"
-        f"Свободные фотоанализы: {photos}"
+async def show_main(chat, uid: int):
+    kb = kb_main(
+        await can_use_daily_text(uid),
+        await get_free_photo(uid),
+        await get_credits(uid),
     )
+    await chat.send_message(MAIN_TEXT, reply_markup=kb)
 
-
-def build_buy_text() -> str:
-    return (
-        "Пакеты пополнения:\n"
-        "100₽ → 100 баллов (/pay_100)\n"
-        "300₽ → 350 баллов (/pay_350)\n"
-        "500₽ → 600 баллов (/pay_600)\n"
-        "Оплата звёздами поддерживается вручную."
-    )
-
-# ── Команды ──────────────────────────────────────────
+# ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if ctx.args:
         try:
             parent = int(ctx.args[0])
-            set_referral(uid, parent)
+            if parent != uid:
+                await set_ref_parent(uid, parent)
+                await grant_referral_bonus(parent)
         except ValueError:
             pass
-    await update.message.reply_text(MAIN_TEXT, reply_markup=build_main_kb(uid))
+    await grant_start_bonus(uid)
+    await show_main(update.message.chat, uid)
     ctx.user_data["stage"] = "main"
 
+# ── Callback router ──────────────────────────────────
+async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = q.data
 
-async def balance(update: Update, ctx):
-    uid = update.effective_user.id
-    await update.message.reply_text(build_balance_text(uid))
+    if data == "ask_text":
+        ctx.user_data["stage"] = "await_text"
+        await q.message.chat.send_message("Введи вопрос…", reply_markup=KB_BACK)
+    elif data == "ask_photo":
+        ctx.user_data["stage"] = "await_photo"
+        await q.message.chat.send_message("Пришли фото…", reply_markup=KB_BACK)
+    elif data == "back":
+        ctx.user_data["stage"] = "main"
+        await show_main(q.message.chat, uid)
+    elif data == "pay":
+        kb_rows = []
+        for c, price in PRICE_PACKS_RUB.items():
+            kb_rows.append([Btn(f"{price/100:.0f}₽ → {c} баллов", callback_data=f"buy_{c}_card")])
+        for c, stars in PRICE_PACKS_STARS.items():
+            kb_rows.append([Btn(f"{stars}⭐ → {c} баллов", callback_data=f"buy_{c}_stars")])
+        kb_rows.append([Btn("◀️ Назад", callback_data="back")])
+        await q.message.chat.send_message("Выбери пакет пополнения", reply_markup=Mk(kb_rows))
+        ctx.user_data["stage"] = "pay"
+    elif data == "ref":
+        link = f"https://t.me/reshalabot?start={uid}"
+        await q.message.chat.send_message(f"Поделись ссылкой: {link}", reply_markup=KB_BACK)
+        ctx.user_data["stage"] = "ref"
+    elif data == "how":
+        await q.message.chat.send_message(HOW_IT_WORKS, reply_markup=KB_BACK)
+        ctx.user_data["stage"] = "how"
+    elif data.startswith("buy_"):
+        _, c, method = data.split("_")
+        credits = int(c)
+        if method == "card":
+            price = PRICE_PACKS_RUB[credits]
+            currency = "RUB"
+            token = YK_TOKEN
+        else:
+            price = PRICE_PACKS_STARS[credits]
+            currency = "XTR"
+            token = ""
+        await ctx.bot.send_invoice(
+            chat_id=q.message.chat_id,
+            title=f"{credits} баллов",
+            description="Пакет баллов",
+            payload=f"buy_{credits}_{method}",
+            provider_token=token,
+            currency=currency,
+            prices=[LabeledPrice(f"{credits} баллов", price)],
+        )
 
-
-async def buy(update: Update, ctx):
-    await update.message.reply_text(build_buy_text())
-
-
-# ── Обработка текстов и фото ─────────────────────────
+# ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
     uid = update.effective_user.id
     stage = ctx.user_data.get("stage")
     text = update.message.text
 
-    # Завершение анализа фото (этап текста)
-    if stage == "await_photo_text":
-        photo_bytes = ctx.user_data.pop("photo_bytes", None)
-        if not photo_bytes:
-            await update.message.reply_text("Сначала пришлите фото.")
-            return
-        if get_photo_credits(uid) > 0:
-            dec_photo_credit(uid)
+    if stage == "await_text":
+        if await can_use_daily_text(uid):
+            await mark_daily_text(uid)
+        elif (await get_credits(uid)) >= TEXT_COST:
+            await dec_credits(uid, TEXT_COST)
         else:
-            if get_credits(uid, ADMIN_IDS) < PHOTO_COST:
-                await update.message.reply_text("Недостаточно баллов. /buy")
-                return
-            dec_credits(uid, PHOTO_COST, ADMIN_IDS)
-        await update.message.chat.send_action("typing")
-        try:
-            resp = await asyncio.to_thread(analyze_photo, photo_bytes, text)
-        except Exception:
-            log.exception("vision error")
-            await update.message.reply_text("Ошибка обработки фото.")
+            kb_topup = Mk([[Btn("Пополнить счёт", callback_data="pay")]])
+            await update.message.reply_text("Нет баллов", reply_markup=kb_topup)
             return
-        await update.message.reply_text(resp)
+        ans = await ask_deepseek(text)
+        max_len = 1200 - len(FOOTER)
+        await update.message.reply_text(ans[:max_len] + FOOTER)
         ctx.user_data["stage"] = "main"
-        await update.message.chat.send_message(
-            MAIN_TEXT, reply_markup=build_main_kb(uid)
-        )
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-        return
+        await show_main(update.message.chat, uid)
 
-    # Обычный текстовый запрос
-    if stage != "await_text":
-        await update.message.reply_text(
-            "Используйте кнопку ‘Текстовый запрос’ в меню."
-        )
-        return
-    if can_use_daily_text(uid):
-        mark_text_used(uid)
-    else:
-        if get_credits(uid, ADMIN_IDS) < TEXT_COST:
-            await update.message.reply_text("Недостаточно баллов. /buy")
+    elif stage == "await_photo_text":
+        photo = ctx.user_data.pop("photo", None)
+        if photo is None:
+            await update.message.reply_text("Сначала пришли фото")
             return
-        dec_credits(uid, TEXT_COST, ADMIN_IDS)
-    await update.message.chat.send_action("typing")
-    try:
-        resp = await asyncio.to_thread(ask_deepseek, text)
-    except Exception:
-        log.exception("deepseek error")
-        await update.message.reply_text("Ошибка запроса.")
-        return
-    await update.message.reply_text(resp)
-    ctx.user_data["stage"] = "main"
-    await update.message.chat.send_message(
-        MAIN_TEXT, reply_markup=build_main_kb(uid)
-    )
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
+        free = await get_free_photo(uid)
+        if free > 0:
+            await use_free_photo(uid)
+        elif (await get_credits(uid)) >= PHOTO_COST:
+            await dec_credits(uid, PHOTO_COST)
+        else:
+            kb_topup = Mk([[Btn("Пополнить счёт", callback_data="pay")]])
+            await update.message.reply_text("Нет баллов", reply_markup=kb_topup)
+            ctx.user_data["photo"] = photo
+            return
+        ans = await analyze_photo(photo, text)
+        max_len = 1200 - len(FOOTER)
+        await update.message.reply_text(ans[:max_len] + FOOTER)
+        ctx.user_data["stage"] = "main"
+        await show_main(update.message.chat, uid)
 
+    else:
+        await update.message.reply_text("Используй меню")
 
 async def handle_photo(update: Update, ctx):
-    uid = update.effective_user.id
-    stage = ctx.user_data.get("stage")
-    if stage != "await_photo":
-        await update.message.reply_text(
-            "Сначала выберите ‘Фото запрос’ в меню."
-        )
+    if ctx.user_data.get("stage") != "await_photo":
+        await update.message.reply_text("Сначала выбери режим фото в меню")
         return
     photo = update.message.photo[-1]
+    f = await ctx.bot.get_file(photo.file_id)
     bio = io.BytesIO()
-    file = await photo.get_file()
-    await file.download(out=bio)
+    await f.download_to_memory(out=bio)
     bio.seek(0)
-    ctx.user_data["photo_bytes"] = bio.getvalue()
+    img = Image.open(bio)
+    img.thumbnail((1024, 1024))
+    out = io.BytesIO()
+    img.save(out, format="JPEG")
+    ctx.user_data["photo"] = out.getvalue()
     ctx.user_data["stage"] = "await_photo_text"
-    await update.message.reply_text("Теперь напишите проблему.")
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
+    await update.message.reply_text("Опиши ситуацию текстом")
+
+# ── Оплата ───────────────────────────────────────────
+async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.pre_checkout_query.answer(True)
 
 
-async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    uid = query.from_user.id
-    if data == "ask_text":
-        await query.message.delete()
-        credits = get_credits(uid, ADMIN_IDS)
-        free = 1 if can_use_daily_text(uid) else 0
-        msg = (
-            "Рассказывай, в чем проблема, я её решу.\n"
-            f"Стоимость: {TEXT_COST} баллов. Баланс: {credits}.\n"
-            f"Бесплатных текстов сегодня: {free}.\n"
-            "Напишите текст снизу."
-        )
-        await query.message.chat.send_message(msg, reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "await_text"
-    elif data == "ask_photo":
-        await query.message.delete()
-        credits = get_credits(uid, ADMIN_IDS)
-        photos = get_photo_credits(uid)
-        msg = (
-            "Пришли фотографию, я помогу разобраться.\n"
-            f"Стоимость: {PHOTO_COST} баллов. Баланс: {credits}.\n"
-            f"Бесплатных фото: {photos}.\n"
-            "Присылай фотографию."
-        )
-        await query.message.chat.send_message(msg, reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "await_photo"
-    elif data == "buy":
-        await query.message.edit_text(build_buy_text(), reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "buy"
-    elif data == "how":
-        await query.message.edit_text(HOW_TEXT, reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "how"
-    elif data == "ref":
-        await query.message.edit_text(REF_TEXT.format(id=uid), reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "ref"
-    elif data == "support":
-        await query.message.edit_text(SUPPORT_TEXT, reply_markup=BACK_KB)
-        ctx.user_data["stage"] = "support"
-    elif data == "back":
-        await query.message.edit_text(
-            MAIN_TEXT, reply_markup=build_main_kb(uid)
-        )
-        ctx.user_data["stage"] = "main"
+async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    payload = update.message.successful_payment.invoice_payload
+    parts = payload.split("_")
+    credits = int(parts[1])
+    uid = update.effective_user.id
+    await add_credits(uid, credits)
+    total = await get_credits(uid)
+    await update.message.reply_text(f"✅ Платёж прошёл! На счету {total} баллов")
+    ctx.user_data["stage"] = "main"
+    await show_main(update.message.chat, uid)
 
+# ── Error handler ────────────────────────────────────
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(ctx.error, NetworkError) and update and getattr(update, "effective_chat", None):
+        await update.effective_chat.send_message("⛔ Временно нет связи")
 
-# ── main ────────────────────────────────────────────
+# ── Запуск ───────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handlers(
-        [
-            CommandHandler("start", start),
-            CommandHandler("balance", balance),
-            CommandHandler("buy", buy),
-            CallbackQueryHandler(on_button),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
-            MessageHandler(filters.PHOTO, handle_photo),
-        ]
+    asyncio.run(create_tables())
+    logging.basicConfig(level=logging.INFO)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(64)
+        .rate_limiter(AIORateLimiter())
+        .job_queue(JobQueue())
+        .request(HTTPXRequest(connection_pool_size=1024))
+        .build()
     )
-    log.info("bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
+    app.add_error_handler(on_error)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
