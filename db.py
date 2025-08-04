@@ -15,7 +15,8 @@ async def create_tables():
               free_text_dt  DATE       DEFAULT '',
               ref_parent    INTEGER    DEFAULT 0,
               text_cnt      INTEGER    DEFAULT 0,
-              photo_cnt     INTEGER    DEFAULT 0
+              photo_cnt     INTEGER    DEFAULT 0,
+              menu_msg      INTEGER    DEFAULT 0
             );
             """
         )
@@ -26,6 +27,10 @@ async def create_tables():
             pass
         try:
             await db.execute("ALTER TABLE users ADD COLUMN photo_cnt INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN menu_msg INTEGER DEFAULT 0")
         except Exception:
             pass
         await db.commit()
@@ -143,4 +148,23 @@ async def get_all_uids() -> list[int]:
         cur = await db.execute("SELECT id FROM users")
         rows = await cur.fetchall()
         return [r[0] for r in rows]
+
+async def set_menu_msg(uid: int, msg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET menu_msg=? WHERE id=?", (msg_id, uid))
+        await db.commit()
+
+async def get_menu_msg(uid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT menu_msg FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+async def get_ref_count(uid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users WHERE ref_parent=?", (uid,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
 
