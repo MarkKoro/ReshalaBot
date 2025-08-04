@@ -1,349 +1,107 @@
-# db.py
-"""
-Mini-ORM для работы с балансом и рефералами.
-Файл `credits.db` создаётся автоматически рядом с ботом.
-
-▪️  users(id INTEGER PRIMARY KEY, credits INTEGER DEFAULT 0,
-          parent INTEGER, joined TIMESTAMP)
-        – parent  → id того, кто пригласил (одноуровневая рефералка)
-
-Все запросы подготовлены, соединение одно (WAL), поэтому
-SQLite выдерживает сотни RPS даже на дешёвом VPS.
-"""
-
-import sqlite3, threading, time
+import aiosqlite
 from pathlib import Path
-from typing import Optional, Iterable
+from datetime import date
 
 DB_PATH = Path(__file__).with_name("credits.db")
-_LOCK = threading.RLock()
 
+async def create_tables():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+              uid           INTEGER PRIMARY KEY,
+              credits       INTEGER    DEFAULT 0,
+              free_photo    INTEGER    DEFAULT 1,
+              free_text_dt  DATE       DEFAULT '',
+              ref_parent    INTEGER    DEFAULT 0
+            );
+            """
+        )
+        await db.commit()
 
-# ── init ─────────────────────────────────────────────
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(
-        DB_PATH, check_same_thread=False, isolation_level=None
-    )  # autocommit
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS users(
-                        id      INTEGER PRIMARY KEY,
-                        credits INTEGER DEFAULT 0,
-                        parent  INTEGER,
-                        joined  INTEGER,
-                        menu_msg INTEGER DEFAULT NULL,
-                        last_text_ts INTEGER DEFAULT 0,
-                        photo_credits INTEGER DEFAULT 1)"""
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_parent ON users(parent)")
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN menu_msg INTEGER")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN last_text_ts INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN photo_credits INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS events(
-                        event   TEXT,
-                        uid     INTEGER,
-                        ts      INTEGER)"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_event_ts ON events(event, ts)"
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS aliases(
-                        alias TEXT PRIMARY KEY,
-                        uid   INTEGER)"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_alias_uid ON aliases(uid)"
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS payments(
-                        uid     INTEGER,
-                        qty     INTEGER,
-                        method  TEXT,
-                        ts      INTEGER)"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_payments_uid ON payments(uid)"
-    )
-    return conn
+async def _ensure_user(db, uid: int):
+    await db.execute("INSERT OR IGNORE INTO users(uid) VALUES(?)", (uid,))
 
-
-DB = _get_conn()
-
-
-# ── util ─────────────────────────────────────────────
-def _ensure(uid: int) -> bool:
-    """Добавить пользователя при первом обращении.
-
-    Возвращает ``True``, если запись была создана прямо сейчас."""
-    cur = DB.execute(
-        "INSERT OR IGNORE INTO users(id,joined) VALUES(?,?)",
-        (uid, int(time.time())),
-    )
-    return cur.rowcount > 0
-
-
-def is_new_user(uid: int) -> bool:
-    "Возвращает True, если пользователь ранее не создавался."
-    with _LOCK:
-        cur = DB.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone()
-        return cur is None
-
-
-# ── API ──────────────────────────────────────────────
-def get_credits(uid: int, admins: Iterable[int] = ()) -> int:
-    """
-    • админам всегда ∞ (10 000)
-    • новый пользователь → 0
-    """
-    if uid in admins:
-        return 10_000
-    with _LOCK:
-        _ensure(uid)
-        row = DB.execute("SELECT credits FROM users WHERE id=?", (uid,)).fetchone()
+async def get_credits(uid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT credits FROM users WHERE uid=?", (uid,))
+        row = await cur.fetchone()
         return row[0] if row else 0
 
-
-def add_credits(uid: int, qty: int):
-    if qty <= 0:
+async def add_credits(uid: int, n: int):
+    if n <= 0:
         return
-    with _LOCK:
-        _ensure(uid)
-        DB.execute("UPDATE users SET credits = credits + ? WHERE id=?", (qty, uid))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET credits = credits + ? WHERE uid=?", (n, uid))
+        await db.commit()
 
-
-def dec_credit(uid: int, admins: Iterable[int] = ()):
-    """Устаревшая функция для обратной совместимости."""
-    dec_credits(uid, 1, admins)
-
-
-def dec_credits(uid: int, qty: int, admins: Iterable[int] = ()):
-    """Списать ``qty`` кредитов (если не админ)."""
-    if uid in admins:
+async def dec_credits(uid: int, n: int):
+    if n <= 0:
         return
-    if qty <= 0:
-        return
-    with _LOCK:
-        DB.execute(
-            """UPDATE users
-                      SET credits = CASE
-                                        WHEN credits >= ? THEN credits - ?
-                                        ELSE credits END
-                      WHERE id=?""",
-            (qty, qty, uid),
-        )
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT credits FROM users WHERE uid=?", (uid,))
+        row = await cur.fetchone()
+        have = row[0] if row else 0
+        if have < n:
+            raise ValueError("not enough credits")
+        await db.execute("UPDATE users SET credits = credits - ? WHERE uid=?", (n, uid))
+        await db.commit()
 
+async def can_use_daily_text(uid: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT free_text_dt FROM users WHERE uid=?", (uid,))
+        row = await cur.fetchone()
+        last = row[0] if row else ''
+    return last != date.today().isoformat()
 
-def can_use_daily_text(uid: int) -> bool:
-    from datetime import date, datetime
-    with _LOCK:
-        _ensure(uid)
-        row = DB.execute("SELECT last_text_ts FROM users WHERE id=?", (uid,)).fetchone()
-        last = row[0] if row else 0
-    return datetime.utcfromtimestamp(last).date() < date.today()
+async def mark_daily_text(uid: int):
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET free_text_dt=? WHERE uid=?", (today, uid))
+        await db.commit()
 
-
-def mark_text_used(uid: int):
-    with _LOCK:
-        _ensure(uid)
-        DB.execute(
-            "UPDATE users SET last_text_ts=? WHERE id=?",
-            (int(time.time()), uid),
-        )
-
-
-def get_photo_credits(uid: int) -> int:
-    with _LOCK:
-        _ensure(uid)
-        row = DB.execute(
-            "SELECT photo_credits FROM users WHERE id=?", (uid,)
-        ).fetchone()
+async def get_free_photo(uid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT free_photo FROM users WHERE uid=?", (uid,))
+        row = await cur.fetchone()
         return row[0] if row else 0
 
+async def use_free_photo(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT free_photo FROM users WHERE uid=?", (uid,))
+        row = await cur.fetchone()
+        qty = row[0] if row else 0
+        if qty <= 0:
+            raise ValueError("no free photo")
+        await db.execute("UPDATE users SET free_photo = free_photo - 1 WHERE uid=?", (uid,))
+        await db.commit()
 
-def add_photo_credits(uid: int, qty: int):
-    if qty <= 0:
+async def grant_start_bonus(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.commit()
+
+async def grant_referral_bonus(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET free_photo = free_photo + 2 WHERE uid=?", (uid,))
+        await db.commit()
+
+async def set_ref_parent(child_uid: int, parent_uid: int):
+    if child_uid == parent_uid:
         return
-    with _LOCK:
-        _ensure(uid)
-        DB.execute(
-            "UPDATE users SET photo_credits = photo_credits + ? WHERE id=?",
-            (qty, uid),
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, child_uid)
+        await _ensure_user(db, parent_uid)
+        await db.execute(
+            "UPDATE users SET ref_parent=? WHERE uid=? AND ref_parent=0",
+            (parent_uid, child_uid),
         )
-
-
-def dec_photo_credit(uid: int):
-    with _LOCK:
-        DB.execute(
-            """UPDATE users
-                      SET photo_credits = CASE
-                                        WHEN photo_credits>0 THEN photo_credits-1
-                                        ELSE 0 END
-                      WHERE id=?""",
-            (uid,),
-        )
-
-
-def all_user_ids() -> list[int]:
-    "Возвращает список всех id пользователей."
-    with _LOCK:
-        rows = DB.execute("SELECT id FROM users").fetchall()
-    return [r[0] for r in rows]
-
-
-def get_menu_msg(uid: int) -> Optional[int]:
-    with _LOCK:
-        row = DB.execute("SELECT menu_msg FROM users WHERE id=?", (uid,)).fetchone()
-    return row[0] if row and row[0] else None
-
-
-def set_menu_msg(uid: int, msg_id: int):
-    with _LOCK:
-        _ensure(uid)
-        DB.execute("UPDATE users SET menu_msg=? WHERE id=?", (msg_id, uid))
-
-
-# ── события и статистика ─────────────────────────────
-def log_event(event: str, uid: int):
-    with _LOCK:
-        DB.execute(
-            "INSERT INTO events(event, uid, ts) VALUES(?,?,?)",
-            (event, uid, int(time.time())),
-        )
-
-
-def count_new_users(days: int) -> int:
-    border = int(time.time()) - days * 86400
-    with _LOCK:
-        row = DB.execute(
-            "SELECT COUNT(*) FROM users WHERE joined>=?", (border,)
-        ).fetchone()
-    return row[0] if row else 0
-
-
-def event_stats() -> dict[str, int]:
-    with _LOCK:
-        rows = DB.execute(
-            "SELECT event, COUNT(*) FROM events GROUP BY event"
-        ).fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
-def unique_event_users(event: str) -> int:
-    with _LOCK:
-        row = DB.execute(
-            "SELECT COUNT(DISTINCT uid) FROM events WHERE event=?",
-            (event,)
-        ).fetchone()
-    return row[0] if row else 0
-
-
-def unique_event_users_like(prefix: str) -> int:
-    """Количество уникальных пользователей для событий, начинающихся с prefix."""
-    with _LOCK:
-        row = DB.execute(
-            "SELECT COUNT(DISTINCT uid) FROM events WHERE event LIKE ?",
-            (prefix + "%",),
-        ).fetchone()
-    return row[0] if row else 0
-
-
-def event_count(uid: int, event: str) -> int:
-    """Возвращает количество событий ``event`` для пользователя ``uid``."""
-    with _LOCK:
-        row = DB.execute(
-            "SELECT COUNT(*) FROM events WHERE uid=? AND event=?",
-            (uid, event),
-        ).fetchone()
-    return row[0] if row else 0
-
-
-# ── рефералка ───────────────────────────────────────
-def set_referral(child: int, parent: int) -> bool:
-    """
-    Возвращает True, если связь установлена впервые.
-    Игнорируется, когда:
-        • child == parent
-        • child уже имеет parent
-    """
-    if child == parent:  # нельзя пригласить себя
-        return False
-    with _LOCK:
-        _ensure(child)
-        _ensure(parent)
-        cur = DB.execute("SELECT parent FROM users WHERE id=?", (child,)).fetchone()
-        if cur and cur[0]:  # уже есть родитель
-            return False
-        DB.execute("UPDATE users SET parent=? WHERE id=?", (parent, child))
-        DB.execute(
-            "UPDATE users SET photo_credits = photo_credits + 2 WHERE id=?",
-            (parent,),
-        )
-        return True
-
-
-def referral_counts() -> list[tuple[int, int]]:
-    """Возвращает список (uid, количество приглашённых)."""
-    with _LOCK:
-        rows = DB.execute(
-            "SELECT parent, COUNT(*) FROM users WHERE parent IS NOT NULL GROUP BY parent"
-        ).fetchall()
-    return [(r[0], r[1]) for r in rows]
-
-
-def add_alias(uid: int, alias: str) -> bool:
-    """Создаёт текстовый реферальный код для пользователя."""
-    with _LOCK:
-        try:
-            DB.execute("INSERT INTO aliases(alias, uid) VALUES(?,?)", (alias, uid))
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def alias_owner(alias: str) -> Optional[int]:
-    """Возвращает id владельца реферального кода или None."""
-    with _LOCK:
-        row = DB.execute("SELECT uid FROM aliases WHERE alias=?", (alias,)).fetchone()
-    return row[0] if row else None
-
-
-def aliases_for(uid: int) -> list[str]:
-    """Возвращает список реферальных имён пользователя."""
-    with _LOCK:
-        rows = DB.execute("SELECT alias FROM aliases WHERE uid=?", (uid,)).fetchall()
-    return [r[0] for r in rows]
-
-
-def log_payment(uid: int, qty: int, method: str):
-    """Сохраняет факт оплаты."""
-    with _LOCK:
-        DB.execute(
-            "INSERT INTO payments(uid, qty, method, ts) VALUES(?,?,?,?)",
-            (uid, qty, method, int(time.time())),
-        )
-
-
-def referral_payment_stats() -> list[tuple[int, str, int, int]]:
-    """Статистика оплат по родителю (uid, метод, пакет, количество покупок)."""
-    with _LOCK:
-        rows = DB.execute(
-            """SELECT u.parent, p.method, p.qty, COUNT(*)
-                     FROM payments p
-                     JOIN users u ON u.id=p.uid
-                     WHERE u.parent IS NOT NULL
-                     GROUP BY u.parent, p.method, p.qty"""
-        ).fetchall()
-    return [(r[0], r[1], r[2], r[3]) for r in rows]
-
+        await db.commit()
