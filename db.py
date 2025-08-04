@@ -32,11 +32,21 @@ def _get_conn() -> sqlite3.Connection:
                         credits INTEGER DEFAULT 0,
                         parent  INTEGER,
                         joined  INTEGER,
-                        menu_msg INTEGER DEFAULT NULL)"""
+                        menu_msg INTEGER DEFAULT NULL,
+                        last_text_ts INTEGER DEFAULT 0,
+                        photo_credits INTEGER DEFAULT 1)"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS ix_parent ON users(parent)")
     try:
         conn.execute("ALTER TABLE users ADD COLUMN menu_msg INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN last_text_ts INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN photo_credits INTEGER DEFAULT 1")
     except sqlite3.OperationalError:
         pass
     conn.execute(
@@ -114,14 +124,71 @@ def add_credits(uid: int, qty: int):
 
 
 def dec_credit(uid: int, admins: Iterable[int] = ()):
-    "-1 кредит (если не админ); < 0 не уходим"
+    """Устаревшая функция для обратной совместимости."""
+    dec_credits(uid, 1, admins)
+
+
+def dec_credits(uid: int, qty: int, admins: Iterable[int] = ()):
+    """Списать ``qty`` кредитов (если не админ)."""
     if uid in admins:
+        return
+    if qty <= 0:
         return
     with _LOCK:
         DB.execute(
             """UPDATE users
                       SET credits = CASE
-                                        WHEN credits>0 THEN credits-1
+                                        WHEN credits >= ? THEN credits - ?
+                                        ELSE credits END
+                      WHERE id=?""",
+            (qty, qty, uid),
+        )
+
+
+def can_use_daily_text(uid: int) -> bool:
+    from datetime import date, datetime
+    with _LOCK:
+        _ensure(uid)
+        row = DB.execute("SELECT last_text_ts FROM users WHERE id=?", (uid,)).fetchone()
+        last = row[0] if row else 0
+    return datetime.utcfromtimestamp(last).date() < date.today()
+
+
+def mark_text_used(uid: int):
+    with _LOCK:
+        _ensure(uid)
+        DB.execute(
+            "UPDATE users SET last_text_ts=? WHERE id=?",
+            (int(time.time()), uid),
+        )
+
+
+def get_photo_credits(uid: int) -> int:
+    with _LOCK:
+        _ensure(uid)
+        row = DB.execute(
+            "SELECT photo_credits FROM users WHERE id=?", (uid,)
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def add_photo_credits(uid: int, qty: int):
+    if qty <= 0:
+        return
+    with _LOCK:
+        _ensure(uid)
+        DB.execute(
+            "UPDATE users SET photo_credits = photo_credits + ? WHERE id=?",
+            (qty, uid),
+        )
+
+
+def dec_photo_credit(uid: int):
+    with _LOCK:
+        DB.execute(
+            """UPDATE users
+                      SET photo_credits = CASE
+                                        WHEN photo_credits>0 THEN photo_credits-1
                                         ELSE 0 END
                       WHERE id=?""",
             (uid,),
@@ -219,6 +286,10 @@ def set_referral(child: int, parent: int) -> bool:
         if cur and cur[0]:  # уже есть родитель
             return False
         DB.execute("UPDATE users SET parent=? WHERE id=?", (parent, child))
+        DB.execute(
+            "UPDATE users SET photo_credits = photo_credits + 2 WHERE id=?",
+            (parent,),
+        )
         return True
 
 
