@@ -319,12 +319,22 @@ async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 # ── Запуск ───────────────────────────────────────────
-async def main() -> None:
-    await create_tables()
+def main() -> None:
+    """Запустить бота в единственном цикле событий.
+
+    Application.run_polling самостоятельно создаёт и управляет event loop.
+    Чтобы избежать ошибки "event loop is already running", не оборачиваем
+    вызов run_polling() в asyncio.run().
+    """
+
+    # Подготовка БД выполняется один раз перед запуском приложения.
+    asyncio.run(create_tables())
+
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         level=logging.INFO,
     )
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -334,6 +344,7 @@ async def main() -> None:
         .request(HTTPXRequest(connection_pool_size=1024))
         .build()
     )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("grant", grant))
@@ -345,7 +356,10 @@ async def main() -> None:
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
     app.add_error_handler(on_error)
-    await app.run_polling()
+
+    # run_polling() блокирует поток, пока бот не будет остановлен.
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
