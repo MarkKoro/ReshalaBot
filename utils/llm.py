@@ -7,7 +7,7 @@ load_dotenv()
 # DeepSeek client uses OpenAI-compatible API
 _deepseek = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
 # OpenAI client for vision analysis
-_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_openai = OpenAI(api_key=os.getenv("OAI_API_KEY"))
 
 SYSTEM_TEXT = (
     "Ты — Решало. Отвечай уверенно и по делу, без лишних эмоций. "
