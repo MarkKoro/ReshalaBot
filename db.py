@@ -13,10 +13,21 @@ async def create_tables():
               credits       INTEGER    DEFAULT 0,
               free_photo    INTEGER    DEFAULT 1,
               free_text_dt  DATE       DEFAULT '',
-              ref_parent    INTEGER    DEFAULT 0
+              ref_parent    INTEGER    DEFAULT 0,
+              text_cnt      INTEGER    DEFAULT 0,
+              photo_cnt     INTEGER    DEFAULT 0
             );
             """
         )
+        # upgrade legacy tables
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN text_cnt INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN photo_cnt INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 async def _ensure_user(db, uid: int):
@@ -49,6 +60,27 @@ async def dec_credits(uid: int, n: int):
             raise ValueError("not enough credits")
         await db.execute("UPDATE users SET credits = credits - ? WHERE uid=?", (n, uid))
         await db.commit()
+
+async def inc_text_cnt(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET text_cnt = text_cnt + 1 WHERE uid=?", (uid,))
+        await db.commit()
+
+async def inc_photo_cnt(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        await db.execute("UPDATE users SET photo_cnt = photo_cnt + 1 WHERE uid=?", (uid,))
+        await db.commit()
+
+async def get_counts(uid: int) -> tuple[int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_user(db, uid)
+        cur = await db.execute("SELECT text_cnt, photo_cnt FROM users WHERE uid=?", (uid,))
+        row = await cur.fetchone()
+        if row:
+            return row[0], row[1]
+        return 0, 0
 
 async def can_use_daily_text(uid: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -105,3 +137,10 @@ async def set_ref_parent(child_uid: int, parent_uid: int):
             (parent_uid, child_uid),
         )
         await db.commit()
+
+async def get_all_uids() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT uid FROM users")
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
+

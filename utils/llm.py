@@ -1,10 +1,10 @@
-import base64, os, httpx, asyncio
+import base64, os, httpx, asyncio, functools
 from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
 _DS = os.getenv("DS_API_KEY")
-_OAI = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SEM = asyncio.Semaphore(32)   # глобальный лимитер
 
@@ -17,17 +17,21 @@ async def ask_deepseek(prompt: str) -> str:
         return r.json()["choices"][0]["message"]["content"][:1200]
 
 async def analyze_photo(photo_bytes: bytes, prompt: str) -> str:
-    import base64, asyncio, functools
     b64 = base64.b64encode(photo_bytes).decode()
     msg = [
-      {"role":"system","content":"Ты — Решала. Отвечай кратко (до 1200 симв.), чётко, по делу."},
+      {"role":"system","content":"Ты – Решала. Отвечай коротко (≤1200 симв.)"},
       {"role":"user","content":[
-         {"type":"text","text": prompt},
-         {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+          {"type":"text","text": prompt},
+          {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
       ]}
     ]
     loop = asyncio.get_running_loop()
-    with (await SEM):
-        fn = functools.partial(_OAI.chat.completions.create, model="gpt-4o", messages=msg, max_tokens=800)
-        resp = await loop.run_in_executor(None, fn)
+    async with SEM:
+        func = functools.partial(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=msg,
+            max_tokens=800,
+        )
+        resp = await loop.run_in_executor(None, func)
     return resp.choices[0].message.content[:1200]
