@@ -329,6 +329,11 @@ def main() -> None:
 
     # Подготовка БД выполняется один раз перед запуском приложения.
     asyncio.run(create_tables())
+    # asyncio.run() закрывает текущий event loop. При последующем вызове
+    # Application.run_polling() в Python 3.11 это приводит к ошибке
+    # "There is no current event loop". Создаём и устанавливаем новый цикл
+    # событий, чтобы run_polling() мог им воспользоваться.
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
