@@ -7,7 +7,7 @@
 асинхронную SQLite-базу.
 """
 
-import os, io, asyncio, logging, json
+import os, io, asyncio, logging, json, sys
 from dotenv import load_dotenv
 from PIL import Image
 from telegram import (
@@ -106,7 +106,7 @@ async def clear_menu(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat.id, message_id=ans_id, reply_markup=None
             )
         except Exception:
-            pass
+            logging.exception("failed to remove reply_markup from answer")
     msg_id = await get_menu_msg(uid)
     if msg_id:
         try:
@@ -114,7 +114,7 @@ async def clear_menu(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat.id, message_id=msg_id, reply_markup=None
             )
         except Exception:
-            pass
+            logging.exception("failed to remove reply_markup from menu")
 
 async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE):
     """Показать меню, редактируя существующее сообщение."""
@@ -126,7 +126,7 @@ async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT
             )
             return
         except Exception:
-            pass
+            logging.exception("failed to edit existing menu message")
     msg = await chat.send_message(text, reply_markup=kb)
     await set_menu_msg(uid, msg.message_id)
     return msg
@@ -185,7 +185,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 await ctx.bot.send_message(parent, text, parse_mode=ParseMode.HTML)
             except Exception:
-                pass
+                logging.exception("failed to notify referrer")
             if alias_mode:
                 await set_free_photo(uid, 2)
     await grant_start_bonus(uid)
@@ -229,7 +229,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 await q.message.edit_reply_markup(None)
             except Exception:
-                pass
+                logging.exception("failed to remove answer markup")
             ctx.user_data.pop("ans_msg_id", None)
         ctx.user_data["stage"] = "main"
         await show_main(q.message.chat, uid, ctx)
@@ -393,6 +393,7 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         raise ctx.error
     except NetworkError:
+        logging.exception("network error")
         if update and getattr(update, "effective_chat", None):
             await update.effective_chat.send_message("⛔ Временно нет связи")
     except RetryAfter as e:
@@ -495,7 +496,7 @@ async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await ctx.bot.send_message(uid_, text)
         except Exception:
-            pass
+            logging.exception("broadcast to %s failed", uid_)
 
 # ── Запуск ───────────────────────────────────────────
 def main() -> None:
@@ -516,7 +517,8 @@ def main() -> None:
 
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        level=logging.INFO,
+        level=logging.WARNING,
+        stream=sys.stdout,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
