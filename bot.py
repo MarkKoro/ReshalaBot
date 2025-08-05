@@ -98,24 +98,35 @@ def clean_md(text: str) -> str:
     return text
 
 async def clear_menu(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Удалить текущее меню и убрать кнопку у ответа."""
+    """Убрать клавиатуру у предыдущих сообщений."""
     ans_id = ctx.user_data.pop("ans_msg_id", None)
     if ans_id:
         try:
-            await ctx.bot.edit_message_reply_markup(chat_id=chat.id, message_id=ans_id, reply_markup=None)
+            await ctx.bot.edit_message_reply_markup(
+                chat_id=chat.id, message_id=ans_id, reply_markup=None
+            )
         except Exception:
             pass
     msg_id = await get_menu_msg(uid)
     if msg_id:
         try:
-            await chat.delete_message(msg_id)
+            await ctx.bot.edit_message_reply_markup(
+                chat_id=chat.id, message_id=msg_id, reply_markup=None
+            )
         except Exception:
             pass
-        await set_menu_msg(uid, 0)
 
 async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE):
-    """Отправить новое меню, удалив предыдущее."""
-    await clear_menu(chat, uid, ctx)
+    """Показать меню, редактируя существующее сообщение."""
+    msg_id = await get_menu_msg(uid)
+    if msg_id:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat.id, message_id=msg_id, text=text, reply_markup=kb
+            )
+            return
+        except Exception:
+            pass
     msg = await chat.send_message(text, reply_markup=kb)
     await set_menu_msg(uid, msg.message_id)
     return msg
