@@ -91,6 +91,7 @@ HOW_IT_WORKS = (
 FOOTER = "\n\n— Решала"
 
 KB_BACK = Mk([[Btn("◀️ Назад", callback_data="back")]])
+KB_PAY = Mk([[Btn("Оплатить", pay=True)], [Btn("◀️ Назад", callback_data="back")]])
 
 def clean_md(text: str) -> str:
     for ch in "#*🔹":
@@ -277,7 +278,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             provider_token=token,
             currency=currency,
             prices=[LabeledPrice(f"{credits} баллов", price)],
-            reply_markup=KB_BACK,
+            reply_markup=KB_PAY,
         )
 
 # ── Message handlers ─────────────────────────────────
