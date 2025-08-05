@@ -15,7 +15,9 @@ from telegram import (
     InlineKeyboardButton as Btn,
     InlineKeyboardMarkup as Mk,
     LabeledPrice,
+    CopyTextButton,
 )
+from telegram.constants import ParseMode
 from telegram.error import NetworkError, RetryAfter
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -130,6 +132,16 @@ def kb_main(free_txt: bool, free_ph: int, credits: int) -> Mk:
         ]
     )
 
+
+def kb_ref(link: str) -> Mk:
+    return Mk(
+        [
+            [Btn("📋 Скопировать ссылку", copy_text=CopyTextButton(link))],
+            [Btn("📤 Отправить другу", url=f"https://t.me/share/url?url={link}")],
+            [Btn("◀️ Назад", callback_data="back")],
+        ]
+    )
+
 async def show_main(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
     kb = kb_main(
         await can_use_daily_text(uid),
@@ -156,7 +168,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await grant_referral_bonus(parent)
             link = f"tg://user?id={uid}"
             try:
-                await ctx.bot.send_message(parent, f"По вашей ссылке зарегистрировался {uid}: {link}")
+                text = (
+                    f"По вашей ссылке зарегистрировался "
+                    f"<a href=\"{link}\">{uid}</a>"
+                )
+                await ctx.bot.send_message(parent, text, parse_mode=ParseMode.HTML)
             except Exception:
                 pass
             if alias_mode:
@@ -224,8 +240,8 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
         link = f"https://t.me/{bot_name}?start={alias or uid}"
         refs = await get_ref_count(uid)
-        msg = f"Поделись ссылкой: {link}\nДрузей по ссылке: {refs}"
-        await send_menu(q.message.chat, uid, msg, KB_BACK, ctx)
+        msg = f"Друзей по ссылке: {refs}"
+        await send_menu(q.message.chat, uid, msg, kb_ref(link), ctx)
         ctx.user_data["stage"] = "ref"
     elif data == "how":
         await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_BACK, ctx)
@@ -420,7 +436,10 @@ async def cmd_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ok:
         bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
         link = f"https://t.me/{bot_name}?start={name}"
-        await update.message.reply_text(f"Ваша ссылка: {link}")
+        await update.message.reply_text(
+            "Нажми кнопку, чтобы скопировать ссылку",
+            reply_markup=kb_ref(link),
+        )
     else:
         await update.message.reply_text("Имя занято")
 
