@@ -294,8 +294,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             q.message.chat,
             uid,
             (
-                "Бывает, картинка говорит больше слов. Пришли фото: лицо видно чётко,"
-                " без фильтров, без маски. Один человек в кадре."
+                "Бывает, картинка говорит больше слов."
             ),
             KB_BACK,
             ctx,
