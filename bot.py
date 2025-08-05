@@ -98,8 +98,14 @@ def clean_md(text: str) -> str:
         text = text.replace(ch, "")
     return text
 
-async def clear_menu(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Убрать клавиатуру у предыдущих сообщений."""
+async def clear_menu(
+    chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE, delete: bool = False
+) -> None:
+    """Убрать клавиатуру у предыдущих сообщений.
+
+    Если ``delete`` истинно, то сообщение с меню удаляется полностью,
+    чтобы не плодить несколько меню в чате.
+    """
     ans_id = ctx.user_data.pop("ans_msg_id", None)
     if ans_id:
         try:
@@ -111,11 +117,16 @@ async def clear_menu(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg_id = await get_menu_msg(uid)
     if msg_id:
         try:
-            await ctx.bot.edit_message_reply_markup(
-                chat_id=chat.id, message_id=msg_id, reply_markup=None
-            )
+            if delete:
+                await ctx.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+            else:
+                await ctx.bot.edit_message_reply_markup(
+                    chat_id=chat.id, message_id=msg_id, reply_markup=None
+                )
         except Exception:
-            logging.exception("failed to remove reply_markup from menu")
+            logging.exception("failed to remove menu message")
+        if delete:
+            await set_menu_msg(uid, 0)
 
 async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE):
     """Показать меню, редактируя существующее сообщение."""
@@ -230,12 +241,8 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["stage"] = "await_photo"
         await send_menu(q.message.chat, uid, "Пришли фото…", KB_BACK, ctx)
     elif data == "back":
-        if ctx.user_data.get("stage") == "answer":
-            try:
-                await q.message.edit_reply_markup(None)
-            except Exception:
-                logging.exception("failed to remove answer markup")
-            ctx.user_data.pop("ans_msg_id", None)
+        delete = bool(getattr(q.message, "invoice", None))
+        await clear_menu(q.message.chat, uid, ctx, delete=delete)
         ctx.user_data["stage"] = "main"
         await show_main(q.message.chat, uid, ctx)
     elif data == "pay":
@@ -263,7 +270,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_BACK, ctx)
         ctx.user_data["stage"] = "how"
     elif data.startswith("buy_"):
-        await clear_menu(q.message.chat, uid, ctx)
+        await clear_menu(q.message.chat, uid, ctx, delete=True)
         _, c, method = data.split("_")
         credits = int(c)
         if method == "card":
@@ -274,7 +281,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             price = PRICE_PACKS_STARS[credits]
             currency = "XTR"
             token = ""
-        await ctx.bot.send_invoice(
+        invoice = await ctx.bot.send_invoice(
             chat_id=q.message.chat_id,
             title=f"{credits} баллов",
             description="Пакет баллов",
@@ -284,6 +291,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             prices=[LabeledPrice(f"{credits} баллов", price)],
             reply_markup=KB_PAY,
         )
+        await set_menu_msg(uid, invoice.message_id)
 
 # ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
@@ -388,10 +396,16 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await log_payment(uid, rub=PRICE_PACKS_RUB[credits] // 100)
     else:
         await log_payment(uid, stars=PRICE_PACKS_STARS[credits])
+    await clear_menu(update.message.chat, uid, ctx, delete=True)
     total = "∞" if uid in ADMINS else await get_credits(uid)
-    await update.message.reply_text(f"✅ Платёж прошёл! На счету {total} баллов")
+    kb = kb_main(
+        await can_use_daily_text(uid),
+        await get_free_photo(uid),
+        total,
+    )
+    msg = f"✅ Платёж прошёл! На счету {total} баллов\n\n{MAIN_TEXT}"
+    await send_menu(update.message.chat, uid, msg, kb, ctx)
     ctx.user_data["stage"] = "main"
-    await show_main(update.message.chat, uid, ctx)
 
 # ── Error handler ────────────────────────────────────
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
