@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 
-from utils.llm import ask_deepseek, analyze_photo
+from utils.llm import ask_deepseek, analyze_photo, PolicyError
 from db import (
     get_credits,
     add_credits,
@@ -91,6 +91,16 @@ HOW_IT_WORKS = (
     "Идея одна: меньше теории, больше дела."
 )
 FOOTER = "\n\nДержу курс на результат. Идём по плану. — Решала"
+
+TEXT_BLOCKED = "Своим запросом ничего не порешать. Давай другой."
+PHOTO_BLOCKED = (
+    "Твою проблему не решить, потому что фото нарушает правила сервиса. "
+    "Если есть другая задача — помогу. Будь осторожнее."
+)
+PHOTO_RULES = (
+    "Бывает, картинка говорит больше слов.\n"
+    "Запрещено: запрещёнка, харассмент, насилие и другое, что нарушает правила."
+)
 
 REMINDER_TEXT = (
     "Ты всё ещё на связи? Если что — я здесь. Запрос в день — бесплатно. "
@@ -293,9 +303,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_menu(
             q.message.chat,
             uid,
-            (
-                "Бывает, картинка говорит больше слов."
-            ),
+            PHOTO_RULES,
             KB_BACK,
             ctx,
         )
@@ -370,33 +378,42 @@ async def handle_text(update: Update, ctx):
 
     if stage == "await_text":
         await clear_menu(update.message.chat, uid, ctx)
-        if await can_use_daily_text(uid):
-            await mark_daily_text(uid)
-        else:
-            if uid not in ADMINS:
-                try:
-                    await dec_credits(uid, TEXT_COST)
-                except ValueError:
-                    kb_topup = Mk(
-                        [
-                            [Btn("Пополнить счёт", callback_data="pay")],
-                            [Btn("◀️ Назад", callback_data="back")],
-                        ]
-                    )
-                    await send_menu(
-                        update.message.chat,
-                        uid,
-                        "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
-                        kb_topup,
-                        ctx,
-                    )
-                    ctx.user_data["stage"] = "main"
-                    return
+        free = await can_use_daily_text(uid)
+        if not free and uid not in ADMINS:
+            credits = await get_credits(uid)
+            if credits < TEXT_COST:
+                kb_topup = Mk(
+                    [
+                        [Btn("Пополнить счёт", callback_data="pay")],
+                        [Btn("◀️ Назад", callback_data="back")],
+                    ]
+                )
+                await send_menu(
+                    update.message.chat,
+                    uid,
+                    "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
+                    kb_topup,
+                    ctx,
+                )
+                ctx.user_data["stage"] = "main"
+                return
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
-        ans = clean_md(await ask_deepseek(text))
+        try:
+            ans = clean_md(await ask_deepseek(text))
+        except PolicyError:
+            await wait.delete()
+            msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_BACK)
+            ctx.user_data["ans_msg_id"] = msg.message_id
+            ctx.user_data["stage"] = "answer"
+            return
         await wait.delete()
         max_len = 1200 - len(FOOTER)
         msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_BACK)
+        if free:
+            await mark_daily_text(uid)
+        else:
+            if uid not in ADMINS:
+                await dec_credits(uid, TEXT_COST)
         await inc_text_cnt(uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
@@ -431,7 +448,15 @@ async def handle_text(update: Update, ctx):
                     ctx.user_data["stage"] = "main"
                     return
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
-        ans = clean_md(await analyze_photo(photo, text))
+        try:
+            ans = clean_md(await analyze_photo(photo, text))
+        except PolicyError:
+            await wait.delete()
+            msg = await update.message.reply_text(PHOTO_BLOCKED, reply_markup=KB_BACK)
+            await inc_photo_cnt(uid)
+            ctx.user_data["ans_msg_id"] = msg.message_id
+            ctx.user_data["stage"] = "answer"
+            return
         await wait.delete()
         max_len = 1200 - len(FOOTER)
         msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_BACK)
