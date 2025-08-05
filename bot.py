@@ -277,6 +277,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             provider_token=token,
             currency=currency,
             prices=[LabeledPrice(f"{credits} баллов", price)],
+            reply_markup=KB_BACK,
         )
 
 # ── Message handlers ─────────────────────────────────
