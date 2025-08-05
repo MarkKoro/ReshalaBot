@@ -18,7 +18,7 @@ from telegram import (
     CopyTextButton,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, RetryAfter
+from telegram.error import NetworkError, RetryAfter, BadRequest
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -126,6 +126,10 @@ async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT
                 chat_id=chat.id, message_id=msg_id, text=text, reply_markup=kb
             )
             return
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return
+            logging.exception("failed to edit existing menu message")
         except Exception:
             logging.exception("failed to edit existing menu message")
     msg = await chat.send_message(text, reply_markup=kb)
