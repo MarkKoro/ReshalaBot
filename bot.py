@@ -78,17 +78,47 @@ PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
 PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
 
 MAIN_TEXT = (
-    "Я — Решало. Отправь текстовый вопрос или фото с подписью — и я подскажу, как действовать.\n"
-    "Каждый день доступен один бесплатный текстовый вопрос. Фотоанализ стоит 20 баллов."
+    "Я — Решала. Привет. Что у тебя за задача? Давай порешаем.\n"
+    "Отправь текстовый вопрос — подскажу, как действовать. Хочешь по фото — кидай снимок и пару строк контекста — разберём и это.\n"
+    "Каждый день у тебя есть один бесплатный текстовый вопрос."
 )
 HOW_IT_WORKS = (
-    "Бесплатно: 1 текст в день\n"
-    "Фото-анализ: 1 стартовый, 2 по ссылке, +1 за друга\n"
-    "Текст = 10 баллов, Фото = 20 баллов\n"
-    "100₽→100⚡ | 300₽→350⚡ | 500₽→600⚡\n"
-    "Команда /profile — статистика и рефералы"
+    "Коротко.\n"
+    "• Текст: задаёшь вопрос — я выдаю практичный план на 1–2 шага вперёд.\n"
+    "• Фото + текст: прикладываешь снимок и контекст — даю выводы и конкретные действия.\n"
+    "Бесплатно: 1 текст в день. Фото — платно, но на старте есть бонус, а за приглашённого друга — ещё плюс.\n"
+    "Баллы: текст — 10, фото — 20. Пакеты: 100₽→100 баллов, 300₽→350, 500₽→600.\n"
+    "Идея одна: меньше теории, больше дела."
 )
-FOOTER = "\n\n— Решала"
+FOOTER = "\n\nДержу курс на результат. Идём по плану. — Решала"
+
+REMINDER_TEXT = (
+    "Ты всё ещё на связи? Если что — я здесь. Запрос в день — бесплатно. "
+    "Сформулируй задачу, а я — план."
+)
+
+async def reminder_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = ctx.job.data
+    await ctx.bot.send_message(uid, REMINDER_TEXT)
+
+
+async def schedule_reminder(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    name = f"rem_{uid}"
+    for job in ctx.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    ctx.job_queue.run_once(reminder_job, 72 * 3600, name=name, data=uid)
+
+
+async def send_invoice_retry(bot, *args, **kwargs):
+    for attempt in range(5):
+        try:
+            return await bot.send_invoice(*args, **kwargs)
+        except RetryAfter as exc:
+            await asyncio.sleep(max(exc.retry_after, 2 ** attempt))
+        except NetworkError:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(2 ** attempt)
 
 KB_BACK = Mk([[Btn("◀️ Назад", callback_data="back")]])
 KB_PAY = Mk([[Btn("Оплатить", pay=True)], [Btn("◀️ Назад", callback_data="back")]])
@@ -192,6 +222,7 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
+    await schedule_reminder(uid, ctx)
     logging.info("command %s from %s", update.message.text, uid)
     if ctx.args:
         arg = ctx.args[0]
@@ -234,6 +265,7 @@ async def send_profile(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
+    await schedule_reminder(uid, ctx)
     logging.info("command %s from %s", update.message.text, uid)
     await send_profile(update.message.chat, uid, ctx)
     ctx.user_data["stage"] = "profile"
@@ -243,15 +275,31 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    await schedule_reminder(uid, ctx)
     data = q.data
     logging.info("callback %s from %s", data, uid)
 
     if data == "ask_text":
         ctx.user_data["stage"] = "await_text"
-        await send_menu(q.message.chat, uid, "Введи вопрос…", KB_BACK, ctx)
+        await send_menu(
+            q.message.chat,
+            uid,
+            "Опиши, в чём суть. Без лишнего — факты и цель. Дальше — мой ход.",
+            KB_BACK,
+            ctx,
+        )
     elif data == "ask_photo":
         ctx.user_data["stage"] = "await_photo"
-        await send_menu(q.message.chat, uid, "Пришли фото…", KB_BACK, ctx)
+        await send_menu(
+            q.message.chat,
+            uid,
+            (
+                "Бывает, картинка говорит больше слов. Пришли фото: лицо видно чётко,"
+                " без фильтров, без маски. Один человек в кадре."
+            ),
+            KB_BACK,
+            ctx,
+        )
     elif data == "back":
         await clear_menu(q.message.chat, uid, ctx, delete=True)
         ctx.user_data["stage"] = "main"
@@ -267,14 +315,23 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 ]
             )
         kb_rows.append([Btn("◀️ Назад", callback_data="back")])
-        await send_menu(q.message.chat, uid, "Выбери пакет пополнения", Mk(kb_rows), ctx)
+        await send_menu(
+            q.message.chat,
+            uid,
+            "Выбирай пакет и не тормози. Чем больше — тем выгоднее. Баллы не сгорают.",
+            Mk(kb_rows),
+            ctx,
+        )
         ctx.user_data["stage"] = "pay"
     elif data == "ref":
         alias = await get_alias(uid)
         bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
         link = f"https://t.me/{bot_name}?start={alias or uid}"
-        refs = await get_ref_count(uid)
-        msg = f"Друзей по ссылке: {refs}"
+        msg = (
+            "Поделись ссылкой — друг стартует быстрее, а ты получаешь дополнительный "
+            f"фото-разбор.\nТвоя ссылка: {link}\nРаботает и для новых, и для тех, кто давно "
+            "собирался."
+        )
         await send_menu(q.message.chat, uid, msg, kb_ref(link), ctx)
         ctx.user_data["stage"] = "ref"
     elif data == "how":
@@ -292,7 +349,8 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             price = PRICE_PACKS_STARS[credits]
             currency = "XTR"
             token = ""
-        invoice = await ctx.bot.send_invoice(
+        invoice = await send_invoice_retry(
+            ctx.bot,
             chat_id=q.message.chat_id,
             title=f"{credits} баллов",
             description="Пакет баллов",
@@ -307,6 +365,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
     uid = update.effective_user.id
+    await schedule_reminder(uid, ctx)
     stage = ctx.user_data.get("stage")
     text = update.message.text
 
@@ -325,7 +384,13 @@ async def handle_text(update: Update, ctx):
                             [Btn("◀️ Назад", callback_data="back")],
                         ]
                     )
-                    await send_menu(update.message.chat, uid, "Нет баллов", kb_topup, ctx)
+                    await send_menu(
+                        update.message.chat,
+                        uid,
+                        "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
+                        kb_topup,
+                        ctx,
+                    )
                     ctx.user_data["stage"] = "main"
                     return
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
@@ -357,7 +422,13 @@ async def handle_text(update: Update, ctx):
                             [Btn("◀️ Назад", callback_data="back")],
                         ]
                     )
-                    await send_menu(update.message.chat, uid, "Нет баллов", kb_topup, ctx)
+                    await send_menu(
+                        update.message.chat,
+                        uid,
+                        "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
+                        kb_topup,
+                        ctx,
+                    )
                     ctx.user_data["stage"] = "main"
                     return
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
@@ -374,6 +445,7 @@ async def handle_text(update: Update, ctx):
 
 async def handle_photo(update: Update, ctx):
     uid = update.effective_user.id
+    await schedule_reminder(uid, ctx)
     if ctx.user_data.get("stage") != "await_photo":
         await update.message.reply_text("Сначала выбери режим фото в меню")
         return
@@ -388,7 +460,13 @@ async def handle_photo(update: Update, ctx):
     out = io.BytesIO()
     img.save(out, format="JPEG")
     ctx.user_data["photo"] = out.getvalue()
-    await send_menu(update.message.chat, uid, "Опиши ситуацию текстом", KB_BACK, ctx)
+    await send_menu(
+        update.message.chat,
+        uid,
+        "Теперь пару строк контекста: что за ситуация и какого результата хочешь. Сделаю выжимку и план действий.",
+        KB_BACK,
+        ctx,
+    )
     ctx.user_data["stage"] = "await_photo_text"
 
 # ── Оплата ───────────────────────────────────────────
@@ -398,10 +476,11 @@ async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     payload = update.message.successful_payment.invoice_payload
+    uid = update.effective_user.id
+    await schedule_reminder(uid, ctx)
     parts = payload.split("_")
     credits = int(parts[1])
     method = parts[2]
-    uid = update.effective_user.id
     await add_credits(uid, credits)
     if method == "card":
         await log_payment(uid, rub=PRICE_PACKS_RUB[credits] // 100)
@@ -414,7 +493,7 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await get_free_photo(uid),
         total,
     )
-    msg = f"✅ Платёж прошёл! На счету {total} баллов\n\n{MAIN_TEXT}"
+    msg = "Готово. Баллы на месте. Возвращаемся к делу?"
     await send_menu(update.message.chat, uid, msg, kb, ctx)
     ctx.user_data["stage"] = "main"
 
@@ -425,7 +504,9 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except NetworkError:
         logging.exception("network error")
         if update and getattr(update, "effective_chat", None):
-            await update.effective_chat.send_message("⛔ Временно нет связи")
+            await update.effective_chat.send_message(
+                "Связь шалит. Дай пару минут — и продолжим."
+            )
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after)
         if update:
