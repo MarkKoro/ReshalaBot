@@ -114,7 +114,9 @@ async def clear_menu(
             )
         except Exception:
             logging.exception("failed to remove reply_markup from answer")
-    msg_id = await get_menu_msg(uid)
+    msg_id = ctx.user_data.get("menu_msg_id")
+    if msg_id is None:
+        msg_id = await get_menu_msg(uid)
     if msg_id:
         try:
             if delete:
@@ -126,24 +128,32 @@ async def clear_menu(
         except Exception:
             logging.exception("failed to remove menu message")
         if delete:
+            ctx.user_data.pop("menu_msg_id", None)
             await set_menu_msg(uid, 0)
 
 async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE):
     """Показать меню, редактируя существующее сообщение."""
-    msg_id = await get_menu_msg(uid)
+    msg_id = ctx.user_data.get("menu_msg_id")
+    if msg_id is None:
+        msg_id = await get_menu_msg(uid)
     if msg_id:
         try:
             await ctx.bot.edit_message_text(
                 chat_id=chat.id, message_id=msg_id, text=text, reply_markup=kb
             )
+            ctx.user_data["menu_msg_id"] = msg_id
+            await set_menu_msg(uid, msg_id)
             return
         except BadRequest as exc:
             if "Message is not modified" in str(exc):
+                ctx.user_data["menu_msg_id"] = msg_id
+                await set_menu_msg(uid, msg_id)
                 return
             logging.exception("failed to edit existing menu message")
         except Exception:
             logging.exception("failed to edit existing menu message")
     msg = await chat.send_message(text, reply_markup=kb)
+    ctx.user_data["menu_msg_id"] = msg.message_id
     await set_menu_msg(uid, msg.message_id)
     return msg
 
@@ -169,7 +179,9 @@ def kb_ref(link: str) -> Mk:
         ]
     )
 
-async def show_main(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
+async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id
     kb = kb_main(
         await can_use_daily_text(uid),
         await get_free_photo(uid),
@@ -205,7 +217,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if alias_mode:
                 await set_free_photo(uid, 2)
     await grant_start_bonus(uid)
-    await show_main(update.message.chat, uid, ctx)
+    await show_main(update, ctx)
     ctx.user_data["stage"] = "main"
 
 async def send_profile(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
@@ -241,10 +253,9 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["stage"] = "await_photo"
         await send_menu(q.message.chat, uid, "Пришли фото…", KB_BACK, ctx)
     elif data == "back":
-        delete = bool(getattr(q.message, "invoice", None))
-        await clear_menu(q.message.chat, uid, ctx, delete=delete)
+        await clear_menu(q.message.chat, uid, ctx, delete=True)
         ctx.user_data["stage"] = "main"
-        await show_main(q.message.chat, uid, ctx)
+        await show_main(update, ctx)
     elif data == "pay":
         kb_rows = []
         for c, price in PRICE_PACKS_RUB.items():
@@ -536,10 +547,11 @@ def main() -> None:
 
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        level=logging.WARNING,
+        level=logging.INFO,
         stream=sys.stdout,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext._callbackqueryhandler").setLevel(logging.INFO)
 
     app = (
         Application.builder()
