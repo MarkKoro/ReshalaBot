@@ -109,10 +109,15 @@ PHOTO_BLOCKED = (
     "Если есть другая задача — скидывай, но будь осторожнее."
 )
 PHOTO_RULES = (
-    '🖼Допустим ты видишь картину перед собой, и вообще не понимаешь: "И что дальше?".\n'
-    "Так вот с абсолютно любой такой диллемой я здесь что бы решить и помочь. Просто скинь фото.\n"
+    "Здесь скинь фото\n"
+    "\n"
+    '🖼Допустим ты видишь картину перед собой, и вообще не понимаешь: "И что дальше?"\n'
+    "Так вот с абсолютно любой такой диллемой я здесь что бы решить и помочь.\n"
     "🚫Запрещено: харассмент, насилие и другое, что нарушает обьективные правила контента\n"
-    "А то мы баллы спишем, а ответ не дадим, оно вам не надо"
+    "А то мы баллы спишем, а ответ не дадим, оно вам не надо\n"
+    "\n"
+    "Скинь фото\n"
+    "(Подсказка: сейчас отправь только фотографию, позже опиши проблему)"
 )
 
 REMINDER_TEXT = (
@@ -144,6 +149,7 @@ async def send_invoice_retry(bot, *args, **kwargs):
             await asyncio.sleep(2 ** attempt)
 
 KB_BACK = Mk([[Btn("◀️ Передумал", callback_data="back")]])
+KB_NAZAD = Mk([[Btn("◀️ Назад", callback_data="back")]])
 KB_PAY = Mk([[Btn("Перевести Решале", pay=True)], [Btn("◀️ Передумал", callback_data="back")]])
 
 def clean_md(text: str) -> str:
@@ -284,7 +290,6 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    await schedule_reminder(uid, ctx)
     logging.info("command %s from %s", update.message.text, uid)
     if ctx.args:
         arg = ctx.args[0]
@@ -327,7 +332,6 @@ async def send_profile(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    await schedule_reminder(uid, ctx)
     logging.info("command %s from %s", update.message.text, uid)
     await send_profile(update.message.chat, uid, ctx)
     ctx.user_data["stage"] = "profile"
@@ -337,7 +341,6 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    await schedule_reminder(uid, ctx)
     data = q.data
     logging.info("callback %s from %s", data, uid)
 
@@ -346,7 +349,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_menu(
             q.message.chat,
             uid,
-            "Опиши, в чём суть. Без лишнего — факты и цель. Дальше — мой ход.",
+            "Опиши, в чём суть. Без лишнего — факты и цель. Дальше — мой ход. (Подсказка: напишите в сообщениях вопрос, который вы хотели бы задать)",
             KB_BACK,
             ctx,
         )
@@ -373,7 +376,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     Btn(f"{stars}⭐ → {c} баллов", callback_data=f"buy_{c}_stars"),
                 ]
             )
-        kb_rows.append([Btn("◀️ Назад", callback_data="back")])
+        kb_rows.append([Btn("◀️ Передумал", callback_data="back")])
         await send_menu(
             q.message.chat,
             uid,
@@ -394,7 +397,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_menu(q.message.chat, uid, msg, kb_ref(link), ctx, slot="ref")
         ctx.user_data["stage"] = "ref"
     elif data == "how":
-        await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_BACK, ctx, slot="how")
+        await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_NAZAD, ctx, slot="how")
         ctx.user_data["stage"] = "how"
     elif data.startswith("buy_"):
         await clear_menu(q.message.chat, uid, ctx, delete=True)
@@ -424,7 +427,6 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
     uid = update.effective_user.id
-    await schedule_reminder(uid, ctx)
     stage = ctx.user_data.get("stage")
     text = update.message.text
 
@@ -470,6 +472,7 @@ async def handle_text(update: Update, ctx):
         await inc_text_cnt(uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
+        await schedule_reminder(uid, ctx)
 
     elif stage == "await_photo_text":
         await clear_menu(update.message.chat, uid, ctx)
@@ -517,13 +520,13 @@ async def handle_text(update: Update, ctx):
         await inc_photo_cnt(uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
+        await schedule_reminder(uid, ctx)
 
     else:
         await update.message.reply_text("Используй меню")
 
 async def handle_photo(update: Update, ctx):
     uid = update.effective_user.id
-    await schedule_reminder(uid, ctx)
     if ctx.user_data.get("stage") != "await_photo":
         await update.message.reply_text("Сначала выбери режим фото в меню")
         return
@@ -555,7 +558,6 @@ async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     payload = update.message.successful_payment.invoice_payload
     uid = update.effective_user.id
-    await schedule_reminder(uid, ctx)
     parts = payload.split("_")
     credits = int(parts[1])
     method = parts[2]
