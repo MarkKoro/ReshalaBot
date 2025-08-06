@@ -7,7 +7,7 @@
 асинхронную SQLite-базу.
 """
 
-import os, io, asyncio, logging, json, sys
+import os, io, asyncio, logging, sys
 from dotenv import load_dotenv
 from PIL import Image
 from telegram import (
@@ -16,6 +16,7 @@ from telegram import (
     InlineKeyboardMarkup as Mk,
     LabeledPrice,
     CopyTextButton,
+    InputMediaPhoto,
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, RetryAfter, BadRequest
@@ -33,6 +34,7 @@ from telegram.ext import (
 )
 
 from utils.llm import ask_deepseek, analyze_photo, PolicyError
+from assets import load_assets, save_assets, SLOTS
 from db import (
     get_credits,
     add_credits,
@@ -70,6 +72,12 @@ ADMINS = {
     for x in (os.getenv("ADMINS") or os.getenv("ADMIN_IDS", "")).split(",")
     if x
 }
+
+ASSETS = load_assets()
+CACHE_CHAT_ID = int(os.getenv("CACHE_CHAT_ID") or ASSETS.get("cache_chat_id", 0))
+if ASSETS.get("cache_chat_id") != CACHE_CHAT_ID:
+    ASSETS["cache_chat_id"] = CACHE_CHAT_ID
+    save_assets(ASSETS)
 
 TEXT_COST = 10
 PHOTO_COST = 20
@@ -174,31 +182,70 @@ async def clear_menu(
             logging.exception("failed to remove menu message")
         if delete:
             ctx.user_data.pop("menu_msg_id", None)
+            ctx.user_data.pop("menu_slot", None)
             await set_menu_msg(uid, 0)
 
-async def send_menu(chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE):
-    """Показать меню, редактируя существующее сообщение."""
+async def send_menu(
+    chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE, slot: str | None = None
+):
+    """Показать меню, редактируя существующее фото-сообщение."""
     msg_id = ctx.user_data.get("menu_msg_id")
     if msg_id is None:
         msg_id = await get_menu_msg(uid)
-    if msg_id:
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat.id, message_id=msg_id, text=text, reply_markup=kb
-            )
+        if msg_id:
             ctx.user_data["menu_msg_id"] = msg_id
-            await set_menu_msg(uid, msg_id)
+    cur_slot = ctx.user_data.get("menu_slot")
+    target_slot = slot or cur_slot or "main"
+    banner = ASSETS.get("banners", {}).get(target_slot, {})
+    banner_id = banner.get("msg_id", 0)
+    banner_file = banner.get("file_id")
+
+    if msg_id and target_slot == cur_slot:
+        try:
+            await ctx.bot.edit_message_caption(
+                chat_id=chat.id,
+                message_id=msg_id,
+                caption=text[:1024],
+                reply_markup=kb,
+            )
             return
         except BadRequest as exc:
-            if "Message is not modified" in str(exc):
-                ctx.user_data["menu_msg_id"] = msg_id
-                await set_menu_msg(uid, msg_id)
+            if "message is not modified" in str(exc).lower():
                 return
             logging.exception("failed to edit existing menu message")
         except Exception:
             logging.exception("failed to edit existing menu message")
-    msg = await chat.send_message(text, reply_markup=kb)
+
+    if msg_id and target_slot != cur_slot and banner_file:
+        try:
+            await ctx.bot.edit_message_media(
+                chat_id=chat.id,
+                message_id=msg_id,
+                media=InputMediaPhoto(banner_file, caption=text[:1024]),
+                reply_markup=kb,
+            )
+            ctx.user_data["menu_slot"] = target_slot
+            return
+        except Exception:
+            logging.exception("failed to edit menu media")
+
+    if banner_id:
+        msg = await ctx.bot.copy_message(
+            chat_id=chat.id,
+            from_chat_id=CACHE_CHAT_ID,
+            message_id=banner_id,
+            caption=text[:1024],
+            reply_markup=kb,
+        )
+    else:
+        msg = await chat.send_message(text[:1024], reply_markup=kb)
+    if msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+        except Exception:
+            logging.exception("failed to delete old menu message")
     ctx.user_data["menu_msg_id"] = msg.message_id
+    ctx.user_data["menu_slot"] = target_slot
     await set_menu_msg(uid, msg.message_id)
     return msg
 
@@ -232,7 +279,7 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await get_free_photo(uid),
         "∞" if uid in ADMINS else await get_credits(uid),
     )
-    await send_menu(chat, uid, MAIN_TEXT, kb, ctx)
+    await send_menu(chat, uid, MAIN_TEXT, kb, ctx, slot="main")
 
 # ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,6 +380,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Здесь ты решаешь, будет ли решала с тобой по-серьезному, или это просто так. Баллы не сгорают.",
             Mk(kb_rows),
             ctx,
+            slot="pay",
         )
         ctx.user_data["stage"] = "pay"
     elif data == "ref":
@@ -343,10 +391,10 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Скинь другу или родителям, я помогу им с их проблемами, а ты получаешь дополнительный "
             f"фото-разбор.\nТвоя ссылка: {link}\n"
         )
-        await send_menu(q.message.chat, uid, msg, kb_ref(link), ctx)
+        await send_menu(q.message.chat, uid, msg, kb_ref(link), ctx, slot="ref")
         ctx.user_data["stage"] = "ref"
     elif data == "how":
-        await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_BACK, ctx)
+        await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_BACK, ctx, slot="how")
         ctx.user_data["stage"] = "how"
     elif data.startswith("buy_"):
         await clear_menu(q.message.chat, uid, ctx, delete=True)
@@ -398,6 +446,7 @@ async def handle_text(update: Update, ctx):
                     "Вам не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
                     kb_topup,
                     ctx,
+                    slot="pay",
                 )
                 ctx.user_data["stage"] = "main"
                 return
@@ -448,6 +497,7 @@ async def handle_text(update: Update, ctx):
                         "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
                         kb_topup,
                         ctx,
+                        slot="pay",
                     )
                     ctx.user_data["stage"] = "main"
                     return
@@ -522,7 +572,7 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         total,
     )
     msg = "Готово. Баллы на месте. Возвращаемся к делу?"
-    await send_menu(update.message.chat, uid, msg, kb, ctx)
+    await send_menu(update.message.chat, uid, msg, kb, ctx, slot="main")
     ctx.user_data["stage"] = "main"
 
 # ── Error handler ────────────────────────────────────
@@ -622,6 +672,56 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     users = len(await get_all_uids())
     await update.message.reply_text(f"Всего пользователей: {users}")
 
+
+async def cache_banner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    if uid not in ADMINS:
+        return
+    try:
+        slot = ctx.args[0]
+    except IndexError:
+        await update.message.reply_text("Usage: /cache_banner <slot>")
+        return
+    if slot not in SLOTS:
+        await update.message.reply_text("unknown slot")
+        return
+    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
+        await update.message.reply_text("Нужно ответить на фото")
+        return
+    src = update.message.reply_to_message
+    copied = await ctx.bot.copy_message(
+        chat_id=CACHE_CHAT_ID,
+        from_chat_id=src.chat_id,
+        message_id=src.message_id,
+    )
+    file_id = ""
+    if copied.photo:
+        file_id = copied.photo[-1].file_id
+    elif src.photo:
+        file_id = src.photo[-1].file_id
+    ASSETS["cache_chat_id"] = CACHE_CHAT_ID
+    ASSETS["banners"][slot]["msg_id"] = copied.message_id
+    ASSETS["banners"][slot]["file_id"] = file_id
+    save_assets(ASSETS)
+    await update.message.reply_text("баннер сохранён")
+
+
+async def banners_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    if uid not in ADMINS:
+        return
+    for slot in SLOTS:
+        msg_id = ASSETS.get("banners", {}).get(slot, {}).get("msg_id", 0)
+        if msg_id:
+            await ctx.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=CACHE_CHAT_ID,
+                message_id=msg_id,
+                caption=slot,
+            )
+
 async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
@@ -680,6 +780,8 @@ def main() -> None:
     app.add_handler(CommandHandler("stats_referrals", stats_referrals))
     app.add_handler(CommandHandler("stats_alias", stats_alias))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("cache_banner", cache_banner))
+    app.add_handler(CommandHandler("banners_check", banners_check))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
