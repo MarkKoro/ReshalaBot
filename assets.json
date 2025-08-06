@@ -1,0 +1,9 @@
+{
+  "cache_chat_id": 0,
+  "banners": {
+    "main": {"msg_id": 0, "file_id": ""},
+    "pay": {"msg_id": 0, "file_id": ""},
+    "how": {"msg_id": 0, "file_id": ""},
+    "ref": {"msg_id": 0, "file_id": ""}
+  }
+}
