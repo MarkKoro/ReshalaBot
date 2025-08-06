@@ -673,6 +673,12 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Всего пользователей: {users}")
 
 
+async def whereami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    logging.info("command %s from chat %s", update.message.text, chat_id)
+    await update.message.reply_text(str(chat_id))
+
+
 async def cache_banner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
@@ -695,11 +701,7 @@ async def cache_banner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         from_chat_id=src.chat_id,
         message_id=src.message_id,
     )
-    file_id = ""
-    if copied.photo:
-        file_id = copied.photo[-1].file_id
-    elif src.photo:
-        file_id = src.photo[-1].file_id
+    file_id = src.photo[-1].file_id
     ASSETS["cache_chat_id"] = CACHE_CHAT_ID
     ASSETS["banners"][slot]["msg_id"] = copied.message_id
     ASSETS["banners"][slot]["file_id"] = file_id
@@ -780,6 +782,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stats_referrals", stats_referrals))
     app.add_handler(CommandHandler("stats_alias", stats_alias))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("whereami", whereami))
     app.add_handler(CommandHandler("cache_banner", cache_banner))
     app.add_handler(CommandHandler("banners_check", banners_check))
     app.add_handler(CommandHandler("broadcast", broadcast))
