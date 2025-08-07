@@ -153,6 +153,7 @@ async def send_invoice_retry(bot, *args, **kwargs):
                 raise
             await asyncio.sleep(2 ** attempt)
 
+KB_MENU = Mk([[Btn("◀️ В меню", callback_data="back")]])
 KB_BACK = Mk([[Btn("◀️ Передумал", callback_data="back")]])
 KB_NAZAD = Mk([[Btn("◀️ Назад", callback_data="back")]])
 KB_PAY = Mk([[Btn("Перевести Решале", pay=True)], [Btn("◀️ Передумал", callback_data="back")]])
@@ -462,13 +463,13 @@ async def handle_text(update: Update, ctx):
             ans = clean_md(await ask_deepseek(text))
         except PolicyError:
             await wait.delete()
-            msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_BACK)
+            msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_MENU)
             ctx.user_data["ans_msg_id"] = msg.message_id
             ctx.user_data["stage"] = "answer"
             return
         await wait.delete()
-        max_len = 1200 - len(FOOTER)
-        msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_BACK)
+        max_len = 1500 - len(FOOTER)
+        msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_MENU)
         if free:
             await mark_daily_text(uid)
         else:
@@ -514,14 +515,14 @@ async def handle_text(update: Update, ctx):
             ans = clean_md(await analyze_photo(photo, text))
         except PolicyError:
             await wait.delete()
-            msg = await update.message.reply_text(PHOTO_BLOCKED, reply_markup=KB_BACK)
+            msg = await update.message.reply_text(PHOTO_BLOCKED, reply_markup=KB_MENU)
             await inc_photo_cnt(uid)
             ctx.user_data["ans_msg_id"] = msg.message_id
             ctx.user_data["stage"] = "answer"
             return
         await wait.delete()
-        max_len = 1200 - len(FOOTER)
-        msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_BACK)
+        max_len = 1500 - len(FOOTER)
+        msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_MENU)
         await inc_photo_cnt(uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
