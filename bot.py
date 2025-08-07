@@ -8,6 +8,7 @@
 """
 
 import os, io, asyncio, logging, sys
+import aiosqlite, json
 from dotenv import load_dotenv
 from PIL import Image
 from telegram import (
@@ -61,6 +62,7 @@ from db import (
     log_payment,
     get_referral_stats,
     get_alias_stats,
+    DB_PATH,
 )
 
 # ── Глобальные настройки ─────────────────────────────
@@ -84,6 +86,18 @@ PHOTO_COST = 20
 # Ключ словаря — количество баллов, значение — цена
 PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
 PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
+
+
+async def init_db(app: Application) -> None:
+    db = await aiosqlite.connect(DB_PATH, check_same_thread=False)
+    await create_tables(db)
+    app.bot_data["db"] = db
+
+
+async def close_db(app: Application) -> None:
+    db = app.bot_data.get("db")
+    if db:
+        await db.close()
 
 MAIN_TEXT = (
     "Привет. Я — Решала. Что у тебя за задача?\n"
@@ -179,7 +193,7 @@ async def clear_menu(
             logging.exception("failed to remove reply_markup from answer")
     msg_id = ctx.user_data.get("menu_msg_id")
     if msg_id is None:
-        msg_id = await get_menu_msg(uid)
+        msg_id = await get_menu_msg(ctx.bot_data["db"], uid)
     if msg_id:
         try:
             if delete:
@@ -193,7 +207,7 @@ async def clear_menu(
         if delete:
             ctx.user_data.pop("menu_msg_id", None)
             ctx.user_data.pop("menu_slot", None)
-            await set_menu_msg(uid, 0)
+            await set_menu_msg(ctx.bot_data["db"], uid, 0)
 
 async def send_menu(
     chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE, slot: str | None = None
@@ -201,7 +215,7 @@ async def send_menu(
     """Показать меню, редактируя существующее фото-сообщение."""
     msg_id = ctx.user_data.get("menu_msg_id")
     if msg_id is None:
-        msg_id = await get_menu_msg(uid)
+        msg_id = await get_menu_msg(ctx.bot_data["db"], uid)
         if msg_id:
             ctx.user_data["menu_msg_id"] = msg_id
     cur_slot = ctx.user_data.get("menu_slot")
@@ -256,7 +270,7 @@ async def send_menu(
             logging.exception("failed to delete old menu message")
     ctx.user_data["menu_msg_id"] = msg.message_id
     ctx.user_data["menu_slot"] = target_slot
-    await set_menu_msg(uid, msg.message_id)
+    await set_menu_msg(ctx.bot_data["db"], uid, msg.message_id)
     return msg
 
 def kb_main(free_txt: bool, free_ph: int, credits: int) -> Mk:
@@ -284,10 +298,11 @@ def kb_ref(link: str) -> Mk:
 async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     uid = update.effective_user.id
+    db = ctx.bot_data["db"]
     kb = kb_main(
-        await can_use_daily_text(uid),
-        await get_free_photo(uid),
-        "∞" if uid in ADMINS else await get_credits(uid),
+        await can_use_daily_text(db, uid),
+        await get_free_photo(db, uid),
+        "∞" if uid in ADMINS else await get_credits(db, uid),
     )
     await send_menu(chat, uid, MAIN_TEXT, kb, ctx, slot="main")
 
@@ -295,6 +310,7 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
+    db = ctx.bot_data["db"]
     if ctx.args:
         arg = ctx.args[0]
         parent = 0
@@ -302,11 +318,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             parent = int(arg)
         except ValueError:
-            parent = await get_uid_by_alias(arg)
+            parent = await get_uid_by_alias(db, arg)
             alias_mode = parent > 0
         if parent and parent != uid:
-            await set_ref_parent(uid, parent)
-            await grant_referral_bonus(parent)
+            await set_ref_parent(db, uid, parent)
+            await grant_referral_bonus(db, parent)
             link = f"tg://user?id={uid}"
             try:
                 text = (
@@ -317,15 +333,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 logging.exception("failed to notify referrer")
             if alias_mode:
-                await set_free_photo(uid, 2)
-    await grant_start_bonus(uid)
+                await set_free_photo(db, uid, 2)
+    await grant_start_bonus(db, uid)
     await show_main(update, ctx)
     ctx.user_data["stage"] = "main"
 
 async def send_profile(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
-    credits = "∞" if uid in ADMINS else await get_credits(uid)
-    tc, pc = await get_counts(uid)
-    refs = await get_ref_count(uid)
+    db = ctx.bot_data["db"]
+    credits = "∞" if uid in ADMINS else await get_credits(db, uid)
+    tc, pc = await get_counts(db, uid)
+    refs = await get_ref_count(db, uid)
     msg = (
         f"Баланс: {credits} баллов\n"
         f"Вопросов: {tc}\n"
@@ -347,6 +364,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = q.from_user.id
     data = q.data
     logging.info("callback %s from %s", data, uid)
+    db = ctx.bot_data["db"]
 
     if data == "ask_text":
         ctx.user_data["stage"] = "await_text"
@@ -391,7 +409,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         ctx.user_data["stage"] = "pay"
     elif data == "ref":
-        alias = await get_alias(uid)
+        alias = await get_alias(db, uid)
         bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
         link = f"https://t.me/{bot_name}?start={alias or uid}"
         msg = (
@@ -426,19 +444,20 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             prices=[LabeledPrice(f"{credits} баллов", price)],
             reply_markup=KB_PAY,
         )
-        await set_menu_msg(uid, invoice.message_id)
+        await set_menu_msg(ctx.bot_data["db"], uid, invoice.message_id)
 
 # ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
     uid = update.effective_user.id
     stage = ctx.user_data.get("stage")
     text = update.message.text
+    db = ctx.bot_data["db"]
 
     if stage == "await_text":
         await clear_menu(update.message.chat, uid, ctx)
-        free = await can_use_daily_text(uid)
+        free = await can_use_daily_text(db, uid)
         if not free and uid not in ADMINS:
-            credits = await get_credits(uid)
+            credits = await get_credits(db, uid)
             if credits < TEXT_COST:
                 kb_topup = Mk(
                     [
@@ -470,28 +489,28 @@ async def handle_text(update: Update, ctx):
         max_len = 1800
         msg = await update.message.reply_text(ans[:max_len], reply_markup=KB_MENU)
         if free:
-            await mark_daily_text(uid)
+            await mark_daily_text(db, uid)
         else:
             if uid not in ADMINS:
-                await dec_credits(uid, TEXT_COST)
-        await inc_text_cnt(uid)
+                await dec_credits(db, uid, TEXT_COST)
+        await inc_text_cnt(db, uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
         await schedule_reminder(uid, ctx)
 
     elif stage == "await_photo_text":
         await clear_menu(update.message.chat, uid, ctx)
-        photo = ctx.user_data.pop("photo", None)
+        photo = ctx.user_data.get("photo")
         if photo is None:
             await update.message.reply_text("Сначала пришли фото")
             return
-        free = await get_free_photo(uid)
+        free = await get_free_photo(db, uid)
         if free > 0:
-            await use_free_photo(uid)
+            await use_free_photo(db, uid)
         else:
             if uid not in ADMINS:
                 try:
-                    await dec_credits(uid, PHOTO_COST)
+                    await dec_credits(db, uid, PHOTO_COST)
                 except ValueError:
                     kb_topup = Mk(
                         [
@@ -515,19 +534,23 @@ async def handle_text(update: Update, ctx):
         except PolicyError:
             await wait.delete()
             msg = await update.message.reply_text(PHOTO_BLOCKED, reply_markup=KB_MENU)
-            await inc_photo_cnt(uid)
+            await inc_photo_cnt(db, uid)
             ctx.user_data["ans_msg_id"] = msg.message_id
             ctx.user_data["stage"] = "answer"
             return
+        finally:
+            ctx.user_data.pop("photo", None)
+            photo = None
         await wait.delete()
         await update.message.reply_text("Вот что порешали")
         max_len = 1800
         msg = await update.message.reply_text(ans[:max_len], reply_markup=KB_MENU)
-        await inc_photo_cnt(uid)
+        await inc_photo_cnt(db, uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
         await schedule_reminder(uid, ctx)
-
+    elif stage == "await_photo":
+        await update.message.reply_text("Сейчас время скидывать фотографию\n(Скинь фото)")
     else:
         await update.message.reply_text("Используй меню")
 
@@ -567,16 +590,17 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     parts = payload.split("_")
     credits = int(parts[1])
     method = parts[2]
-    await add_credits(uid, credits)
+    db = ctx.bot_data["db"]
+    await add_credits(db, uid, credits)
     if method == "card":
-        await log_payment(uid, rub=PRICE_PACKS_RUB[credits] // 100)
+        await log_payment(db, uid, rub=PRICE_PACKS_RUB[credits] // 100)
     else:
-        await log_payment(uid, stars=PRICE_PACKS_STARS[credits])
+        await log_payment(db, uid, stars=PRICE_PACKS_STARS[credits])
     await clear_menu(update.message.chat, uid, ctx, delete=True)
-    total = "∞" if uid in ADMINS else await get_credits(uid)
+    total = "∞" if uid in ADMINS else await get_credits(db, uid)
     kb = kb_main(
-        await can_use_daily_text(uid),
-        await get_free_photo(uid),
+        await can_use_daily_text(db, uid),
+        await get_free_photo(db, uid),
         total,
     )
     msg = "Готово. Баллы на месте. Возвращаемся к делу?"
@@ -613,7 +637,8 @@ async def grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /grant <id> <qty>")
         return
-    await add_credits(target, qty)
+    db = ctx.bot_data["db"]
+    await add_credits(db, target, qty)
     await update.message.reply_text("OK")
 
 async def decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -628,7 +653,8 @@ async def decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /decredits <id> <qty>")
         return
     try:
-        await dec_credits(target, qty)
+        db = ctx.bot_data["db"]
+        await dec_credits(db, target, qty)
     except ValueError:
         await update.message.reply_text("Not enough")
         return
@@ -642,7 +668,8 @@ async def cmd_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except IndexError:
         await update.message.reply_text("Usage: /alias <name>")
         return
-    ok = await set_alias(uid, name)
+    db = ctx.bot_data["db"]
+    ok = await set_alias(db, uid, name)
     if ok:
         bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
         link = f"https://t.me/{bot_name}?start={name}"
@@ -658,17 +685,19 @@ async def stats_referrals(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     logging.info("command %s from %s", update.message.text, uid)
     if uid not in ADMINS:
         return
-    data = await get_referral_stats()
+    db = ctx.bot_data["db"]
+    data = await get_referral_stats(db)
     await update.message.reply_text(json.dumps(data, ensure_ascii=False))
 
 async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
-    alias = await get_alias(uid)
+    db = ctx.bot_data["db"]
+    alias = await get_alias(db, uid)
     if not alias:
         await update.message.reply_text("У вас нет alias")
         return
-    cnt, rub, stars = await get_alias_stats(uid)
+    cnt, rub, stars = await get_alias_stats(db, uid)
     data = {"alias": alias, "count": cnt, "rub": rub, "stars": stars}
     await update.message.reply_text(json.dumps(data, ensure_ascii=False))
 
@@ -677,7 +706,8 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logging.info("command %s from %s", update.message.text, uid)
     if uid not in ADMINS:
         return
-    users = len(await get_all_uids())
+    db = ctx.bot_data["db"]
+    users = len(await get_all_uids(db))
     await update.message.reply_text(f"Всего пользователей: {users}")
 
 
@@ -741,7 +771,8 @@ async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /broadcast <text>")
         return
     text = " ".join(ctx.args)
-    for uid_ in await get_all_uids():
+    db = ctx.bot_data["db"]
+    for uid_ in await get_all_uids(db):
         try:
             await ctx.bot.send_message(uid_, text)
         except Exception:
@@ -755,14 +786,6 @@ def main() -> None:
     Чтобы избежать ошибки "event loop is already running", не оборачиваем
     вызов run_polling() в asyncio.run().
     """
-
-    # Подготовка БД выполняется один раз перед запуском приложения.
-    asyncio.run(create_tables())
-    # asyncio.run() закрывает текущий event loop. При последующем вызове
-    # Application.run_polling() в Python 3.11 это приводит к ошибке
-    # "There is no current event loop". Создаём и устанавливаем новый цикл
-    # событий, чтобы run_polling() мог им воспользоваться.
-    asyncio.set_event_loop(asyncio.new_event_loop())
 
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -779,6 +802,8 @@ def main() -> None:
         .rate_limiter(AIORateLimiter())
         .job_queue(JobQueue())
         .request(HTTPXRequest(connection_pool_size=1024))
+        .post_init(init_db)
+        .post_shutdown(close_db)
         .build()
     )
 
