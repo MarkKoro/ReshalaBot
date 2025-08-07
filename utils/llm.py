@@ -55,12 +55,18 @@ async def ask_deepseek(prompt: str) -> str:
         {"role": "user", "content": prompt},
     ]
     for attempt in range(5):
-        async with SEM, httpx.AsyncClient(timeout=30) as cli:
-            r = await cli.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={"Authorization": f"Bearer {_DS}"},
-                json={"model": "deepseek-chat", "messages": messages},
-            )
+        async with SEM, httpx.AsyncClient(timeout=60) as cli:
+            try:
+                r = await cli.post(
+                    "https://api.deepseek.com/chat/completions",
+                    headers={"Authorization": f"Bearer {_DS}"},
+                    json={"model": "deepseek-chat", "messages": messages},
+                )
+            except httpx.ReadTimeout:
+                if attempt < 4:
+                    await _sleep(attempt)
+                    continue
+                raise
         if r.status_code in {429, 500, 502} and attempt < 4:
             await _sleep(attempt)
             continue
