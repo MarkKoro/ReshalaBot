@@ -108,8 +108,6 @@ HOW_IT_WORKS = (
     "\n"
     " А если тебе грустно, то и это как то порешаем"
 )
-FOOTER = "\n\nДержу курс на результат. Идём по плану. — Решала"
-
 TEXT_BLOCKED = "Выявлено нарушение нашего сервиса. С твоим запросом ничего не порешать. Давай другой."
 PHOTO_BLOCKED = (
     "Твою проблему не решить, потому что фото нарушает правила сервиса. "
@@ -468,8 +466,9 @@ async def handle_text(update: Update, ctx):
             ctx.user_data["stage"] = "answer"
             return
         await wait.delete()
-        max_len = 1500 - len(FOOTER)
-        msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_MENU)
+        await update.message.reply_text("Вот что порешали")
+        max_len = 1800
+        msg = await update.message.reply_text(ans[:max_len], reply_markup=KB_MENU)
         if free:
             await mark_daily_text(uid)
         else:
@@ -521,8 +520,9 @@ async def handle_text(update: Update, ctx):
             ctx.user_data["stage"] = "answer"
             return
         await wait.delete()
-        max_len = 1500 - len(FOOTER)
-        msg = await update.message.reply_text(ans[:max_len] + FOOTER, reply_markup=KB_MENU)
+        await update.message.reply_text("Вот что порешали")
+        max_len = 1800
+        msg = await update.message.reply_text(ans[:max_len], reply_markup=KB_MENU)
         await inc_photo_cnt(uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
