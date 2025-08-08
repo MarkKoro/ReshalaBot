@@ -1,18 +1,25 @@
 import base64, os, httpx, asyncio, functools, logging
 from dotenv import load_dotenv
 from openai import OpenAI
+from telegram import Bot
 
 load_dotenv()
 _DS = os.getenv("DS_API_KEY")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+DEBUG_POLICY = os.getenv("DEBUG_POLICY") == "1"
+_BOT_TOKEN = os.getenv("BOT_TOKEN")
+_ADMINS = [
+    int(x)
+    for x in (os.getenv("ADMINS") or os.getenv("ADMIN_IDS", "")).split(",")
+    if x
+]
+_DEBUG_BOT = Bot(_BOT_TOKEN) if DEBUG_POLICY and _BOT_TOKEN and _ADMINS else None
+
 
 class PolicyError(Exception):
     """Запрос нарушает правила сервиса."""
-
-    def __init__(self, message: str = ""):
-        super().__init__(message)
-        self.message = message
+    pass
 
 
 TEXT_SYS_PROMPT = '''== СИСТЕМНЫЙ ПРОМПТ: ПЕРСОНАЖ "РЕШАЛА" ==
@@ -81,7 +88,7 @@ async def ask_deepseek(prompt: str) -> str:
     r.raise_for_status()
 
 
-async def analyze_photo(photo_bytes: bytes, prompt: str) -> str:
+async def analyze_photo(photo_bytes: bytes, prompt: str, uid: int | None = None) -> str:
     b64 = base64.b64encode(photo_bytes).decode()
     msg = [
         {"role": "system", "content": PHOTO_SYS_PROMPT},
@@ -113,21 +120,34 @@ async def analyze_photo(photo_bytes: bytes, prompt: str) -> str:
                     exc, "http_status", None
                 )
                 detail = str(exc)
-                logging.warning(
-                    "OpenAI refused image: status=%s; detail=%s", status, detail
-                )
                 if status in {429, 500, 502} and attempt < 4:
                     await _sleep(attempt)
                     continue
-                if status and status >= 400:
-                    det = detail.lower()
-                    if "medical" in det:
+                det_low = detail.lower()
+                if status in {400, 403} and (
+                    "content_policy" in det_low or "moderation" in det_low
+                ):
+                    if "medical" in det_low:
+                        reason = "medical"
                         msg = "Похоже на медицинский документ. Разбирать не буду."
-                    elif "too large" in det or "size" in det or "too many" in det:
+                    elif "too large" in det_low or "size" in det_low or "too many" in det_low:
+                        reason = "too_large"
                         msg = "Слишком большой файл. Сожми и пришли снова."
-                    elif "personal" in det or "face" in det:
+                    elif "personal" in det_low or "face" in det_low:
+                        reason = "personal"
                         msg = "На фото личные данные. Замажь и отправь снова."
                     else:
+                        reason = det_low[:50]
                         msg = "Фото отклонено. Отправь другое."
+                    sample = base64.b64encode(photo_bytes)[:20].decode()
+                    log_msg = (
+                        f"vision_refused uid={uid} status={status} reason={reason} "
+                        f"size={len(photo_bytes)} sample={sample} detail={detail[:500]}"
+                    )
+                    logging.warning(log_msg)
+                    if DEBUG_POLICY and _DEBUG_BOT and _ADMINS:
+                        asyncio.create_task(
+                            _DEBUG_BOT.send_message(_ADMINS[0], log_msg)
+                        )
                     raise PolicyError(msg) from exc
                 raise
