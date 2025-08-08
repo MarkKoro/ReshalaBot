@@ -257,7 +257,7 @@ async def get_alias_stats(db, uid: int) -> tuple[int, int, int]:
                IFNULL(SUM(pay.stars),0) AS stars
         FROM users AS c
         LEFT JOIN payments AS pay ON pay.uid = c.id
-        WHERE c.ref_parent=?,
+        WHERE c.ref_parent=?
         """,
         (uid,),
     ) as cur:

@@ -485,9 +485,10 @@ async def handle_text(update: Update, ctx):
             ctx.user_data["stage"] = "answer"
             return
         await wait.delete()
-        await update.message.reply_text("Вот что порешали")
         max_len = 1800
-        msg = await update.message.reply_text(ans[:max_len], reply_markup=KB_MENU)
+        msg = await update.message.reply_text(
+            f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_MENU
+        )
         if free:
             await mark_daily_text(db, uid)
         else:
@@ -531,9 +532,11 @@ async def handle_text(update: Update, ctx):
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
         try:
             ans = clean_md(await analyze_photo(photo, text))
-        except PolicyError:
+        except PolicyError as exc:
             await wait.delete()
-            msg = await update.message.reply_text(PHOTO_BLOCKED, reply_markup=KB_MENU)
+            msg = await update.message.reply_text(
+                str(exc) or PHOTO_BLOCKED, reply_markup=KB_MENU
+            )
             await inc_photo_cnt(db, uid)
             ctx.user_data["ans_msg_id"] = msg.message_id
             ctx.user_data["stage"] = "answer"
@@ -542,9 +545,10 @@ async def handle_text(update: Update, ctx):
             ctx.user_data.pop("photo", None)
             photo = None
         await wait.delete()
-        await update.message.reply_text("Вот что порешали")
         max_len = 1800
-        msg = await update.message.reply_text(ans[:max_len], reply_markup=KB_MENU)
+        msg = await update.message.reply_text(
+            f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_MENU
+        )
         await inc_photo_cnt(db, uid)
         ctx.user_data["ans_msg_id"] = msg.message_id
         ctx.user_data["stage"] = "answer"
