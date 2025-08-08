@@ -1,4 +1,4 @@
-import base64, os, httpx, asyncio, functools
+import base64, os, httpx, asyncio, functools, logging
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -9,6 +9,10 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class PolicyError(Exception):
     """Запрос нарушает правила сервиса."""
+
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+        self.message = message
 
 
 TEXT_SYS_PROMPT = '''== СИСТЕМНЫЙ ПРОМПТ: ПЕРСОНАЖ "РЕШАЛА" ==
@@ -108,9 +112,22 @@ async def analyze_photo(photo_bytes: bytes, prompt: str) -> str:
                 status = getattr(exc, "status_code", None) or getattr(
                     exc, "http_status", None
                 )
+                detail = str(exc)
+                logging.warning(
+                    "OpenAI refused image: status=%s; detail=%s", status, detail
+                )
                 if status in {429, 500, 502} and attempt < 4:
                     await _sleep(attempt)
                     continue
                 if status and status >= 400:
-                    raise PolicyError from exc
+                    det = detail.lower()
+                    if "medical" in det:
+                        msg = "Похоже на медицинский документ. Разбирать не буду."
+                    elif "too large" in det or "size" in det or "too many" in det:
+                        msg = "Слишком большой файл. Сожми и пришли снова."
+                    elif "personal" in det or "face" in det:
+                        msg = "На фото личные данные. Замажь и отправь снова."
+                    else:
+                        msg = "Фото отклонено. Отправь другое."
+                    raise PolicyError(msg) from exc
                 raise
