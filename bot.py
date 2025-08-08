@@ -7,7 +7,7 @@
 асинхронную SQLite-базу.
 """
 
-import os, io, asyncio, logging, sys
+import os, io, asyncio, logging, sys, httpx
 import aiosqlite, json
 from dotenv import load_dotenv
 from PIL import Image
@@ -35,6 +35,7 @@ from telegram.ext import (
 )
 
 from utils.llm import ask_deepseek, analyze_photo, PolicyError
+from openai import APIError, RateLimitError
 from assets import load_assets, save_assets, SLOTS
 from db import (
     get_credits,
@@ -531,8 +532,11 @@ async def handle_text(update: Update, ctx):
                     return
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
         try:
-            ans = clean_md(await analyze_photo(photo, text))
+            ans = clean_md(await analyze_photo(photo, text, uid=uid))
         except PolicyError as exc:
+            logging.warning(
+                "photo_policy_blocked uid=%s reason=%s", uid, str(exc) or "unknown"
+            )
             await wait.delete()
             msg = await update.message.reply_text(
                 str(exc) or PHOTO_BLOCKED, reply_markup=KB_MENU
@@ -541,6 +545,17 @@ async def handle_text(update: Update, ctx):
             ctx.user_data["ans_msg_id"] = msg.message_id
             ctx.user_data["stage"] = "answer"
             return
+        except (
+            httpx.TimeoutException,
+            httpx.ReadTimeout,
+            httpx.ConnectError,
+            APIError,
+            RateLimitError,
+        ):
+            raise
+        except Exception:
+            logging.exception("unexpected vision error")
+            raise
         finally:
             ctx.user_data.pop("photo", None)
             photo = None
@@ -569,10 +584,19 @@ async def handle_photo(update: Update, ctx):
     bio = io.BytesIO()
     await f.download_to_memory(out=bio)
     bio.seek(0)
+    if bio.getbuffer().nbytes >= 18 * 1024 * 1024:
+        logging.warning("photo_rejected uid=%s reason=client_format", uid)
+        await update.message.reply_text("Сложно читаемый файл или слишком большой")
+        return
     img = Image.open(bio)
+    if img.format not in {"JPEG", "PNG"}:
+        logging.warning("photo_rejected uid=%s reason=client_format", uid)
+        await update.message.reply_text("Сложно читаемый файл или слишком большой")
+        return
     img.thumbnail((1024, 1024))
+    img = img.convert("RGB")
     out = io.BytesIO()
-    img.save(out, format="JPEG")
+    img.save(out, format="JPEG", quality=80)
     ctx.user_data["photo"] = out.getvalue()
     await send_menu(
         update.message.chat,
@@ -615,7 +639,14 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         raise ctx.error
-    except NetworkError:
+    except (
+        NetworkError,
+        httpx.TimeoutException,
+        httpx.ReadTimeout,
+        httpx.ConnectError,
+        APIError,
+        RateLimitError,
+    ):
         logging.exception("network error")
         if update and getattr(update, "effective_chat", None):
             await update.effective_chat.send_message(
