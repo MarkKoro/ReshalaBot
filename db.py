@@ -17,7 +17,8 @@ async def create_tables(db):
           text_cnt      INTEGER    DEFAULT 0,
           photo_cnt     INTEGER    DEFAULT 0,
           menu_msg      INTEGER    DEFAULT 0,
-          alias         TEXT       UNIQUE
+          alias         TEXT       UNIQUE,
+          last_dt       DATE       DEFAULT ''
         );
         """
     )
@@ -38,12 +39,42 @@ async def create_tables(db):
         await db.execute("ALTER TABLE users ADD COLUMN alias TEXT UNIQUE")
     except Exception:
         pass
+    try:
+        await db.execute("ALTER TABLE users ADD COLUMN last_dt DATE DEFAULT ''")
+    except Exception:
+        pass
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS payments (
           uid   INTEGER,
           rub   INTEGER DEFAULT 0,
           stars INTEGER DEFAULT 0
+        );
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pay_clicks (
+          uid INTEGER,
+          ts  DATE DEFAULT CURRENT_DATE
+        );
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feedback (
+          uid  INTEGER,
+          kind TEXT,
+          good INTEGER
+        );
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS funnels (
+          kind  TEXT PRIMARY KEY,
+          start INTEGER DEFAULT 0,
+          done  INTEGER DEFAULT 0
         );
         """
     )
@@ -84,13 +115,21 @@ async def dec_credits(db, uid: int, n: int):
 
 async def inc_text_cnt(db, uid: int):
     await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET text_cnt = text_cnt + 1 WHERE id=?", (uid,))
+    today = date.today().isoformat()
+    await db.execute(
+        "UPDATE users SET text_cnt = text_cnt + 1, last_dt=? WHERE id=?",
+        (today, uid),
+    )
     await db.commit()
 
 
 async def inc_photo_cnt(db, uid: int):
     await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET photo_cnt = photo_cnt + 1 WHERE id=?", (uid,))
+    today = date.today().isoformat()
+    await db.execute(
+        "UPDATE users SET photo_cnt = photo_cnt + 1, last_dt=? WHERE id=?",
+        (today, uid),
+    )
     await db.commit()
 
 
@@ -222,6 +261,79 @@ async def log_payment(db, uid: int, rub: int = 0, stars: int = 0):
         (uid, rub, stars),
     )
     await db.commit()
+
+
+async def log_pay_click(db, uid: int):
+    await _ensure_user(db, uid)
+    await db.execute("INSERT INTO pay_clicks(uid) VALUES(?)", (uid,))
+    await db.commit()
+
+
+async def get_pay_stats(db) -> tuple[int, int, float]:
+    async with db.execute("SELECT COUNT(*), IFNULL(SUM(rub),0) FROM payments") as cur:
+        row = await cur.fetchone()
+    pays = row[0]
+    rub_sum = row[1]
+    async with db.execute("SELECT COUNT(*) FROM pay_clicks") as cur:
+        clicks = (await cur.fetchone())[0]
+    avg = (rub_sum / pays) if pays else 0.0
+    return clicks, pays, avg
+
+
+async def inc_funnel_start(db, kind: str):
+    await db.execute(
+        "INSERT INTO funnels(kind,start,done) VALUES(?,1,0) "
+        "ON CONFLICT(kind) DO UPDATE SET start=start+1",
+        (kind,),
+    )
+    await db.commit()
+
+
+async def inc_funnel_done(db, kind: str):
+    await db.execute(
+        "INSERT INTO funnels(kind,start,done) VALUES(?,0,1) "
+        "ON CONFLICT(kind) DO UPDATE SET done=done+1",
+        (kind,),
+    )
+    await db.commit()
+
+
+async def get_funnel(db) -> dict:
+    async with db.execute("SELECT kind, start, done FROM funnels") as cur:
+        rows = await cur.fetchall()
+    return {r[0]: {"start": r[1], "done": r[2]} for r in rows}
+
+
+async def add_feedback(db, uid: int, kind: str, good: bool):
+    await _ensure_user(db, uid)
+    await db.execute(
+        "INSERT INTO feedback(uid, kind, good) VALUES(?,?,?)",
+        (uid, kind, 1 if good else 0),
+    )
+    await db.commit()
+
+
+async def get_feedback_stats(db) -> tuple[int, int]:
+    async with db.execute("SELECT COUNT(*), IFNULL(SUM(good),0) FROM feedback") as cur:
+        row = await cur.fetchone()
+    total, good = row[0], row[1]
+    return total, good
+
+
+async def get_active(db) -> tuple[int, int]:
+    today = date.today()
+    week_ago = today.fromordinal(today.toordinal() - 6)
+    async with db.execute(
+        "SELECT COUNT(*) FROM users WHERE last_dt=?",
+        (today.isoformat(),),
+    ) as cur:
+        dau = (await cur.fetchone())[0]
+    async with db.execute(
+        "SELECT COUNT(*) FROM users WHERE last_dt>=?",
+        (week_ago.isoformat(),),
+    ) as cur:
+        wau = (await cur.fetchone())[0]
+    return dau, wau
 
 
 async def get_referral_stats(db) -> list[dict]:
