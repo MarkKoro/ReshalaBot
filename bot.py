@@ -61,6 +61,14 @@ from db import (
     get_uid_by_alias,
     get_alias,
     log_payment,
+    log_pay_click,
+    inc_funnel_start,
+    inc_funnel_done,
+    get_pay_stats,
+    get_funnel,
+    add_feedback,
+    get_feedback_stats,
+    get_active,
     get_referral_stats,
     get_alias_stats,
     DB_PATH,
@@ -75,6 +83,8 @@ ADMINS = {
     for x in (os.getenv("ADMINS") or os.getenv("ADMIN_IDS", "")).split(",")
     if x
 }
+
+USER_LOCKS: dict[int, asyncio.Lock] = {}
 
 ASSETS = load_assets()
 CACHE_CHAT_ID = int(os.getenv("CACHE_CHAT_ID") or ASSETS.get("cache_chat_id", 0))
@@ -170,6 +180,12 @@ KB_MENU = Mk([[Btn("◀️ В меню", callback_data="back")]])
 KB_BACK = Mk([[Btn("◀️ Передумал", callback_data="back")]])
 KB_NAZAD = Mk([[Btn("◀️ Назад", callback_data="back")]])
 KB_PAY = Mk([[Btn("Перевести Решале", pay=True)], [Btn("◀️ Передумал", callback_data="back")]])
+KB_ANS = Mk(
+    [
+        [Btn("👍", callback_data="fb_good"), Btn("👎", callback_data="fb_bad")],
+        [Btn("◀️ В меню", callback_data="back")],
+    ]
+)
 
 def clean_md(text: str) -> str:
     for ch in "#*🔹":
@@ -369,6 +385,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "ask_text":
         ctx.user_data["stage"] = "await_text"
+        await inc_funnel_start(db, "text")
         await send_menu(
             q.message.chat,
             uid,
@@ -390,6 +407,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["stage"] = "main"
         await show_main(update, ctx)
     elif data == "pay":
+        await log_pay_click(db, uid)
         kb_rows = []
         for c, price in PRICE_PACKS_RUB.items():
             stars = PRICE_PACKS_STARS[c]
@@ -409,6 +427,11 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             slot="pay",
         )
         ctx.user_data["stage"] = "pay"
+    elif data in {"fb_good", "fb_bad"}:
+        kind = ctx.user_data.get("last_kind", "")
+        await add_feedback(db, uid, kind, data == "fb_good")
+        await q.edit_message_reply_markup(KB_MENU)
+        ctx.user_data["stage"] = "answer"
     elif data == "ref":
         alias = await get_alias(db, uid)
         bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
@@ -453,127 +476,138 @@ async def handle_text(update: Update, ctx):
     stage = ctx.user_data.get("stage")
     text = update.message.text
     db = ctx.bot_data["db"]
-
-    if stage == "await_text":
-        await clear_menu(update.message.chat, uid, ctx)
-        free = await can_use_daily_text(db, uid)
-        if not free and uid not in ADMINS:
-            credits = await get_credits(db, uid)
-            if credits < TEXT_COST:
-                kb_topup = Mk(
-                    [
-                        [Btn("Заплатить Решале", callback_data="pay")],
-                        [Btn("◀️ Передумал", callback_data="back")],
-                    ]
-                )
-                await send_menu(
-                    update.message.chat,
-                    uid,
-                    "Вам не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
-                    kb_topup,
-                    ctx,
-                    slot="pay",
-                )
-                ctx.user_data["stage"] = "main"
+    lock = USER_LOCKS.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        await update.message.reply_text("Погодь, я ещё отвечаю на предыдущий вопрос")
+        return
+    async with lock:
+        if stage == "await_text":
+            await clear_menu(update.message.chat, uid, ctx)
+            free = await can_use_daily_text(db, uid)
+            if not free and uid not in ADMINS:
+                credits = await get_credits(db, uid)
+                if credits < TEXT_COST:
+                    kb_topup = Mk(
+                        [
+                            [Btn("Заплатить Решале", callback_data="pay")],
+                            [Btn("◀️ Передумал", callback_data="back")],
+                        ]
+                    )
+                    await send_menu(
+                        update.message.chat,
+                        uid,
+                        "Вам не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
+                        kb_topup,
+                        ctx,
+                        slot="pay",
+                    )
+                    ctx.user_data["stage"] = "main"
+                    return
+            wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
+            try:
+                ans = clean_md(await ask_deepseek(text))
+            except PolicyError:
+                await wait.delete()
+                msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_MENU)
+                ctx.user_data["ans_msg_id"] = msg.message_id
+                ctx.user_data["stage"] = "answer"
+                ctx.user_data["last_kind"] = "text"
                 return
-        wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
-        try:
-            ans = clean_md(await ask_deepseek(text))
-        except PolicyError:
-            await wait.delete()
-            msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_MENU)
-            ctx.user_data["ans_msg_id"] = msg.message_id
-            ctx.user_data["stage"] = "answer"
-            return
-        await wait.delete()
-        max_len = 1800
-        msg = await update.message.reply_text(
-            f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_MENU
-        )
-        if free:
-            await mark_daily_text(db, uid)
-        else:
-            if uid not in ADMINS:
-                await dec_credits(db, uid, TEXT_COST)
-        await inc_text_cnt(db, uid)
-        ctx.user_data["ans_msg_id"] = msg.message_id
-        ctx.user_data["stage"] = "answer"
-        await schedule_reminder(uid, ctx)
-
-    elif stage == "await_photo_text":
-        await clear_menu(update.message.chat, uid, ctx)
-        photo = ctx.user_data.get("photo")
-        if photo is None:
-            await update.message.reply_text("Сначала пришли фото")
-            return
-        free = await get_free_photo(db, uid)
-        use_free = free > 0
-        if not use_free and uid not in ADMINS:
-            credits = await get_credits(db, uid)
-            if credits < PHOTO_COST:
-                kb_topup = Mk(
-                    [
-                        [Btn("Заключить сделку", callback_data="pay")],
-                        [Btn("◀️ Передумал", callback_data="back")],
-                    ]
-                )
-                await send_menu(
-                    update.message.chat,
-                    uid,
-                    "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
-                    kb_topup,
-                    ctx,
-                    slot="pay",
-                )
-                ctx.user_data["stage"] = "main"
-                return
-        wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
-        try:
-            ans = clean_md(await analyze_photo(photo, text, uid=uid))
-        except PolicyError as exc:
-            logging.warning(
-                "photo_policy_blocked uid=%s reason=%s", uid, str(exc) or "unknown"
-            )
-            await wait.delete()
-            msg = await update.message.reply_text(
-                str(exc) or PHOTO_BLOCKED, reply_markup=KB_MENU
-            )
-            await inc_photo_cnt(db, uid)
-            ctx.user_data["ans_msg_id"] = msg.message_id
-            ctx.user_data["stage"] = "answer"
-            return
-        except (
-            httpx.TimeoutException,
-            httpx.ReadTimeout,
-            httpx.ConnectError,
-            APIError,
-            RateLimitError,
-        ):
-            raise
-        except Exception:
-            logging.exception("unexpected vision error")
-            raise
-        else:
-            if use_free:
-                await use_free_photo(db, uid)
-            elif uid not in ADMINS:
-                await dec_credits(db, uid, PHOTO_COST)
             await wait.delete()
             max_len = 1800
             msg = await update.message.reply_text(
-                f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_MENU
+                f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_ANS
             )
-            await inc_photo_cnt(db, uid)
+            if free:
+                await mark_daily_text(db, uid)
+            else:
+                if uid not in ADMINS:
+                    await dec_credits(db, uid, TEXT_COST)
+            await inc_text_cnt(db, uid)
+            await inc_funnel_done(db, "text")
             ctx.user_data["ans_msg_id"] = msg.message_id
             ctx.user_data["stage"] = "answer"
+            ctx.user_data["last_kind"] = "text"
             await schedule_reminder(uid, ctx)
-        finally:
-            ctx.user_data.pop("photo", None)
-            photo = None
-    elif stage == "await_photo":
-        await update.message.reply_text("Сейчас время скидывать фотографию\n(Скинь фото)")
-    else:
-        await update.message.reply_text("Используй меню")
+
+        elif stage == "await_photo_text":
+            await clear_menu(update.message.chat, uid, ctx)
+            photo = ctx.user_data.get("photo")
+            if photo is None:
+                await update.message.reply_text("Сначала пришли фото")
+                return
+            free = await get_free_photo(db, uid)
+            use_free = free > 0
+            if not use_free and uid not in ADMINS:
+                credits = await get_credits(db, uid)
+                if credits < PHOTO_COST:
+                    kb_topup = Mk(
+                        [
+                            [Btn("Заключить сделку", callback_data="pay")],
+                            [Btn("◀️ Передумал", callback_data="back")],
+                        ]
+                    )
+                    await send_menu(
+                        update.message.chat,
+                        uid,
+                        "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
+                        kb_topup,
+                        ctx,
+                        slot="pay",
+                    )
+                    ctx.user_data["stage"] = "main"
+                    return
+            wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
+            try:
+                ans = clean_md(await analyze_photo(photo, text, uid=uid))
+            except PolicyError as exc:
+                logging.warning(
+                    "photo_policy_blocked uid=%s reason=%s", uid, str(exc) or "unknown"
+                )
+                await wait.delete()
+                msg = await update.message.reply_text(
+                    str(exc) or PHOTO_BLOCKED, reply_markup=KB_MENU
+                )
+                await inc_photo_cnt(db, uid)
+                await inc_funnel_done(db, "photo")
+                ctx.user_data["ans_msg_id"] = msg.message_id
+                ctx.user_data["stage"] = "answer"
+                ctx.user_data["last_kind"] = "photo"
+                return
+            except (
+                httpx.TimeoutException,
+                httpx.ReadTimeout,
+                httpx.ConnectError,
+                APIError,
+                RateLimitError,
+            ):
+                raise
+            except Exception:
+                logging.exception("unexpected vision error")
+                raise
+            else:
+                if use_free:
+                    await use_free_photo(db, uid)
+                elif uid not in ADMINS:
+                    await dec_credits(db, uid, PHOTO_COST)
+                await wait.delete()
+                max_len = 1800
+                msg = await update.message.reply_text(
+                    f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_ANS
+                )
+                await inc_photo_cnt(db, uid)
+                await inc_funnel_done(db, "photo")
+                ctx.user_data["ans_msg_id"] = msg.message_id
+                ctx.user_data["stage"] = "answer"
+                ctx.user_data["last_kind"] = "photo"
+                await schedule_reminder(uid, ctx)
+            finally:
+                ctx.user_data.pop("photo", None)
+                photo = None
+        elif stage == "await_photo":
+            await update.message.reply_text("Сейчас время скидывать фотографию\n(Скинь фото)")
+        else:
+            await update.message.reply_text("Используй меню")
 
 async def handle_photo(update: Update, ctx):
     uid = update.effective_user.id
@@ -582,6 +616,7 @@ async def handle_photo(update: Update, ctx):
         return
     await clear_menu(update.message.chat, uid, ctx, delete=True)
     photo = update.message.photo[-1]
+    db = ctx.bot_data["db"]
     f = await ctx.bot.get_file(photo.file_id)
     bio = io.BytesIO()
     await f.download_to_memory(out=bio)
@@ -608,6 +643,7 @@ async def handle_photo(update: Update, ctx):
         ctx,
     )
     ctx.user_data["stage"] = "await_photo_text"
+    await inc_funnel_start(db, "photo")
 
 # ── Оплата ───────────────────────────────────────────
 async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -744,8 +780,25 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if uid not in ADMINS:
         return
     db = ctx.bot_data["db"]
-    users = len(await get_all_uids(db))
-    await update.message.reply_text(f"Всего пользователей: {users}")
+    if ctx.args and ctx.args[0] == "pro":
+        users = len(await get_all_uids(db))
+        dau, wau = await get_active(db)
+        clicks, pays, avg = await get_pay_stats(db)
+        funnel = await get_funnel(db)
+        total_fb, good_fb = await get_feedback_stats(db)
+        tf = funnel.get("text", {"start": 0, "done": 0})
+        pf = funnel.get("photo", {"start": 0, "done": 0})
+        txt = (
+            f"U:{users} DAU:{dau} WAU:{wau}\n"
+            f"Pay {pays}/{clicks} avg:{avg:.1f}₽\n"
+            f"T {tf['done']}/{tf['start']} P {pf['done']}/{pf['start']}\n"
+        )
+        if total_fb:
+            txt += f"FB {good_fb/total_fb:.0%} полезно"
+        await update.message.reply_text(txt)
+    else:
+        users = len(await get_all_uids(db))
+        await update.message.reply_text(f"Всего пользователей: {users}")
 
 
 async def whereami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
