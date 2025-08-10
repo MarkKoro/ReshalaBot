@@ -507,29 +507,26 @@ async def handle_text(update: Update, ctx):
             await update.message.reply_text("Сначала пришли фото")
             return
         free = await get_free_photo(db, uid)
-        if free > 0:
-            await use_free_photo(db, uid)
-        else:
-            if uid not in ADMINS:
-                try:
-                    await dec_credits(db, uid, PHOTO_COST)
-                except ValueError:
-                    kb_topup = Mk(
-                        [
-                            [Btn("Заключить сделку", callback_data="pay")],
-                            [Btn("◀️ Передумал", callback_data="back")],
-                        ]
-                    )
-                    await send_menu(
-                        update.message.chat,
-                        uid,
-                        "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
-                        kb_topup,
-                        ctx,
-                        slot="pay",
-                    )
-                    ctx.user_data["stage"] = "main"
-                    return
+        use_free = free > 0
+        if not use_free and uid not in ADMINS:
+            credits = await get_credits(db, uid)
+            if credits < PHOTO_COST:
+                kb_topup = Mk(
+                    [
+                        [Btn("Заключить сделку", callback_data="pay")],
+                        [Btn("◀️ Передумал", callback_data="back")],
+                    ]
+                )
+                await send_menu(
+                    update.message.chat,
+                    uid,
+                    "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
+                    kb_topup,
+                    ctx,
+                    slot="pay",
+                )
+                ctx.user_data["stage"] = "main"
+                return
         wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
         try:
             ans = clean_md(await analyze_photo(photo, text, uid=uid))
@@ -556,18 +553,23 @@ async def handle_text(update: Update, ctx):
         except Exception:
             logging.exception("unexpected vision error")
             raise
+        else:
+            if use_free:
+                await use_free_photo(db, uid)
+            elif uid not in ADMINS:
+                await dec_credits(db, uid, PHOTO_COST)
+            await wait.delete()
+            max_len = 1800
+            msg = await update.message.reply_text(
+                f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_MENU
+            )
+            await inc_photo_cnt(db, uid)
+            ctx.user_data["ans_msg_id"] = msg.message_id
+            ctx.user_data["stage"] = "answer"
+            await schedule_reminder(uid, ctx)
         finally:
             ctx.user_data.pop("photo", None)
             photo = None
-        await wait.delete()
-        max_len = 1800
-        msg = await update.message.reply_text(
-            f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_MENU
-        )
-        await inc_photo_cnt(db, uid)
-        ctx.user_data["ans_msg_id"] = msg.message_id
-        ctx.user_data["stage"] = "answer"
-        await schedule_reminder(uid, ctx)
     elif stage == "await_photo":
         await update.message.reply_text("Сейчас время скидывать фотографию\n(Скинь фото)")
     else:
