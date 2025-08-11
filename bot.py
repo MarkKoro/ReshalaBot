@@ -299,7 +299,12 @@ def kb_main(free_txt: bool, free_ph: int, credits: int) -> Mk:
         [
             [Btn(f"📝 (10) Решаем вопрос ({'1' if free_txt else '0'})", callback_data="ask_text")],
             [Btn(f"📷 (20) Смотрим и решаем ({free_ph})", callback_data="ask_photo")],
-            [Btn(f"💳 Дать решале за работу\nУ вас доступно {credits} баллов", callback_data="pay")],
+            [
+                Btn(
+                    f"💳 Дать решале за работу\n(У вас доступно {credits} баллов)",
+                    callback_data="pay",
+                )
+            ],
             [Btn("🎁 Пригласить друга", callback_data="ref")],
             [Btn("ℹ️ Как я это делаю?", callback_data="how")],
         ]
