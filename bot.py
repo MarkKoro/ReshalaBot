@@ -104,7 +104,7 @@ PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
 # ── Подписка ─────────────────────────────────────────
 CHANNEL_ID = -1002883355776
 JOIN_URL = "https://t.me/obotization/3"
-SUB_CACHE_TTL = 3600
+SUB_CACHE_TTL = 0
 
 
 async def init_db(app: Application) -> None:
@@ -590,12 +590,16 @@ async def handle_text(update: Update, ctx):
                 ans = clean_md(await ask_deepseek(text))
             except PolicyError:
                 await wait.delete()
+                if not await ensure_subscription(update, ctx):
+                    return
                 msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_MENU)
                 ctx.user_data["ans_msg_id"] = msg.message_id
                 ctx.user_data["stage"] = "answer"
                 ctx.user_data["last_kind"] = "text"
                 return
             await wait.delete()
+            if not await ensure_subscription(update, ctx):
+                return
             max_len = 1800
             msg = await update.message.reply_text(
                 f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_ANS
@@ -647,6 +651,8 @@ async def handle_text(update: Update, ctx):
                     "photo_policy_blocked uid=%s reason=%s", uid, str(exc) or "unknown"
                 )
                 await wait.delete()
+                if not await ensure_subscription(update, ctx):
+                    return
                 msg = await update.message.reply_text(
                     str(exc) or PHOTO_BLOCKED, reply_markup=KB_MENU
                 )
@@ -668,11 +674,13 @@ async def handle_text(update: Update, ctx):
                 logging.exception("unexpected vision error")
                 raise
             else:
+                await wait.delete()
+                if not await ensure_subscription(update, ctx):
+                    return
                 if use_free:
                     await use_free_photo(db, uid)
                 elif uid not in ADMINS:
                     await dec_credits(db, uid, PHOTO_COST)
-                await wait.delete()
                 max_len = 1800
                 msg = await update.message.reply_text(
                     f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_ANS
