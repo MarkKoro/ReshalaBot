@@ -7,7 +7,7 @@
 асинхронную SQLite-базу.
 """
 
-import os, io, asyncio, logging, sys, httpx
+import os, io, asyncio, logging, sys, httpx, time
 import aiosqlite, json
 from dotenv import load_dotenv
 from PIL import Image
@@ -20,7 +20,7 @@ from telegram import (
     InputMediaPhoto,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, RetryAfter, BadRequest
+from telegram.error import NetworkError, RetryAfter, BadRequest, Forbidden
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -72,6 +72,9 @@ from db import (
     get_referral_stats,
     get_alias_stats,
     DB_PATH,
+    init_subscription,
+    get_subscribed,
+    set_subscribed,
 )
 
 # ── Глобальные настройки ─────────────────────────────
@@ -98,10 +101,16 @@ PHOTO_COST = 20
 PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
 PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
 
+# ── Подписка ─────────────────────────────────────────
+CHANNEL_ID = -1002883355776
+JOIN_URL = "https://t.me/obotization/3"
+SUB_CACHE_TTL = 3600
+
 
 async def init_db(app: Application) -> None:
     db = await aiosqlite.connect(DB_PATH, check_same_thread=False)
     await create_tables(db)
+    await init_subscription(db)
     app.bot_data["db"] = db
 
 
@@ -189,6 +198,43 @@ KB_ANS = Mk(
         [Btn("◀️ В меню", callback_data="back")],
     ]
 )
+KB_SUB = Mk(
+    [
+        [Btn("✅ Подписаться", url=JOIN_URL)],
+        [Btn("🔁 Проверить подписку", callback_data="chk_sub")],
+    ]
+)
+
+async def _check_member(bot, user_id) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+    except (BadRequest, Forbidden):
+        return False
+    return member.status in {"member", "administrator", "creator"}
+
+
+async def ensure_subscription(update, ctx) -> bool:
+    uid = update.effective_user.id
+    if uid in ADMINS:
+        return True
+    db = ctx.bot_data["db"]
+    sub, last = await get_subscribed(db, uid)
+    now = int(time.time())
+    if sub and now - last < SUB_CACHE_TTL:
+        return True
+    ok = await _check_member(ctx.bot, uid)
+    await set_subscribed(db, uid, ok, now)
+    if ok:
+        return True
+    text = (
+        "Чтобы пользоваться ботом, подпишись на наш канал. После подписки нажми «Проверить подписку» ниже."
+    )
+    chat = update.effective_chat
+    if chat:
+        await chat.send_message(text, reply_markup=KB_SUB)
+    else:
+        await ctx.bot.send_message(uid, text, reply_markup=KB_SUB)
+    return False
 
 def clean_md(text: str) -> str:
     for ch in "#*🔹":
@@ -333,6 +379,8 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscription(update, ctx):
+        return
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
     db = ctx.bot_data["db"]
@@ -385,11 +433,30 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Callback router ──────────────────────────────────
 async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
     uid = q.from_user.id
     data = q.data
     logging.info("callback %s from %s", data, uid)
     db = ctx.bot_data["db"]
+
+    if data == "chk_sub":
+        ok = await _check_member(ctx.bot, uid)
+        now = int(time.time())
+        await set_subscribed(db, uid, ok, now)
+        if ok:
+            await q.answer()
+            await q.edit_message_reply_markup(None)
+            await q.message.reply_text("Подписка подтверждена. Продолжаем!")
+            await show_main(update, ctx)
+        else:
+            await q.answer(
+                "Подписка пока не найдена. Проверь, что ты подписан/а, и нажми ещё раз."
+            )
+            await q.edit_message_reply_markup(KB_SUB)
+        return
+
+    await q.answer()
+    if not await ensure_subscription(update, ctx):
+        return
 
     if data == "ask_text":
         ctx.user_data["stage"] = "await_text"
@@ -480,6 +547,8 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
+    if not await ensure_subscription(update, ctx):
+        return
     uid = update.effective_user.id
     stage = ctx.user_data.get("stage")
     text = update.message.text
@@ -618,6 +687,8 @@ async def handle_text(update: Update, ctx):
             await update.message.reply_text("Используй меню")
 
 async def handle_photo(update: Update, ctx):
+    if not await ensure_subscription(update, ctx):
+        return
     uid = update.effective_user.id
     if ctx.user_data.get("stage") != "await_photo":
         await update.message.reply_text("Сначала выбери режим фото в меню")
@@ -655,10 +726,15 @@ async def handle_photo(update: Update, ctx):
 
 # ── Оплата ───────────────────────────────────────────
 async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscription(update, ctx):
+        await update.pre_checkout_query.answer(False)
+        return
     await update.pre_checkout_query.answer(True)
 
 
 async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscription(update, ctx):
+        return
     payload = update.message.successful_payment.invoice_payload
     uid = update.effective_user.id
     parts = payload.split("_")
