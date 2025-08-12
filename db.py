@@ -18,7 +18,9 @@ async def create_tables(db):
           photo_cnt     INTEGER    DEFAULT 0,
           menu_msg      INTEGER    DEFAULT 0,
           alias         TEXT       UNIQUE,
-          last_dt       DATE       DEFAULT ''
+          last_dt       DATE       DEFAULT '',
+          subscribed    INTEGER    DEFAULT 0,
+          last_sub_check INTEGER   DEFAULT 0
         );
         """
     )
@@ -78,6 +80,23 @@ async def create_tables(db):
         );
         """
     )
+    await db.commit()
+
+
+async def init_subscription(db):
+    """Add subscription cache columns if missing."""
+    try:
+        await db.execute(
+            "ALTER TABLE users ADD COLUMN subscribed INTEGER DEFAULT 0"
+        )
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "ALTER TABLE users ADD COLUMN last_sub_check INTEGER DEFAULT 0"
+        )
+    except Exception:
+        pass
     await db.commit()
 
 
@@ -194,6 +213,27 @@ async def set_ref_parent(db, child_uid: int, parent_uid: int):
     await db.execute(
         "UPDATE users SET ref_parent=? WHERE id=? AND ref_parent=0",
         (parent_uid, child_uid),
+    )
+    await db.commit()
+
+
+async def get_subscribed(db, uid: int) -> tuple[int, int]:
+    await _ensure_user(db, uid)
+    async with db.execute(
+        "SELECT subscribed, last_sub_check FROM users WHERE id=?",
+        (uid,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        return row[0], row[1]
+    return 0, 0
+
+
+async def set_subscribed(db, uid: int, ok: bool, now_ts: int):
+    await _ensure_user(db, uid)
+    await db.execute(
+        "UPDATE users SET subscribed=?, last_sub_check=? WHERE id=?",
+        (1 if ok else 0, now_ts, uid),
     )
     await db.commit()
 
