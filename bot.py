@@ -208,7 +208,11 @@ KB_SUB = Mk(
 async def _check_member(bot, user_id) -> bool:
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
-    except (BadRequest, Forbidden):
+    except (BadRequest, Forbidden) as e:
+        logging.warning("check member failed for %s: %s", user_id, e)
+        return False
+    except Exception:
+        logging.exception("unexpected error while checking member %s", user_id)
         return False
     return member.status in {"member", "administrator", "creator"}
 
@@ -375,10 +379,11 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    text = getattr(update.message, "text", "")
+    logging.info("command %s from %s", text, uid)
     if not await ensure_subscription(update, ctx):
         return
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
     db = ctx.bot_data["db"]
     if ctx.args:
         arg = ctx.args[0]
@@ -961,7 +966,10 @@ def main() -> None:
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         level=logging.INFO,
-        stream=sys.stdout,
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("bot.log", encoding="utf-8"),
+        ],
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram.ext._callbackqueryhandler").setLevel(logging.INFO)
