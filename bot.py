@@ -339,18 +339,13 @@ async def send_menu(
     await set_menu_msg(ctx.bot_data["db"], uid, msg.message_id)
     return msg
 
-def kb_main(free_txt: bool, free_ph: int, credits: int) -> Mk:
+def kb_main(free_txt: bool, free_ph: int) -> Mk:
     """Главное меню."""
     return Mk(
         [
             [Btn(f"📝 (10) Решаем вопрос ({'1' if free_txt else '0'})", callback_data="ask_text")],
             [Btn(f"📷 (20) Смотрим и решаем ({free_ph})", callback_data="ask_photo")],
-            [
-                Btn(
-                    f"💳 Дать решале за работу\n(У вас доступно {credits} баллов)",
-                    callback_data="pay",
-                )
-            ],
+            [Btn("💳 Дать решале за работу", callback_data="pay")],
             [Btn("🎁 Пригласить друга", callback_data="ref")],
             [Btn("ℹ️ Как я это делаю?", callback_data="how")],
         ]
@@ -370,12 +365,13 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     uid = update.effective_user.id
     db = ctx.bot_data["db"]
+    credits = "∞" if uid in ADMINS else await get_credits(db, uid)
     kb = kb_main(
         await can_use_daily_text(db, uid),
         await get_free_photo(db, uid),
-        "∞" if uid in ADMINS else await get_credits(db, uid),
     )
-    await send_menu(chat, uid, MAIN_TEXT, kb, ctx, slot="main")
+    text = f"{MAIN_TEXT}\n\nДОСТУПНО БАЛЛОВ: {credits}"
+    await send_menu(chat, uid, text, kb, ctx, slot="main")
 
 # ── Команда /start ───────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -447,6 +443,7 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await q.edit_message_reply_markup(None)
             await q.message.reply_text("Подписка подтверждена. Продолжаем!")
             await show_main(update, ctx)
+            ctx.user_data["stage"] = "main"
         else:
             await q.answer(
                 "Подписка пока не найдена. Проверь, что ты подписан/а, и нажми ещё раз."
@@ -547,10 +544,13 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Message handlers ─────────────────────────────────
 async def handle_text(update: Update, ctx):
+    stage = ctx.user_data.get("stage")
+    if stage not in {"await_text", "await_photo_text", "await_photo"}:
+        await update.message.reply_text("Используй меню")
+        return
     if not await ensure_subscription(update, ctx):
         return
     uid = update.effective_user.id
-    stage = ctx.user_data.get("stage")
     text = update.message.text
     db = ctx.bot_data["db"]
     lock = USER_LOCKS.setdefault(uid, asyncio.Lock())
@@ -681,18 +681,16 @@ async def handle_text(update: Update, ctx):
             finally:
                 ctx.user_data.pop("photo", None)
                 photo = None
-        elif stage == "await_photo":
+        else:  # stage == "await_photo"
             await update.message.reply_text("Сейчас время скидывать фотографию\n(Скинь фото)")
-        else:
-            await update.message.reply_text("Используй меню")
 
 async def handle_photo(update: Update, ctx):
-    if not await ensure_subscription(update, ctx):
-        return
-    uid = update.effective_user.id
     if ctx.user_data.get("stage") != "await_photo":
         await update.message.reply_text("Сначала выбери режим фото в меню")
         return
+    if not await ensure_subscription(update, ctx):
+        return
+    uid = update.effective_user.id
     await clear_menu(update.message.chat, uid, ctx, delete=True)
     photo = update.message.photo[-1]
     db = ctx.bot_data["db"]
@@ -751,9 +749,8 @@ async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     kb = kb_main(
         await can_use_daily_text(db, uid),
         await get_free_photo(db, uid),
-        total,
     )
-    msg = "Готово. Баллы на месте. Возвращаемся к делу?"
+    msg = f"Готово. Баллы на месте. Возвращаемся к делу?\n\nДОСТУПНО БАЛЛОВ: {total}"
     await send_menu(update.message.chat, uid, msg, kb, ctx, slot="main")
     ctx.user_data["stage"] = "main"
 
