@@ -446,9 +446,16 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ok:
             await q.answer()
             await q.edit_message_reply_markup(None)
-            await q.message.reply_text("Подписка подтверждена. Продолжаем!")
-            await show_main(update, ctx)
-            ctx.user_data["stage"] = "main"
+            pend = ctx.user_data.pop("pending_update", None)
+            handler = ctx.user_data.pop("pending_handler", None)
+            if pend and handler == "text":
+                await handle_text(pend, ctx)
+            elif pend and handler == "photo":
+                await handle_photo(pend, ctx)
+            else:
+                await q.message.reply_text("Подписка подтверждена. Продолжаем!")
+                await show_main(update, ctx)
+                ctx.user_data["stage"] = "main"
         else:
             await q.answer(
                 "Подписка пока не найдена. Проверь, что ты подписан/а, и нажми ещё раз."
@@ -457,8 +464,6 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await q.answer()
-    if not await ensure_subscription(update, ctx):
-        return
 
     if data == "ask_text":
         ctx.user_data["stage"] = "await_text"
@@ -554,6 +559,8 @@ async def handle_text(update: Update, ctx):
         await update.message.reply_text("Используй меню")
         return
     if not await ensure_subscription(update, ctx):
+        ctx.user_data["pending_update"] = update
+        ctx.user_data["pending_handler"] = "text"
         return
     uid = update.effective_user.id
     text = update.message.text
@@ -702,6 +709,8 @@ async def handle_photo(update: Update, ctx):
         await update.message.reply_text("Сначала выбери режим фото в меню")
         return
     if not await ensure_subscription(update, ctx):
+        ctx.user_data["pending_update"] = update
+        ctx.user_data["pending_handler"] = "photo"
         return
     uid = update.effective_user.id
     await clear_menu(update.message.chat, uid, ctx, delete=True)
