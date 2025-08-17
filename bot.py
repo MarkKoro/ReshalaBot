@@ -128,16 +128,13 @@ MAIN_TEXT = (
     "\n"
     "Каждый день у тебя есть один бесплатный текстовый вопрос.\n"
     "А если хочешь больше разбора по фото - кидай меня друзьям или заходи в оплату.\n"
-    "\n"
-    "(В скобках справа - количество бесплатных проверок)\n"
-    "(В скобках слева - цена в баллах за проверку)"
 )
 HOW_IT_WORKS = (
     "Коротко. Я Решу вашу делему\запрос\пробему\ступор\уравнение.\n"
     "\n"
     "• Текст: задаёшь вопрос — я выдаю практичный план на 1–2 шага вперёд.\n"
     "• Фото + текст: прикладываешь снимок и контекст — даю выводы и конкретные действия.\n"
-    "• Слева от вариантов в меню указана цена в баллах, справа — сколько бесплатных проверок осталось. "
+    "• Под балансом указана стоимость проверок, справа от вариантов в меню — сколько бесплатных осталось. "
     "Если бесплатных нет, запрос списывает баллы; их число видно под кнопкой пополнения баланса.\n"
     "\n"
     "Фото — платно, но на старте есть бонус, а за приглашённого друга — ещё бонус.\n"
@@ -347,8 +344,18 @@ def kb_main(free_txt: bool, free_ph: int) -> Mk:
     """Главное меню."""
     return Mk(
         [
-            [Btn(f"📝 (10) Решаем вопрос ({'1' if free_txt else '0'})", callback_data="ask_text")],
-            [Btn(f"📷 (20) Смотрим и решаем ({free_ph})", callback_data="ask_photo")],
+            [
+                Btn(
+                    f"📝 Решаем вопрос — {'1' if free_txt else '0'} бесплатно",
+                    callback_data="ask_text",
+                )
+            ],
+            [
+                Btn(
+                    f"📷 Смотрим и решаем — {free_ph} бесплатно",
+                    callback_data="ask_photo",
+                )
+            ],
             [Btn("💳 Дать решале за работу", callback_data="pay")],
             [Btn("🎁 Пригласить друга", callback_data="ref")],
             [Btn("ℹ️ Как я это делаю?", callback_data="how")],
@@ -374,7 +381,12 @@ async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await can_use_daily_text(db, uid),
         await get_free_photo(db, uid),
     )
-    text = f"{MAIN_TEXT}\n\nДОСТУПНО БАЛЛОВ: {credits}"
+    text = (
+        f"{MAIN_TEXT}\n\n"
+        f"ДОСТУПНО БАЛЛОВ: {credits}\n"
+        "Цена текстового вопроса: 10\n"
+        "Цена вопроса с фото: 20"
+    )
     await send_menu(chat, uid, text, kb, ctx, slot="main")
 
 # ── Команда /start ───────────────────────────────────
@@ -729,10 +741,10 @@ async def handle_photo(update: Update, ctx):
         logging.warning("photo_rejected uid=%s reason=client_format", uid)
         await update.message.reply_text("Сложно читаемый файл или слишком большой")
         return
-    img.thumbnail((1024, 1024))
+    img.thumbnail((2048, 2048))
     img = img.convert("RGB")
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=80)
+    img.save(out, format="JPEG", quality=90)
     ctx.user_data["photo"] = out.getvalue()
     await send_menu(
         update.message.chat,
