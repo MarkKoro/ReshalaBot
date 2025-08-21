@@ -409,15 +409,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if parent and parent != uid:
             await set_ref_parent(db, uid, parent)
             await grant_referral_bonus(db, parent)
-            link = f"tg://user?id={uid}"
-            try:
-                text = (
-                    f"По вашей ссылке зарегистрировался "
-                    f"<a href=\"{link}\">{uid}</a>"
-                )
-                await ctx.bot.send_message(parent, text, parse_mode=ParseMode.HTML)
-            except Exception:
-                logging.exception("failed to notify referrer")
+            if parent not in ADMINS:
+                link = f"tg://user?id={uid}"
+                try:
+                    text = (
+                        f"По вашей ссылке зарегистрировался "
+                        f"<a href=\"{link}\">{uid}</a>"
+                    )
+                    await ctx.bot.send_message(parent, text, parse_mode=ParseMode.HTML)
+                except Exception:
+                    logging.exception("failed to notify referrer")
             if alias_mode:
                 await set_free_photo(db, uid, 2)
     await grant_start_bonus(db, uid)
@@ -889,6 +890,24 @@ async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     stats["alias"] = alias
     await update.message.reply_text(json.dumps(stats, ensure_ascii=False))
 
+
+async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    db = ctx.bot_data["db"]
+    stats = await get_alias_stats(db, uid)
+    if not stats["count"]:
+        await update.message.reply_text("По вашей ссылке ещё никто не приходил.")
+        return
+    lines = [
+        f"По вашей ссылке пришло {stats['count']} человек.",
+        f"Они заплатили {stats['rub']}₽ и {stats['stars']}⭐.",
+    ]
+    for u in stats["users"]:
+        alias = u["alias"] or str(u["id"])
+        lines.append(f"- {alias}: {u['rub']}₽ {u['stars']}⭐")
+    await update.message.reply_text("\n".join(lines))
+
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
@@ -1020,6 +1039,7 @@ def main() -> None:
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CommandHandler("decredits", decredits))
     app.add_handler(CommandHandler("alias", cmd_alias))
+    app.add_handler(CommandHandler(["mylinkstats", "mystats"], my_stats))
     app.add_handler(CommandHandler("stats_referrals", stats_referrals))
     app.add_handler(CommandHandler("stats_alias", stats_alias))
     app.add_handler(CommandHandler("stats", stats))
