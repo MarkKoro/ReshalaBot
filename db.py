@@ -377,42 +377,81 @@ async def get_active(db) -> tuple[int, int]:
 
 
 async def get_referral_stats(db) -> list[dict]:
+    """Return referral statistics grouped by parent with child details."""
     async with db.execute(
         """
-        SELECT p.id, p.alias, COUNT(c.id) AS cnt,
+        SELECT p.id, p.alias,
+               c.id, c.alias, c.text_cnt, c.photo_cnt,
                IFNULL(SUM(pay.rub),0) AS rub,
                IFNULL(SUM(pay.stars),0) AS stars
         FROM users AS c
         JOIN users AS p ON c.ref_parent = p.id
         LEFT JOIN payments AS pay ON pay.uid = c.id
-        GROUP BY p.id
+        GROUP BY p.id, c.id
         """
     ) as cur:
         rows = await cur.fetchall()
-    return [
-        {
-            "id": r[0],
-            "alias": r[1] or "",
-            "count": r[2],
-            "rub": r[3],
-            "stars": r[4],
-        }
-        for r in rows
-    ]
+    stats: dict[int, dict] = {}
+    for pid, palias, cid, calias, tc, pc, rub, stars in rows:
+        item = stats.setdefault(
+            pid,
+            {
+                "id": pid,
+                "alias": palias or "",
+                "count": 0,
+                "rub": 0,
+                "stars": 0,
+                "users": [],
+            },
+        )
+        item["count"] += 1
+        item["rub"] += rub
+        item["stars"] += stars
+        item["users"].append(
+            {
+                "id": cid,
+                "alias": calias or "",
+                "rub": rub,
+                "stars": stars,
+                "text": tc,
+                "photo": pc,
+            }
+        )
+    return list(stats.values())
 
 
-async def get_alias_stats(db, uid: int) -> tuple[int, int, int]:
+async def get_alias_stats(db, uid: int) -> dict:
+    """Return detailed stats for a single alias owner."""
     async with db.execute(
         """
-        SELECT COUNT(c.id) AS cnt,
+        SELECT c.id, c.alias, c.text_cnt, c.photo_cnt,
                IFNULL(SUM(pay.rub),0) AS rub,
                IFNULL(SUM(pay.stars),0) AS stars
         FROM users AS c
         LEFT JOIN payments AS pay ON pay.uid = c.id
         WHERE c.ref_parent=?
+        GROUP BY c.id
         """,
         (uid,),
     ) as cur:
-        row = await cur.fetchone()
-    return row if row else (0, 0, 0)
+        rows = await cur.fetchall()
+    cnt = 0
+    rub_sum = 0
+    stars_sum = 0
+    users = []
+    for cid, alias, tc, pc, rub, stars in rows:
+        cnt += 1
+        rub_sum += rub
+        stars_sum += stars
+        users.append(
+            {
+                "id": cid,
+                "alias": alias or "",
+                "rub": rub,
+                "stars": stars,
+                "text": tc,
+                "photo": pc,
+            }
+        )
+    return {"count": cnt, "rub": rub_sum, "stars": stars_sum, "users": users}
 

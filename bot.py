@@ -885,9 +885,9 @@ async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not alias:
         await update.message.reply_text("У вас нет alias")
         return
-    cnt, rub, stars = await get_alias_stats(db, uid)
-    data = {"alias": alias, "count": cnt, "rub": rub, "stars": stars}
-    await update.message.reply_text(json.dumps(data, ensure_ascii=False))
+    stats = await get_alias_stats(db, uid)
+    stats["alias"] = alias
+    await update.message.reply_text(json.dumps(stats, ensure_ascii=False))
 
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
