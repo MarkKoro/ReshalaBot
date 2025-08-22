@@ -455,3 +455,60 @@ async def get_alias_stats(db, uid: int) -> dict:
         )
     return {"count": cnt, "rub": rub_sum, "stars": stars_sum, "users": users}
 
+
+async def get_global_stats(db) -> dict:
+    """Return overall bot statistics."""
+    today = date.today()
+    week_ago = today.fromordinal(today.toordinal() - 6)
+
+    async with db.execute("SELECT COUNT(*) FROM users") as cur:
+        total_users = (await cur.fetchone())[0]
+
+    async with db.execute(
+        "SELECT COUNT(*) FROM users WHERE last_dt>=?", (week_ago.isoformat(),)
+    ) as cur:
+        week_active = (await cur.fetchone())[0]
+
+    async with db.execute(
+        """
+        SELECT IFNULL(SUM(rub),0), IFNULL(SUM(stars),0), COUNT(DISTINCT uid),
+               COUNT(DISTINCT CASE WHEN rub>0 THEN uid END),
+               COUNT(DISTINCT CASE WHEN stars>0 THEN uid END)
+        FROM payments
+        """
+    ) as cur:
+        rub_sum, stars_sum, pay_users, rub_users, star_users = await cur.fetchone()
+
+    async with db.execute("SELECT SUM(text_cnt + photo_cnt) FROM users") as cur:
+        total_checks = (await cur.fetchone())[0] or 0
+
+    async with db.execute(
+        "SELECT SUM(text_cnt + photo_cnt) FROM users WHERE last_dt>=?",
+        (week_ago.isoformat(),),
+    ) as cur:
+        week_checks = (await cur.fetchone())[0] or 0
+
+    async with db.execute(
+        "SELECT COUNT(*) FROM users WHERE last_dt>=? AND text_cnt + photo_cnt <= 1",
+        (week_ago.isoformat(),),
+    ) as cur:
+        new_users = (await cur.fetchone())[0]
+
+    return {
+        "users": {
+            "total": total_users,
+            "week_active": week_active,
+            "new_week": new_users,
+        },
+        "payments": {
+            "rub": rub_sum,
+            "stars": stars_sum,
+            "users": {
+                "total": pay_users,
+                "rub": rub_users,
+                "stars": star_users,
+            },
+        },
+        "checks": {"total": total_checks, "week_free": week_checks},
+    }
+
