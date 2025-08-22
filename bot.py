@@ -71,6 +71,7 @@ from db import (
     get_active,
     get_referral_stats,
     get_alias_stats,
+    get_global_stats,
     DB_PATH,
     init_subscription,
     get_subscribed,
@@ -887,8 +888,27 @@ async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("У вас нет alias")
         return
     stats = await get_alias_stats(db, uid)
-    stats["alias"] = alias
-    await update.message.reply_text(json.dumps(stats, ensure_ascii=False))
+    data = {
+        "id": uid,
+        "alias": alias,
+        "total": {
+            "users": stats["count"],
+            "rub": stats["rub"],
+            "stars": f"{stats['stars']}⭐",
+        },
+        "users": [
+            {
+                "id": u["id"],
+                "alias": u["alias"],
+                "rub": u["rub"],
+                "stars": f"{u['stars']}⭐",
+                "text": u["text"],
+                "photo": u["photo"],
+            }
+            for u in stats["users"]
+        ],
+    }
+    await update.message.reply_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -931,8 +951,11 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             txt += f"FB {good_fb/total_fb:.0%} полезно"
         await update.message.reply_text(txt)
     else:
-        users = len(await get_all_uids(db))
-        await update.message.reply_text(f"Всего пользователей: {users}")
+        data = await get_global_stats(db)
+        data["payments"]["stars"] = f"{data['payments']['stars']}⭐"
+        await update.message.reply_text(
+            json.dumps(data, ensure_ascii=False, indent=2)
+        )
 
 
 async def whereami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
