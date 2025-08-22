@@ -9,6 +9,7 @@
 
 import os, io, asyncio, logging, sys, httpx, time
 import aiosqlite, json
+from datetime import date
 from dotenv import load_dotenv
 from PIL import Image
 from telegram import (
@@ -888,27 +889,27 @@ async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("У вас нет alias")
         return
     stats = await get_alias_stats(db, uid)
-    data = {
-        "id": uid,
-        "alias": alias,
-        "total": {
-            "users": stats["count"],
-            "rub": stats["rub"],
-            "stars": f"{stats['stars']}⭐",
-        },
-        "users": [
-            {
-                "id": u["id"],
-                "alias": u["alias"],
-                "rub": u["rub"],
-                "stars": f"{u['stars']}⭐",
-                "text": u["text"],
-                "photo": u["photo"],
-            }
-            for u in stats["users"]
-        ],
-    }
-    await update.message.reply_text(json.dumps(data, ensure_ascii=False, indent=2))
+    lines = [
+        f"ID: {uid}",
+        f"Alias: {alias}",
+        "",
+        "|Показатель|Кол.|",
+        "|---|---:|",
+        f"|Пришло|{stats['count']}|",
+        f"|Заплатили ₽|{stats['rub']}|",
+        f"|Заплатили ⭐|{stats['stars']}⭐|",
+    ]
+    if stats["users"]:
+        lines += [
+            "",
+            "|ID|Alias|₽|⭐|",
+            "|---:|---|---:|---:|",
+        ]
+        for u in stats["users"]:
+            lines.append(
+                f"|{u['id']}|{u['alias'] or ''}|{u['rub']}|{u['stars']}⭐|"
+            )
+    await update.message.reply_text("\n".join(lines))
 
 
 async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -952,10 +953,30 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(txt)
     else:
         data = await get_global_stats(db)
-        data["payments"]["stars"] = f"{data['payments']['stars']}⭐"
-        await update.message.reply_text(
-            json.dumps(data, ensure_ascii=False, indent=2)
-        )
+        today = date.today()
+        week_ago = today.fromordinal(today.toordinal() - 6)
+        async with db.execute(
+            """
+            SELECT COUNT(DISTINCT pay.uid),
+                   IFNULL(SUM(pay.rub),0),
+                   IFNULL(SUM(pay.stars),0)
+            FROM payments AS pay
+            JOIN users AS u ON u.id = pay.uid
+            WHERE u.last_dt>=? AND u.text_cnt + u.photo_cnt <= 1
+            """,
+            (week_ago.isoformat(),),
+        ) as cur:
+            pay_users, rub_sum, stars_sum = await cur.fetchone()
+        lines = [
+            "|Показатель|Кол.|",
+            "|---|---:|",
+            f"|Новых за 7д|{data['users']['new_week']}|",
+            f"|Заплатило|{pay_users}|",
+            f"|В рублях|{rub_sum}|",
+            f"|В звёздах|{stars_sum}⭐|",
+            f"|Бесплатных проверок|{data['checks']['week_free']}|",
+        ]
+        await update.message.reply_text("\n".join(lines))
 
 
 async def whereami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
