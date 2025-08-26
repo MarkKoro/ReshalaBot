@@ -102,6 +102,7 @@ PHOTO_COST = 20
 # Ключ словаря — количество баллов, значение — цена
 PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
 PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
+SUPPORT_URL = "https://t.me/ObotizactiaSuppBot"
 
 # ── Подписка ─────────────────────────────────────────
 CHANNEL_ID = -1002883355776
@@ -366,6 +367,7 @@ def kb_main(free_txt: bool, free_ph: int) -> Mk:
             [Btn("💳 Дать решале за работу", callback_data="pay")],
             [Btn("🎁 Пригласить друга", callback_data="ref")],
             [Btn("ℹ️ Как я это делаю?", callback_data="how")],
+            [Btn("🆘 Техподдержка", url=SUPPORT_URL)],
         ]
     )
 
@@ -450,6 +452,12 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logging.info("command %s from %s", update.message.text, uid)
     await send_profile(update.message.chat, uid, ctx)
     ctx.user_data["stage"] = "profile"
+
+
+async def cmd_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    logging.info("command %s from %s", update.message.text, uid)
+    await update.message.reply_text(f"Техподдержка: {SUPPORT_URL}")
 
 # ── Callback router ──────────────────────────────────
 async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1098,6 +1106,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CommandHandler("decredits", decredits))
     app.add_handler(CommandHandler("alias", cmd_alias))
