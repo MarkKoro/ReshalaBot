@@ -271,6 +271,11 @@ async def clear_menu(
                 await ctx.bot.edit_message_reply_markup(
                     chat_id=chat.id, message_id=msg_id, reply_markup=None
                 )
+        except BadRequest as exc:
+            if delete and "can't be deleted for everyone" in str(exc):
+                logging.info("menu message %s can't be deleted: %s", msg_id, exc)
+            else:
+                logging.exception("failed to remove menu message")
         except Exception:
             logging.exception("failed to remove menu message")
         if delete:
