@@ -770,17 +770,29 @@ async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_subscription(update, ctx):
         return
-    payload = update.message.successful_payment.invoice_payload
+    sp = update.message.successful_payment
+    payload = sp.invoice_payload
     uid = update.effective_user.id
     parts = payload.split("_")
     credits = int(parts[1])
     method = parts[2]
+    charge_id = sp.provider_payment_charge_id
     db = ctx.bot_data["db"]
     await add_credits(db, uid, credits)
     if method == "card":
-        await log_payment(db, uid, rub=PRICE_PACKS_RUB[credits] // 100)
+        rub = PRICE_PACKS_RUB[credits] // 100
+        stars = 0
     else:
-        await log_payment(db, uid, stars=PRICE_PACKS_STARS[credits])
+        rub = 0
+        stars = PRICE_PACKS_STARS[credits]
+    await log_payment(
+        db,
+        uid,
+        rub=rub,
+        stars=stars,
+        method=method,
+        provider_charge_id=charge_id,
+    )
     await clear_menu(update.message.chat, uid, ctx, delete=True)
     total = "∞" if uid in ADMINS else await get_credits(db, uid)
     kb = kb_main(
@@ -830,7 +842,8 @@ async def grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db = ctx.bot_data["db"]
     await add_credits(db, target, qty)
-    await update.message.reply_text("OK")
+    total = await get_credits(db, target)
+    await update.message.reply_text(f"OK. Now {target} has {total} credits")
 
 async def decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id

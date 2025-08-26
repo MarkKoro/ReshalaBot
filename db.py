@@ -1,4 +1,5 @@
 import aiosqlite
+import time
 from pathlib import Path
 from datetime import date
 
@@ -50,9 +51,33 @@ async def create_tables(db):
         CREATE TABLE IF NOT EXISTS payments (
           uid   INTEGER,
           rub   INTEGER DEFAULT 0,
-          stars INTEGER DEFAULT 0
+          stars INTEGER DEFAULT 0,
+          ts    INTEGER DEFAULT (strftime('%s','now')),
+          method TEXT DEFAULT '',
+          provider_charge_id TEXT
         );
         """
+    )
+    try:
+        await db.execute(
+            "ALTER TABLE payments ADD COLUMN ts INTEGER DEFAULT (strftime('%s','now'))"
+        )
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "ALTER TABLE payments ADD COLUMN method TEXT DEFAULT ''"
+        )
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "ALTER TABLE payments ADD COLUMN provider_charge_id TEXT"
+        )
+    except Exception:
+        pass
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_payments_charge ON payments(provider_charge_id)"
     )
     await db.execute(
         """
@@ -292,15 +317,27 @@ async def get_alias(db, uid: int) -> str:
     return row[0] if row else ''
 
 
-async def log_payment(db, uid: int, rub: int = 0, stars: int = 0):
+async def log_payment(
+    db,
+    uid: int,
+    rub: int = 0,
+    stars: int = 0,
+    method: str = "",
+    provider_charge_id: str | None = None,
+    ts: int | None = None,
+):
     if rub <= 0 and stars <= 0:
         return
     await _ensure_user(db, uid)
-    await db.execute(
-        "INSERT INTO payments(uid, rub, stars) VALUES(?,?,?)",
-        (uid, rub, stars),
-    )
-    await db.commit()
+    ts = int(ts or time.time())
+    try:
+        await db.execute(
+            "INSERT INTO payments(uid, rub, stars, ts, method, provider_charge_id) VALUES(?,?,?,?,?,?)",
+            (uid, rub, stars, ts, method, provider_charge_id),
+        )
+        await db.commit()
+    except aiosqlite.IntegrityError:
+        pass
 
 
 async def log_pay_click(db, uid: int):
