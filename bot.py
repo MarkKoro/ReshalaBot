@@ -102,7 +102,7 @@ PHOTO_COST = 20
 # Ключ словаря — количество баллов, значение — цена
 PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
 PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
-SUPPORT_URL = "https://t.me/ObotizactiaSuppBot"
+SUPPORT_URL = "https://t.me/obotizatciaSupp_bot"
 
 # ── Подписка ─────────────────────────────────────────
 CHANNEL_ID = -1002883355776
