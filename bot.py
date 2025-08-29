@@ -993,6 +993,12 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             (week_ago.isoformat(),),
         ) as cur:
             pay_users, rub_sum, stars_sum = await cur.fetchone()
+        month_ago = int(time.time()) - 30 * 86400
+        async with db.execute(
+            "SELECT IFNULL(SUM(rub),0), IFNULL(SUM(stars),0) FROM payments WHERE ts>=?",
+            (month_ago,),
+        ) as cur:
+            rub_30, stars_30 = await cur.fetchone()
         lines = [
             "|Показатель|Кол.|",
             "|---|---:|",
@@ -1001,6 +1007,8 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"|В рублях|{rub_sum}|",
             f"|В звёздах|{stars_sum}⭐|",
             f"|Бесплатных проверок|{data['checks']['week_free']}|",
+            f"|Доход 30д ₽|{rub_30}|",
+            f"|Доход 30д ⭐|{stars_30}⭐|",
         ]
         await update.message.reply_text("\n".join(lines))
 
