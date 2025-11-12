@@ -284,6 +284,21 @@ async def clear_menu(
             ctx.user_data.pop("menu_slot", None)
             await set_menu_msg(ctx.bot_data["db"], uid, 0)
 
+
+def reset_interaction_state(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбросить временные данные сессии без затрагивания счётчиков и баланса."""
+
+    for key in (
+        "ans_msg_id",
+        "pending_update",
+        "pending_handler",
+        "stage",
+        "last_kind",
+        "photo",
+    ):
+        ctx.user_data.pop(key, None)
+
+
 async def send_menu(
     chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE, slot: str | None = None
 ):
@@ -403,6 +418,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     text = getattr(update.message, "text", "")
     logging.info("command %s from %s", text, uid)
+    chat = update.effective_chat
+    if chat:
+        await clear_menu(chat, uid, ctx, delete=True)
+    reset_interaction_state(ctx)
     if not await ensure_subscription(update, ctx):
         return
     db = ctx.bot_data["db"]
