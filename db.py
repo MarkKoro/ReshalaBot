@@ -137,6 +137,8 @@ async def create_tables() -> None:
             access_until TEXT NOT NULL,
             last_payment_id TEXT,
             status TEXT NOT NULL DEFAULT 'active',
+            renewal_notice_sent_at TEXT,
+            expiration_notice_sent_at TEXT,
             updated_at TEXT NOT NULL
         );
 
@@ -171,7 +173,22 @@ async def create_tables() -> None:
         );
         """
     )
+    await _add_missing_columns(
+        db,
+        "subscriptions",
+        {
+            "renewal_notice_sent_at": "TEXT",
+            "expiration_notice_sent_at": "TEXT",
+        },
+    )
     await db.commit()
+
+
+async def _add_missing_columns(db: aiosqlite.Connection, table: str, columns: dict[str, str]) -> None:
+    existing_columns = await _table_columns(db, table)
+    for column, definition in columns.items():
+        if column not in existing_columns:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 async def upsert_user(tg_user_id: int, username: str | None = None, full_name: str | None = None) -> None:
@@ -425,6 +442,8 @@ async def finalize_payment_once(
                 access_until = excluded.access_until,
                 last_payment_id = excluded.last_payment_id,
                 status = 'active',
+                renewal_notice_sent_at = NULL,
+                expiration_notice_sent_at = NULL,
                 updated_at = excluded.updated_at
             """,
             (tg_user_id, access_until, payment_id, now),
@@ -467,6 +486,8 @@ async def grant_access(tg_user_id: int, days: int, source: str = "admin", paymen
             access_until = excluded.access_until,
             last_payment_id = excluded.last_payment_id,
             status = 'active',
+            renewal_notice_sent_at = NULL,
+            expiration_notice_sent_at = NULL,
             updated_at = excluded.updated_at
         """,
         (tg_user_id, access_until, payment_id or source, iso_now()),
@@ -501,9 +522,35 @@ async def list_expired_subscriptions(now: str | datetime | None = None) -> list[
         return [dict(row) for row in await cur.fetchall()]
 
 
+async def list_subscriptions_due_for_renewal_notice(now: str | datetime | None = None, days_before: int = 3) -> list[dict[str, Any]]:
+    db = await connection()
+    now_dt = parse_dt(now.isoformat() if isinstance(now, datetime) else now) or utcnow()
+    threshold = (now_dt + timedelta(days=days_before)).isoformat()
+    now_value = now_dt.isoformat()
+    async with db.execute(
+        """
+        SELECT * FROM subscriptions
+        WHERE status = 'active'
+          AND access_until > ?
+          AND access_until <= ?
+          AND renewal_notice_sent_at IS NULL
+        """,
+        (now_value, threshold),
+    ) as cur:
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def mark_renewal_notice_sent(tg_user_id: int) -> None:
+    db = await connection()
+    now = iso_now()
+    await db.execute("UPDATE subscriptions SET renewal_notice_sent_at = ?, updated_at = ? WHERE tg_user_id = ?", (now, now, tg_user_id))
+    await db.commit()
+
+
 async def mark_subscription_expired(tg_user_id: int) -> None:
     db = await connection()
-    await db.execute("UPDATE subscriptions SET status = 'expired', updated_at = ? WHERE tg_user_id = ?", (iso_now(), tg_user_id))
+    now = iso_now()
+    await db.execute("UPDATE subscriptions SET status = 'expired', expiration_notice_sent_at = ?, updated_at = ? WHERE tg_user_id = ?", (now, now, tg_user_id))
     await db.commit()
 
 
