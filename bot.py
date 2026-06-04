@@ -637,10 +637,55 @@ async def send_existing_access(chat_id: int, tg_user_id: int, payment_id: str | 
     await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж уже обработан, но активный доступ не найден. Напишите администратору.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
 
 
+async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await render_screen(
+        tg_user_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "⏳ До конца твоей подписки осталось 3 дня.\n\n"
+            f"Доступ к закрытому каналу активен до {format_dt(access_until)}. "
+            "Если хочешь остаться внутри без перерыва, можешь продлить доступ прямо сейчас — "
+            "новый срок добавится к текущей подписке.\n\n"
+            "Можно продлить сейчас или вернуться к этому позже."
+        ),
+        reply_markup=next_keyboard("user:tariffs", "Продлить сейчас"),
+    )
+
+
+async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await render_screen(
+        tg_user_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "🔒 Твоя подписка закончилась.\n\n"
+            "Доступ к закрытому каналу завершён, поэтому бот убрал тебя из канала. "
+            "Если хочешь вернуться к материалам и продолжить обучение, можешь продлить подписку прямо сейчас."
+        ),
+        reply_markup=next_keyboard("user:tariffs", "Купить ещё / продлить"),
+    )
+
+
+async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    for sub in await db.list_subscriptions_due_for_renewal_notice(now_iso(), days_before=3):
+        tg_user_id = int(sub["tg_user_id"])
+        try:
+            await send_subscription_renewal_notice(tg_user_id, sub.get("access_until"), ctx)
+            await db.mark_renewal_notice_sent(tg_user_id)
+            logger.info("renewal notice sent user_id=%s access_until=%s", tg_user_id, sub["access_until"])
+        except TelegramError:
+            logger.exception("failed to send renewal notice user_id=%s access_until=%s", tg_user_id, sub.get("access_until"))
+
+
 async def expire_subscriptions_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for sub in await db.list_expired_subscriptions(now_iso()):
         tg_user_id = int(sub["tg_user_id"])
         await remove_user_from_channel(ctx, tg_user_id, reason="expired")
+        try:
+            await send_subscription_expired_notice(tg_user_id, ctx)
+        except TelegramError:
+            logger.exception("failed to send expiration notice user_id=%s access_until=%s", tg_user_id, sub.get("access_until"))
         await db.mark_subscription_expired(tg_user_id)
         logger.info("expired subscription removed user_id=%s access_until=%s", tg_user_id, sub["access_until"])
 
@@ -1053,7 +1098,8 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, fallback_message))
     if app.job_queue is None:
         raise RuntimeError("JobQueue is unavailable. Install python-telegram-bot[job-queue].")
-    app.job_queue.run_repeating(expire_subscriptions_job, interval=3600, first=60, name="expire_subscriptions")
+    app.job_queue.run_repeating(renewal_notices_job, interval=3600, first=60, name="renewal_notices")
+    app.job_queue.run_repeating(expire_subscriptions_job, interval=3600, first=120, name="expire_subscriptions")
     return app
 
 
