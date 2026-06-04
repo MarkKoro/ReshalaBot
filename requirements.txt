@@ -1,6 +1,4 @@
-python-telegram-bot==21.*
-httpx
-openai
-python-dotenv
-Pillow
+python-telegram-bot[job-queue]
 aiosqlite
+python-dotenv
+httpx
