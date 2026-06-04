@@ -268,6 +268,12 @@ async def clear_intro_video_file_id() -> None:
     await db.commit()
 
 
+async def count_review_photos() -> int:
+    db = await connection()
+    async with db.execute("SELECT COUNT(*) AS value FROM review_photos") as cur:
+        return int((await cur.fetchone())["value"])
+
+
 async def add_review_photo(file_id: str) -> None:
     db = await connection()
     async with db.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS next_order FROM review_photos") as cur:
@@ -277,6 +283,14 @@ async def add_review_photo(file_id: str) -> None:
         (file_id, int(row["next_order"]), iso_now()),
     )
     await db.commit()
+
+
+async def delete_review_photo(photo_id: int) -> bool:
+    db = await connection()
+    cur = await db.execute("DELETE FROM review_photos WHERE id = ?", (photo_id,))
+    deleted = cur.rowcount > 0
+    await db.commit()
+    return deleted
 
 
 async def list_review_photos() -> list[dict[str, Any]]:

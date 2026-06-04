@@ -32,10 +32,10 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002468345259"))
 ENV_OFFER_URL = os.getenv("OFFER_URL", "").strip()
 YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
-SUPPORT = os.getenv("SUPPORT", "").strip()
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 ScreenKind = Literal["text", "video", "photo"]
+MAX_REVIEW_PHOTOS = 8
 
 
 @dataclass(frozen=True)
@@ -123,6 +123,31 @@ async def delete_incoming(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_delete_message(ctx, update.effective_chat.id, update.effective_message.message_id)
 
 
+def markup_rows(markup: Mk | None) -> list[list[Btn]]:
+    if not markup:
+        return []
+    return [list(row) for row in markup.inline_keyboard]
+
+
+def has_callback(rows: list[list[Btn]], callback_data: str) -> bool:
+    return any(button.callback_data == callback_data for row in rows for button in row)
+
+
+async def with_admin_quick_actions(tg_user_id: int, reply_markup: Mk | None) -> Mk | None:
+    if tg_user_id not in ADMIN_IDS:
+        return reply_markup
+    rows = markup_rows(reply_markup)
+    quick_buttons: list[Btn] = []
+    if not has_callback(rows, "admin:review_add"):
+        quick_buttons.append(Btn("➕ Добавить фото", callback_data="admin:review_add"))
+    if not has_callback(rows, "admin:intro_set"):
+        video_label = "🎬 Заменить видео" if await db.get_intro_video_file_id() else "🎬 Добавить видео"
+        quick_buttons.append(Btn(video_label, callback_data="admin:intro_set"))
+    if quick_buttons:
+        rows.append(quick_buttons)
+    return Mk(rows)
+
+
 async def render_screen(
     chat_id: int,
     tg_user_id: int,
@@ -134,6 +159,7 @@ async def render_screen(
     file_id: str | None = None,
 ) -> None:
     """Render one actual bot screen and keep its coordinates in users.current_* fields."""
+    reply_markup = await with_admin_quick_actions(tg_user_id, reply_markup)
     current = await db.get_current_message(tg_user_id) or {}
     old_chat_id = int(current.get("current_chat_id") or 0)
     old_message_id = int(current.get("current_message_id") or 0)
@@ -192,25 +218,8 @@ def next_keyboard(callback_data: str, label: str = "Далее ➡️") -> Mk:
     return Mk([[Btn(label, callback_data=callback_data)]])
 
 
-def support_url() -> str | None:
-    if not SUPPORT:
-        return None
-    if SUPPORT.startswith("@"):
-        return f"https://t.me/{SUPPORT.lstrip('@')}"
-    if SUPPORT.startswith(("http://", "https://", "tg://")):
-        return SUPPORT
-    if SUPPORT.startswith("t.me/"):
-        return f"https://{SUPPORT}"
-    return SUPPORT
-
-
 def tariffs_keyboard(tariffs: list[Tariff]) -> Mk:
-    rows = [[Btn(f"{tariff.title} — {tariff.amount_rub} ₽", callback_data=f"user:tariff:{tariff.code}")] for tariff in tariffs]
-    support = support_url()
-    if support:
-        rows.append([Btn("Поддержка", url=support)])
-    rows.append([Btn("🔄 Обновить", callback_data="user:tariffs")])
-    return Mk(rows)
+    return Mk([[Btn(f"{tariff.title} — {tariff.amount_rub} ₽", callback_data=f"user:tariff:{tariff.code}")] for tariff in tariffs])
 
 
 def payment_keyboard(payment_id: str, confirmation_url: str) -> Mk:
@@ -225,7 +234,40 @@ def payment_keyboard(payment_id: str, confirmation_url: str) -> Mk:
 
 async def available_tariffs(tg_user_id: int) -> list[Tariff]:
     had_successful_payment = await db.has_successful_payment(tg_user_id)
-    return [tariff for tariff in TARIFFS.values() if not tariff.first_purchase_only or not had_successful_payment]
+    if had_successful_payment:
+        return [TARIFFS["m1"], TARIFFS["m3"]]
+    return [TARIFFS["m1_first"], TARIFFS["m3"]]
+
+
+def active_subscription_until(sub: dict | None) -> str | None:
+    if not sub or sub.get("status") != "active":
+        return None
+    access_until = sub.get("access_until")
+    parsed_until = db.parse_dt(access_until)
+    if not parsed_until or parsed_until <= datetime.now(timezone.utc):
+        return None
+    return access_until
+
+
+async def show_active_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    sub = await db.get_subscription(tg_user_id)
+    access_until = active_subscription_until(sub)
+    if not access_until:
+        await show_welcome_intro(chat_id, tg_user_id, ctx)
+        return
+    await render_screen(
+        chat_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "✅ Доступ у тебя уже есть.\n\n"
+            f"Твой текущий доступ к закрытому каналу активен до {format_dt(access_until)}. "
+            "Можно спокойно продолжать обучение и возвращаться к материалам в канале.\n\n"
+            "Если хочешь продлить доступ заранее или купить ещё один период, нажми кнопку ниже — "
+            "мы просто добавим новый срок к твоему текущему доступу."
+        ),
+        reply_markup=next_keyboard("user:tariffs", "Продлить или купить ещё"),
+    )
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -237,7 +279,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await delete_incoming(update, ctx)
 
     if await db.has_accepted_offer(user.id):
-        await show_intro_or_reviews_or_tariffs(chat.id, user.id, ctx)
+        if active_subscription_until(await db.get_subscription(user.id)):
+            await show_active_access(chat.id, user.id, ctx)
+            return
+        await show_welcome_intro(chat.id, user.id, ctx)
         return
 
     await render_screen(
@@ -245,13 +290,27 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user.id,
         ctx,
         text=(
-            "Привет! Это бот доступа к закрытому Telegram-каналу.\n\n"
-            "1. Откройте оферту.\n"
-            "2. Нажмите «✅ Принимаю оферту».\n"
-            "3. После этого откроются материалы и тарифы.\n\n"
-            "До принятия оферты оплатить доступ нельзя."
+            "Приветствую тебя, любитель узнавать новое и познавать жизнь.\n\n"
+            "Перед оплатой нужно принять оферту — это откроет короткое превью, отзывы участников "
+            "и тарифы для входа в закрытый канал.\n\n"
+            "Нажми «📄 Оферта», ознакомься с условиями и затем подтверди согласие кнопкой ниже."
         ),
         reply_markup=offer_keyboard(await db.get_offer_url()),
+    )
+
+
+async def show_welcome_intro(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await render_screen(
+        chat_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "Приветствую тебя, любитель узнавать новое и познавать жизнь.\n\n"
+            "Сейчас мы кратко покажем, что ждёт тебя внутри закрытого канала: "
+            "сначала небольшое видео-превью, затем отзывы людей, которые уже прошли через курс, "
+            "и после этого — тарифы для входа."
+        ),
+        reply_markup=next_keyboard("user:start_intro", "Смотреть превью"),
     )
 
 
@@ -264,19 +323,80 @@ async def show_intro_or_reviews_or_tariffs(chat_id: int, tg_user_id: int, ctx: C
             ctx,
             kind="video",
             file_id=intro_video_file_id,
-            text="Короткое превью закрытого канала",
+            text=(
+                "Короткое превью закрытого канала.\n\n"
+                "Посмотри его, чтобы почувствовать атмосферу и понять, какие темы мы разбираем внутри."
+            ),
             reply_markup=next_keyboard("user:after_intro"),
         )
         return
-    await show_first_review_or_tariffs(chat_id, tg_user_id, ctx)
+    await show_reviews_intro(chat_id, tg_user_id, ctx)
+
+
+async def show_reviews_intro(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    reviews = await db.list_review_photos()
+    if not reviews:
+        await show_tariff_intro(chat_id, tg_user_id, ctx)
+        return
+    await render_screen(
+        chat_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "Теперь можешь кратко ознакомиться с отзывами клиентов, "
+            "которые уже прошли через курс и увидели результат на практике.\n\n"
+            "Мы покажем фото одной удобной пачкой, чтобы их было легко пролистать."
+        ),
+        reply_markup=next_keyboard("user:show_reviews", "Смотреть отзывы"),
+    )
 
 
 async def show_first_review_or_tariffs(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    reviews = await db.list_review_photos()
-    if reviews:
-        await show_review(chat_id, tg_user_id, 0, ctx)
+    reviews = (await db.list_review_photos())[:MAX_REVIEW_PHOTOS]
+    if not reviews:
+        await show_tariff_intro(chat_id, tg_user_id, ctx)
         return
-    await show_tariffs(chat_id, tg_user_id, ctx)
+    if len(reviews) == 1:
+        await ctx.bot.send_photo(
+            chat_id=chat_id,
+            photo=reviews[0]["file_id"],
+            caption="Отзывы участников (1/1)",
+        )
+    else:
+        media = [
+            InputMediaPhoto(
+                media=review["file_id"],
+                caption=f"Отзывы участников (1/{len(reviews)})" if index == 0 else None,
+            )
+            for index, review in enumerate(reviews)
+        ]
+        await ctx.bot.send_media_group(chat_id=chat_id, media=media)
+    await render_screen(
+        chat_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "Отлично. Если хочешь стать одним из нас, углубиться в сознание и выстроить "
+            "свои личные опоры, чтобы быстрее и увереннее принимать решения в жизни, "
+            "переходи к выбору тарифа.\n\n"
+            "Мы будем рады видеть тебя внутри."
+        ),
+        reply_markup=next_keyboard("user:tariffs", "Выбрать тариф"),
+    )
+
+
+async def show_tariff_intro(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await render_screen(
+        chat_id,
+        tg_user_id,
+        ctx,
+        text=(
+            "Если хочешь стать одним из нас, углубиться в сознание и выстроить свои личные опоры, "
+            "чтобы быстрее и увереннее принимать решения в жизни, выбирай подходящий тариф.\n\n"
+            "Мы ждём тебя внутри закрытого канала."
+        ),
+        reply_markup=next_keyboard("user:tariffs", "Выбрать тариф"),
+    )
 
 
 async def show_review(chat_id: int, tg_user_id: int, offset: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -299,14 +419,23 @@ async def show_review(chat_id: int, tg_user_id: int, offset: int, ctx: ContextTy
 
 async def show_tariffs(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sub = await db.get_subscription(tg_user_id)
-    active_line = ""
-    if sub and sub.get("status") == "active" and db.parse_dt(sub.get("access_until")) and db.parse_dt(sub.get("access_until")) > datetime.now(timezone.utc):
-        active_line = f"\n\nВаш текущий доступ активен до {format_dt(sub.get('access_until'))}."
+    access_until = active_subscription_until(sub)
+    if access_until:
+        text = (
+            f"Твой доступ уже активен до {format_dt(access_until)}.\n\n"
+            "Если хочешь продлить его заранее или купить ещё один период, выбери тариф ниже — "
+            "новый срок добавится к текущему доступу."
+        )
+    else:
+        text = (
+            "Выбери срок доступа к закрытому каналу. После оплаты бот выдаст одноразовую ссылку "
+            "для входа в канал."
+        )
     await render_screen(
         chat_id,
         tg_user_id,
         ctx,
-        text="Выберите срок доступа к закрытому каналу:" + active_line,
+        text=text,
         reply_markup=tariffs_keyboard(await available_tariffs(tg_user_id)),
     )
 
@@ -323,9 +452,18 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "user:accept_offer":
         await db.accept_offer(tg_user_id)
+        if active_subscription_until(await db.get_subscription(tg_user_id)):
+            await show_active_access(chat_id, tg_user_id, ctx)
+            return
+        await show_welcome_intro(chat_id, tg_user_id, ctx)
+        return
+    if data == "user:start_intro":
         await show_intro_or_reviews_or_tariffs(chat_id, tg_user_id, ctx)
         return
     if data == "user:after_intro":
+        await show_reviews_intro(chat_id, tg_user_id, ctx)
+        return
+    if data == "user:show_reviews":
         await show_first_review_or_tariffs(chat_id, tg_user_id, ctx)
         return
     if data.startswith("user:review:"):
@@ -345,8 +483,14 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not tariff:
             await render_screen(chat_id, tg_user_id, ctx, text="Тариф не найден. Выберите тариф заново.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
             return
-        if tariff.first_purchase_only and tariff not in await available_tariffs(tg_user_id):
-            await render_screen(chat_id, tg_user_id, ctx, text="Тариф первой покупки уже недоступен.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
+        if tariff not in await available_tariffs(tg_user_id):
+            await render_screen(
+                chat_id,
+                tg_user_id,
+                ctx,
+                text="Этот тариф сейчас недоступен для вашего аккаунта. Выберите актуальный тариф из списка.",
+                reply_markup=next_keyboard("user:tariffs", "К тарифам"),
+            )
             return
         await create_payment_and_render(chat_id, tg_user_id, tariff, ctx)
         return
@@ -474,8 +618,14 @@ async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None
         chat_id,
         tg_user_id,
         ctx,
-        text=f"{prefix} Доступ активен до {format_dt(access_until)}.\n\nВаша одноразовая ссылка для входа в канал:\n{invite_link}",
-        reply_markup=next_keyboard("user:tariffs", "К тарифам"),
+        text=(
+            f"{prefix} Доступ активен до {format_dt(access_until)}.\n\n"
+            "Вот твоя одноразовая ссылка для входа в канал:\n"
+            f"{invite_link}\n\n"
+            "Важно: ссылка рассчитана на одно вступление и действует 1 час. "
+            "После перехода Telegram больше не позволит использовать её повторно."
+        ),
+        reply_markup=next_keyboard("user:tariffs", "Продлить доступ"),
     )
 
 
@@ -529,11 +679,13 @@ def admin_intro_keyboard(has_video: bool) -> Mk:
     return Mk(rows)
 
 
-def admin_reviews_keyboard(has_reviews: bool) -> Mk:
-    rows = [[Btn("➕ Добавить фото-отзыв", callback_data="admin:review_add")]]
+def admin_reviews_keyboard(has_reviews: bool, count: int = 0) -> Mk:
+    rows: list[list[Btn]] = []
+    if count < MAX_REVIEW_PHOTOS:
+        rows.append([Btn("➕ Добавить фото", callback_data="admin:review_add")])
     if has_reviews:
-        rows.append([Btn("👀 Показать отзывы", callback_data="admin:review_show:0")])
-        rows.append([Btn("🗑 Очистить отзывы", callback_data="admin:reviews_clear")])
+        rows.append([Btn("👀 Показать фото", callback_data="admin:review_show:0")])
+        rows.append([Btn("🗑 Удалить выбранное фото", callback_data="admin:review_delete_menu")])
     rows.append([Btn("◀️ В админ-панель", callback_data="admin:menu")])
     return Mk(rows)
 
@@ -589,19 +741,39 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data == "admin:reviews":
         await db.clear_admin_state(tg_user_id)
-        reviews = await db.list_review_photos()
-        await render_screen(chat_id, tg_user_id, ctx, text=f"Управление отзывами. Сейчас отзывов: {len(reviews)}.", reply_markup=admin_reviews_keyboard(bool(reviews)))
+        await show_admin_reviews_menu(chat_id, tg_user_id, ctx)
         return
     if data == "admin:review_add":
+        count = await db.count_review_photos()
+        if count >= MAX_REVIEW_PHOTOS:
+            await show_admin_reviews_menu(chat_id, tg_user_id, ctx, f"⚠️ Уже добавлено максимум фото: {MAX_REVIEW_PHOTOS}.")
+            return
         await db.set_admin_state(tg_user_id, "review_photo")
-        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте следующим сообщением фото-отзыв.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:reviews")]]))
+        await render_screen(
+            chat_id,
+            tg_user_id,
+            ctx,
+            text=(
+                f"Отправьте фото. Можно прислать несколько фото подряд, максимум — {MAX_REVIEW_PHOTOS}.\n"
+                f"Сейчас добавлено: {count}/{MAX_REVIEW_PHOTOS}."
+            ),
+            reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
+        )
         return
     if data == "admin:reviews_clear":
         await db.clear_review_photos()
-        await render_screen(chat_id, tg_user_id, ctx, text="✅ Все отзывы удалены.", reply_markup=admin_reviews_keyboard(False))
+        await render_screen(chat_id, tg_user_id, ctx, text="✅ Все отзывы удалены.", reply_markup=admin_reviews_keyboard(False, 0))
         return
     if data.startswith("admin:review_show:"):
         await show_admin_review(chat_id, tg_user_id, int(data.rsplit(":", 1)[1]), ctx)
+        return
+    if data == "admin:review_delete_menu":
+        await show_review_delete_menu(chat_id, tg_user_id, ctx)
+        return
+    if data.startswith("admin:review_delete:"):
+        photo_id = int(data.rsplit(":", 1)[1])
+        await db.delete_review_photo(photo_id)
+        await show_review_delete_menu(chat_id, tg_user_id, ctx, "✅ Фото удалено.")
         return
     if data == "admin:grant":
         await db.set_admin_state(tg_user_id, "grant")
@@ -617,10 +789,35 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
 
+
+async def show_admin_reviews_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, note: str = "") -> None:
+    reviews = await db.list_review_photos()
+    text = (
+        f"{note}\n\n" if note else ""
+    ) + (
+        "Управление фото-отзывами.\n"
+        f"Добавлено: {len(reviews)}/{MAX_REVIEW_PHOTOS}.\n\n"
+        "Пользователю фото отправляются одной пачкой перед выбором тарифа."
+    )
+    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=admin_reviews_keyboard(bool(reviews), len(reviews)))
+
+
+async def show_review_delete_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, note: str = "") -> None:
+    reviews = await db.list_review_photos()
+    if not reviews:
+        await render_screen(chat_id, tg_user_id, ctx, text="Фото не добавлены.", reply_markup=admin_reviews_keyboard(False, 0))
+        return
+    lines = [f"{index}. Фото ID {row['id']} — добавлено {format_dt(row['created_at'])}" for index, row in enumerate(reviews, start=1)]
+    text = (f"{note}\n\n" if note else "") + "Выберите, какое фото удалить:\n\n" + "\n".join(lines)
+    rows = [[Btn(f"🗑 Фото {index}", callback_data=f"admin:review_delete:{row['id']}")] for index, row in enumerate(reviews, start=1)]
+    rows.append([Btn("◀️ К фото", callback_data="admin:reviews")])
+    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=Mk(rows))
+
+
 async def show_admin_review(chat_id: int, tg_user_id: int, offset: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     reviews = await db.list_review_photos()
     if not reviews:
-        await render_screen(chat_id, tg_user_id, ctx, text="Отзывы не добавлены.", reply_markup=admin_reviews_keyboard(False))
+        await render_screen(chat_id, tg_user_id, ctx, text="Фото не добавлены.", reply_markup=admin_reviews_keyboard(False, 0))
         return
     offset = max(0, min(offset, len(reviews) - 1))
     rows: list[list[Btn]] = []
@@ -631,9 +828,18 @@ async def show_admin_review(chat_id: int, tg_user_id: int, offset: int, ctx: Con
         nav.append(Btn("➡️", callback_data=f"admin:review_show:{offset + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([Btn("◀️ К отзывам", callback_data="admin:reviews")])
     row = reviews[offset]
-    await render_screen(chat_id, tg_user_id, ctx, kind="photo", file_id=row["file_id"], text=f"Отзыв {offset + 1}/{len(reviews)}\nID: {row['id']}\nДобавлен: {format_dt(row['created_at'])}", reply_markup=Mk(rows))
+    rows.append([Btn(f"🗑 Удалить фото {offset + 1}", callback_data=f"admin:review_delete:{row['id']}")])
+    rows.append([Btn("◀️ К фото", callback_data="admin:reviews")])
+    await render_screen(
+        chat_id,
+        tg_user_id,
+        ctx,
+        kind="photo",
+        file_id=row["file_id"],
+        text=f"Фото {offset + 1}/{len(reviews)}\nID: {row['id']}\nДобавлено: {format_dt(row['created_at'])}",
+        reply_markup=Mk(rows),
+    )
 
 
 async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -685,14 +891,39 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return True
 
     if state_name == "review_photo":
+        count = await db.count_review_photos()
+        if count >= MAX_REVIEW_PHOTOS:
+            await db.clear_admin_state(user.id)
+            await delete_incoming(update, ctx)
+            await show_admin_reviews_menu(chat.id, user.id, ctx, f"⚠️ Уже добавлено максимум фото: {MAX_REVIEW_PHOTOS}.")
+            return True
         if not message.photo:
             await delete_incoming(update, ctx)
-            await render_screen(chat.id, user.id, ctx, text="Нужно отправить именно фото.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:reviews")]]))
+            await render_screen(
+                chat.id,
+                user.id,
+                ctx,
+                text="Нужно отправить именно фото. Видео добавляется отдельной кнопкой «Заменить видео».",
+                reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
+            )
             return True
         await db.add_review_photo(message.photo[-1].file_id)
-        await db.clear_admin_state(user.id)
+        count += 1
         await delete_incoming(update, ctx)
-        await render_screen(chat.id, user.id, ctx, text="✅ Фото-отзыв добавлен.", reply_markup=admin_reviews_keyboard(True))
+        if count >= MAX_REVIEW_PHOTOS:
+            await db.clear_admin_state(user.id)
+            await show_admin_reviews_menu(chat.id, user.id, ctx, f"✅ Фото добавлено. Достигнут лимит {MAX_REVIEW_PHOTOS}/{MAX_REVIEW_PHOTOS}.")
+            return True
+        await render_screen(
+            chat.id,
+            user.id,
+            ctx,
+            text=(
+                f"✅ Фото добавлено: {count}/{MAX_REVIEW_PHOTOS}.\n"
+                "Можно отправить ещё фото или нажать «Готово»."
+            ),
+            reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
+        )
         return True
 
     if state_name == "grant":
@@ -779,14 +1010,26 @@ async def admin_shortcut(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await db.clear_intro_video_file_id()
         await render_screen(chat.id, user.id, ctx, text="✅ Превью-видео удалено.", reply_markup=admin_intro_keyboard(False))
     elif command == "/add_review":
+        count = await db.count_review_photos()
+        if count >= MAX_REVIEW_PHOTOS:
+            await show_admin_reviews_menu(chat.id, user.id, ctx, f"⚠️ Уже добавлено максимум фото: {MAX_REVIEW_PHOTOS}.")
+            return
         await db.set_admin_state(user.id, "review_photo")
-        await render_screen(chat.id, user.id, ctx, text="Отправьте следующим сообщением фото-отзыв.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:reviews")]]))
+        await render_screen(
+            chat.id,
+            user.id,
+            ctx,
+            text=(
+                f"Отправьте фото. Можно прислать несколько фото подряд, максимум — {MAX_REVIEW_PHOTOS}.\n"
+                f"Сейчас добавлено: {count}/{MAX_REVIEW_PHOTOS}."
+            ),
+            reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
+        )
     elif command == "/reviews":
-        reviews = await db.list_review_photos()
-        await render_screen(chat.id, user.id, ctx, text=f"Управление отзывами. Сейчас отзывов: {len(reviews)}.", reply_markup=admin_reviews_keyboard(bool(reviews)))
+        await show_admin_reviews_menu(chat.id, user.id, ctx)
     elif command == "/clear_reviews":
         await db.clear_review_photos()
-        await render_screen(chat.id, user.id, ctx, text="✅ Все отзывы удалены.", reply_markup=admin_reviews_keyboard(False))
+        await render_screen(chat.id, user.id, ctx, text="✅ Все отзывы удалены.", reply_markup=admin_reviews_keyboard(False, 0))
     elif command == "/grant":
         await db.set_admin_state(user.id, "grant")
         await render_screen(chat.id, user.id, ctx, text="Отправьте: <telegram_id> <days>", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
