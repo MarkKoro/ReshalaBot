@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import httpx
@@ -24,7 +25,6 @@ import db
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
 PROJECT_KEY = os.getenv("PROJECT_KEY", "reshalo_channel_access")
@@ -32,6 +32,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002468345259"))
 ENV_OFFER_URL = os.getenv("OFFER_URL", "").strip()
 YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
+SUPPORT = os.getenv("SUPPORT", "").strip()
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 ScreenKind = Literal["text", "video", "photo"]
@@ -54,6 +55,24 @@ TARIFFS: dict[str, Tariff] = {
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("reshalo_channel_bot")
+
+
+def parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS") or os.getenv("ADMINS") or ""
+    admin_ids: set[int] = set()
+    for part in re.split(r"[,\s]+", raw.strip()):
+        if not part:
+            continue
+        try:
+            admin_ids.add(int(part))
+        except ValueError:
+            logger.warning("invalid admin id skipped: %s", part)
+    if not admin_ids:
+        logger.warning("no admin ids configured; /admin will be unavailable")
+    return admin_ids
+
+
+ADMIN_IDS = parse_admin_ids()
 
 
 async def init_storage(app: Application) -> None:
@@ -173,8 +192,23 @@ def next_keyboard(callback_data: str, label: str = "Далее ➡️") -> Mk:
     return Mk([[Btn(label, callback_data=callback_data)]])
 
 
+def support_url() -> str | None:
+    if not SUPPORT:
+        return None
+    if SUPPORT.startswith("@"):
+        return f"https://t.me/{SUPPORT.lstrip('@')}"
+    if SUPPORT.startswith(("http://", "https://", "tg://")):
+        return SUPPORT
+    if SUPPORT.startswith("t.me/"):
+        return f"https://{SUPPORT}"
+    return SUPPORT
+
+
 def tariffs_keyboard(tariffs: list[Tariff]) -> Mk:
     rows = [[Btn(f"{tariff.title} — {tariff.amount_rub} ₽", callback_data=f"user:tariff:{tariff.code}")] for tariff in tariffs]
+    support = support_url()
+    if support:
+        rows.append([Btn("Поддержка", url=support)])
     rows.append([Btn("🔄 Обновить", callback_data="user:tariffs")])
     return Mk(rows)
 
@@ -416,15 +450,25 @@ async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str
     await send_access_link(chat_id, tg_user_id, payment_id, result["access_until"], ctx, already_finalized=result.get("already_finalized", False))
 
 
-async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
-    invite = await ctx.bot.create_chat_invite_link(chat_id=CHANNEL_ID, name=f"access_{tg_user_id}_{int(datetime.now().timestamp())}", member_limit=1)
-    logger.info("created invite link user_id=%s channel_id=%s", tg_user_id, CHANNEL_ID)
-    return invite.invite_link
+async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
+    expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    invite = await ctx.bot.create_chat_invite_link(
+        chat_id=CHANNEL_ID,
+        name=f"access_{tg_user_id}_{int(datetime.now().timestamp())}",
+        member_limit=1,
+        expire_date=expire_at,
+    )
+    logger.info("created invite link user_id=%s channel_id=%s expire_at=%s", tg_user_id, CHANNEL_ID, expire_at.isoformat())
+    return invite.invite_link, expire_at.isoformat()
 
 
 async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE, already_finalized: bool = False) -> None:
-    invite_link = await create_invite_link(tg_user_id, ctx)
-    await db.save_invite_link(tg_user_id, invite_link, payment_id=payment_id)
+    existing_invite = await db.get_invite_link_by_payment(payment_id) if payment_id else None
+    if existing_invite:
+        invite_link = existing_invite["invite_link"]
+    else:
+        invite_link, expire_at = await create_invite_link(tg_user_id, ctx)
+        await db.save_invite_link(tg_user_id, invite_link, payment_id=payment_id, expire_at=expire_at)
     prefix = "Платёж уже был обработан." if already_finalized else "✅ Оплата подтверждена."
     await render_screen(
         chat_id,
@@ -666,8 +710,8 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await db.clear_admin_state(user.id)
         sub = await db.grant_access(target_user_id, days)
         try:
-            invite_link = await create_invite_link(target_user_id, ctx)
-            await db.save_invite_link(target_user_id, invite_link)
+            invite_link, expire_at = await create_invite_link(target_user_id, ctx)
+            await db.save_invite_link(target_user_id, invite_link, expire_at=expire_at)
             await ctx.bot.send_message(target_user_id, f"✅ Администратор выдал доступ до {format_dt(sub['access_until'])}.\n{invite_link}")
         except TelegramError:
             logger.exception("failed to notify granted user_id=%s", target_user_id)
