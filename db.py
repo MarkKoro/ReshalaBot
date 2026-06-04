@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 DB_PATH = Path(os.getenv("DB_PATH", Path(__file__).with_name("credits.db")))
 _conn: aiosqlite.Connection | None = None
@@ -490,8 +493,19 @@ async def mark_subscription_expired(tg_user_id: int) -> None:
     await db.commit()
 
 
+async def get_invite_link_by_payment(payment_id: str) -> dict[str, Any] | None:
+    db = await connection()
+    async with db.execute(
+        "SELECT * FROM invite_links WHERE payment_id = ? ORDER BY id LIMIT 1",
+        (payment_id,),
+    ) as cur:
+        return row_to_dict(await cur.fetchone())
+
+
 async def save_invite_link(tg_user_id: int, invite_link: str, payment_id: str | None = None, expire_at: str | None = None) -> None:
     db = await connection()
+    if payment_id and await get_invite_link_by_payment(payment_id):
+        return
     await db.execute(
         "INSERT INTO invite_links(tg_user_id, invite_link, payment_id, expire_at, created_at) VALUES(?, ?, ?, ?, ?)",
         (tg_user_id, invite_link, payment_id, expire_at, iso_now()),
