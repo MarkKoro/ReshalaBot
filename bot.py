@@ -48,9 +48,9 @@ class Tariff:
 
 
 TARIFFS: dict[str, Tariff] = {
-    "m1_first": Tariff("m1_first", "1 месяц — первая покупка", 1000, 30, True),
-    "m1": Tariff("m1", "1 месяц", 1500, 30),
-    "m3": Tariff("m3", "3 месяца", 4000, 90),
+    "m1_first": Tariff("m1_first", "1 месяц — первая покупка", 399, 30, True),
+    "m1": Tariff("m1", "1 месяц", 500, 30),
+    "m3": Tariff("m3", "3 месяца", 1200, 90),
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
