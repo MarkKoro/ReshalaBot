@@ -75,13 +75,18 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def parse_admin_ids() -> set[int]:
-    raw = os.getenv("ADMIN_IDS") or os.getenv("ADMINS") or ""
+    # The first non-empty setting is authoritative; never merge extra legacy IDs.
+    raw = next((os.getenv(key, "").strip() for key in ("ADMIN_ID", "ADMIN_IDS", "ADMINS")
+                if os.getenv(key, "").strip()), "")
     admin_ids: set[int] = set()
     for part in re.split(r"[,\s]+", raw.strip()):
         if not part:
             continue
         try:
-            admin_ids.add(int(part))
+            admin_id = int(part)
+            if admin_id <= 0:
+                raise ValueError
+            admin_ids.add(admin_id)
         except ValueError:
             logger.warning("invalid admin id skipped: %s", part)
     if not admin_ids:
@@ -90,6 +95,17 @@ def parse_admin_ids() -> set[int]:
 
 
 ADMIN_IDS = parse_admin_ids()
+ADMIN_MENU_LABEL = "⚙️ Админ-меню"
+
+
+def with_admin_menu(tg_user_id: int, reply_markup: Mk | None = None) -> Mk | None:
+    """Expose navigation only to configured admins; callbacks still check permissions."""
+    if not is_admin(tg_user_id):
+        return reply_markup
+    rows = [list(row) for row in reply_markup.inline_keyboard] if reply_markup else []
+    if not any(button.callback_data == "admin:menu" for row in rows for button in row):
+        rows.append([Btn(ADMIN_MENU_LABEL, callback_data="admin:menu")])
+    return Mk(rows)
 
 
 async def init_storage(app: Application) -> None:
@@ -149,8 +165,11 @@ async def render_screen(
     reply_markup: Mk | None = None,
     kind: ScreenKind = "text",
     file_id: str | None = None,
+    include_admin_shortcut: bool = True,
 ) -> None:
     """Render one actual bot screen and keep its coordinates in users.current_* fields."""
+    if include_admin_shortcut:
+        reply_markup = with_admin_menu(tg_user_id, reply_markup)
     current = await db.get_current_message(tg_user_id) or {}
     old_chat_id = int(current.get("current_chat_id") or 0)
     old_message_id = int(current.get("current_message_id") or 0)
@@ -200,7 +219,7 @@ def offer_keyboard(offer_url: str | None) -> Mk:
         return next_keyboard("user:product", "🧠 Креативный мозг")
     return Mk([
         [Btn("📄 Открыть оферту", url=offer_url)],
-        [Btn("✅ Принимаю и перехожу к оплате", callback_data="user:accept_offer_and_pay")],
+        [Btn("✅ Принимаю, идём дальше", callback_data="user:accept_offer_and_pay")],
     ])
 
 
@@ -237,7 +256,7 @@ async def show_active_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DE
         return
     await render_screen(chat_id, tg_user_id, ctx,
                         text=texts.ACTIVE_ACCESS.format(date=format_dt(access_until)),
-                        reply_markup=next_keyboard("user:buy", "Продлить на 30 дней — 400 ₽"))
+                        reply_markup=next_keyboard("user:buy", "Продлить доступ →"))
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -308,7 +327,7 @@ async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tarif
     if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
         await start_offer_again(chat_id, tg_user_id, ctx)
         return
-    back = next_keyboard("user:buy", "Попробовать ещё раз — 400 ₽")
+    back = next_keyboard("user:buy", "Попробовать ещё раз →")
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         await render_screen(chat_id, tg_user_id, ctx, text="Оплата временно недоступна: YooKassa не настроена.", reply_markup=back)
         logger.error("payment creation blocked: empty YooKassa credentials")
@@ -372,7 +391,7 @@ async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str
     if payment["status"] != "succeeded":
         if payment["status"] == "canceled":
             await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж отменён. Можно создать новый счёт.",
-                                reply_markup=next_keyboard("user:buy", "Получить доступ — 400 ₽"))
+                                reply_markup=next_keyboard("user:buy", "Поехали →"))
         else:
             await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_PENDING,
                                 reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url"), retry=True))
@@ -437,16 +456,17 @@ async def send_existing_access(chat_id: int, tg_user_id: int, payment_id: str | 
         await send_access_link(chat_id, tg_user_id, payment_id, access_until, ctx, already_finalized=True)
         return
     await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж уже обработан. Текущий доступ закончился или был отозван.",
-                        reply_markup=next_keyboard("user:buy", "Вернуться — 400 ₽"))
+                        reply_markup=next_keyboard("user:buy", "Вернуться в канал →"))
 
 
 async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ctx.bot.send_message(tg_user_id, texts.RENEWAL_NOTICE.format(date=format_dt(access_until)),
-                               reply_markup=next_keyboard("user:buy", "Продлить за 400 ₽"))
+                               reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:buy", "Продолжить с нами →")))
 
 
 async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ctx.bot.send_message(tg_user_id, texts.EXPIRED, reply_markup=next_keyboard("user:buy", "Вернуться — 400 ₽"))
+    await ctx.bot.send_message(tg_user_id, texts.EXPIRED,
+                               reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:buy", "Вернуться в канал →")))
 
 
 async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -525,16 +545,22 @@ async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def show_admin_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, note: str = "") -> None:
+    if chat_id != tg_user_id or not is_admin(tg_user_id):
+        return
     await db.clear_admin_state(tg_user_id)
     text = "Админ-панель\n\nВыберите действие кнопками ниже."
     if note:
         text = f"{note}\n\n{text}"
-    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=admin_menu_keyboard())
+    # An admin shortcut can belong to an old lesson or a newer standalone notice.
+    # Open the menu at the bottom of the chat instead of editing an unrelated screen.
+    await db.clear_current_message(tg_user_id)
+    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=admin_menu_keyboard(),
+                        include_admin_shortcut=False)
 
 
 async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user_id, chat_id = query.from_user.id, query.message.chat_id
-    if not is_admin(tg_user_id):
+    if chat_id != tg_user_id or not is_admin(tg_user_id):
         return
     await remember_user(query.from_user)
     data = query.data or ""
@@ -567,6 +593,8 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if chat_id != tg_user_id or not is_admin(tg_user_id):
+        return
     s = await db.funnel_stats()
     events = s["events"]
     def count(event, field="users"):
@@ -600,13 +628,13 @@ async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TY
         page += line + "\n"
     pages.append(page)
     for page in pages[:-1]:
-        await ctx.bot.send_message(chat_id, page)
+        await ctx.bot.send_message(chat_id, page, reply_markup=with_admin_menu(tg_user_id))
     await render_screen(chat_id, tg_user_id, ctx, text=pages[-1], reply_markup=admin_cancel_keyboard())
 
 
 async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     user, chat, message = update.effective_user, update.effective_chat, update.effective_message
-    if not user or not chat or not message or not is_admin(user.id):
+    if not user or not chat or not message or chat.id != user.id or not is_admin(user.id):
         return False
     state = await db.get_admin_state(user.id)
     if not state:
@@ -666,7 +694,7 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     invite, expires = await create_invite_link(target, ctx)
                     await db.save_invite_link(target, invite, expire_at=expires)
                     await ctx.bot.send_message(target, f"✅ Администратор выдал доступ к «Креативному мозгу» до {format_dt(sub['access_until'])}. Ссылка действует 1 час. Начни с закреплённого сообщения и Урока 1.",
-                                               reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite)]]))
+                                               reply_markup=with_admin_menu(target, Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite)]])))
                 except TelegramError:
                     note += "\nНе удалось доставить ссылку. Проверьте права бота и доступность личного чата; срок уже записан."
                     logger.warning("admin grant delivery failed user_id=%s", target)
@@ -777,12 +805,13 @@ async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFA
                            welcome: bool = True, track: bool = True) -> None:
     url = await db.get_lead_magnet_url()
     if not valid_youtube_url(url):
-        await ctx.bot.send_message(chat_id, "Бесплатный урок пока не добавлен. Загляни чуть позже.",
-                                   reply_markup=next_keyboard("user:product", "🧠 Узнать про «Креативный мозг»"))
+        await ctx.bot.send_message(chat_id, "Урок скоро появится здесь. А пока можно заглянуть в «Креативный мозг» 🧠",
+                                   reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:product", "Что внутри? →")))
         return
     text = (texts.WELCOME if welcome else texts.LEAD_CAPTION + "\n\n👇 Сам урок:") + "\n" + url
-    label = "🧠 Узнать про «Креативный мозг»" if welcome else "🧠 Креативный мозг — 400 ₽ / месяц"
-    kwargs = {"chat_id": chat_id, "text": text, "reply_markup": next_keyboard("user:product", label)}
+    label = "🧠 Что внутри «Креативного мозга»?"
+    kwargs = {"chat_id": chat_id, "text": text,
+              "reply_markup": with_admin_menu(tg_user_id, next_keyboard("user:product", label))}
     if LinkPreviewOptions is not None:
         kwargs["link_preview_options"] = LinkPreviewOptions(
             url=url, is_disabled=False, prefer_large_media=True, show_above_text=True)
@@ -803,7 +832,7 @@ async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFA
 
 async def show_product(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await render_screen(chat_id, tg_user_id, ctx, text=texts.PRODUCT,
-                        reply_markup=next_keyboard("user:buy", "Получить доступ — 400 ₽"))
+                        reply_markup=next_keyboard("user:buy", "Поехали →"))
     await db.record_event(tg_user_id, "product_opened")
 
 
@@ -846,6 +875,8 @@ def admin_cancel_keyboard() -> Mk:
 
 
 async def show_admin_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if chat_id != tg_user_id or not is_admin(tg_user_id):
+        return
     url = await db.get_lead_magnet_url()
     rows = [[Btn("🔗 Установить / заменить ссылку", callback_data="admin:lead_set")],
             [Btn("👀 Проверить как пользователь", callback_data="admin:lead_test")]]
@@ -872,7 +903,7 @@ async def followup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             try:
                 await ctx.bot.send_message(tg_user_id, texts.FOLLOWUP,
-                                           reply_markup=next_keyboard("user:product", "Посмотреть «Креативный мозг»"))
+                                           reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:product", "Посмотреть «Креативный мозг»")))
                 await db.mark_followup_sent(tg_user_id)
             except TelegramError:
                 # An ambiguous timeout must not cause a second marketing message.
@@ -906,7 +937,8 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("handler failed error_type=%s", type(ctx.error).__name__)
     if isinstance(update, Update) and update.effective_chat and update.effective_chat.type == "private":
         try:
-            await ctx.bot.send_message(update.effective_chat.id, "Не удалось выполнить действие. Попробуй ещё раз чуть позже.")
+            await ctx.bot.send_message(update.effective_chat.id, "Не удалось выполнить действие. Попробуй ещё раз чуть позже.",
+                                       reply_markup=with_admin_menu(update.effective_chat.id))
         except TelegramError:
             pass
 
