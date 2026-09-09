@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -488,7 +489,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["events"]["start"]["users"], 1)
         self.assertEqual(stats["conversions"], {"start": 1, "product_opened": 1})
         self.assertEqual(stats["sources"], [{"source": "instagram_creative", "starts": 1, "paid": 1}])
-        await bot.show_stats(1, 1, self.ctx)
+        await bot.show_stats(99, 99, self.ctx)
         self.assertIn("100.0%", self.last()["text"])
         self.assertIn("400 ₽", self.last()["text"])
 
@@ -518,6 +519,92 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         update.effective_message.text = "https://example.com/new-offer"
         await bot.handle_admin_input(update, self.ctx)
         self.assertEqual(await db.get_offer_url(), update.effective_message.text)
+
+    async def test_non_admin_cannot_open_commands_callbacks_or_use_stale_admin_state(self):
+        for command in ("/admin", "/stats", "/grant", "/revoke", "/set_offer", "/set_lead_magnet"):
+            self.update.effective_message.text = command
+            await (bot.admin if command == "/admin" else bot.admin_shortcut)(self.update, self.ctx)
+        for route in ("admin:menu", "admin:stats", "admin:grant", "admin:revoke", "admin:offer",
+                      "admin:lead_magnet", "admin:lead_set", "admin:lead_clear", "admin:user_path"):
+            await self.press(route)
+        self.telegram.send_message.assert_not_awaited()
+        self.telegram.edit_message_text.assert_not_awaited()
+        self.assertEqual(await db.get_lead_magnet_url(), URL)
+        self.assertEqual(await db.get_offer_url(), OFFER)
+        self.assertIsNone(await db.get_admin_state(1))
+        await db.set_admin_state(1, "grant")
+        self.update.effective_message.text = "1 30"
+        self.assertFalse(await bot.handle_admin_input(self.update, self.ctx))
+        self.assertIsNone(await db.get_subscription(1))
+        self.telegram.ban_chat_member.assert_not_awaited()
+
+    async def test_admin_command_works_and_group_admin_input_is_blocked(self):
+        self.user.id = self.chat.id = 99
+        self.update.effective_message.text = "/admin"
+        await bot.admin(self.update, self.ctx)
+        self.assertEqual(len(self.buttons()), 6)
+        await db.set_admin_state(99, "grant")
+        self.chat.id = -100123
+        self.chat.type = "supergroup"
+        self.update.effective_message.text = "1 30"
+        self.assertFalse(await bot.handle_admin_input(self.update, self.ctx))
+        self.assertIsNone(await db.get_subscription(1))
+        before = self.telegram.send_message.await_count
+        await bot.show_admin_menu(self.chat.id, 99, self.ctx)
+        await bot.show_stats(self.chat.id, 99, self.ctx)
+        self.assertEqual(before, self.telegram.send_message.await_count)
+
+    async def test_admin_shortcut_on_every_user_screen_and_exit_from_input(self):
+        def assert_menu():
+            self.assertEqual(sum(b.callback_data == "admin:menu" for b in self.buttons()), 1)
+        with patch.object(bot, "ADMIN_IDS", {1}):
+            await bot.start(self.update, self.ctx)
+            assert_menu()
+            await self.press("user:product")
+            assert_menu()
+            await self.press("user:buy")
+            assert_menu()
+            self.http.post.return_value = self.response(self.payment())
+            await self.press("user:accept_offer_and_pay")
+            assert_menu()
+            self.http.get.return_value = self.response(self.payment(status="succeeded"))
+            await self.press("user:check_payment:p1")
+            assert_menu()
+            await bot.start(self.update, self.ctx)
+            assert_menu()
+            await bot.send_subscription_renewal_notice(1, (await db.get_subscription(1))["access_until"], self.ctx)
+            assert_menu()
+            await bot.send_subscription_expired_notice(1, self.ctx)
+            assert_menu()
+            await db.clear_lead_magnet_url()
+            await bot.send_lead_magnet(1, 1, self.ctx)
+            assert_menu()
+            await self.press("admin:lead_set")
+            self.assertEqual((await db.get_admin_state(1))["state"], "lead_magnet_url")
+            assert_menu()
+            await self.press("admin:menu")
+            self.assertIsNone(await db.get_admin_state(1))
+            self.assertEqual(len(self.buttons()), 6)
+
+    async def test_regular_user_gets_no_admin_button_and_price_only_at_checkout(self):
+        await bot.start(self.update, self.ctx)
+        await self.press("user:product")
+        self.assertLess(len(self.last()["text"]), 450)
+        self.assertEqual(self.buttons()[0].text, "Поехали →")
+        self.assertNotIn("400", self.last()["text"])
+        await self.press("user:buy")
+        self.assertNotIn("400", self.last()["text"])
+        self.assertFalse(any("400" in b.text for b in self.buttons()))
+        self.http.post.return_value = self.response(self.payment())
+        await self.press("user:accept_offer_and_pay")
+        self.assertNotIn("400", self.last()["text"])
+        self.assertEqual(sum("400" in b.text for b in self.buttons()), 1)
+        self.assertEqual(self.buttons()[0].text, "💳 Оплатить 400 ₽")
+        for message in self.messages.values():
+            markup = message.get("reply_markup")
+            if markup:
+                self.assertFalse(any((b.callback_data or "").startswith("admin:")
+                                     for row in markup.inline_keyboard for b in row))
 
     async def test_revoked_payment_cannot_restore_access(self):
         await self.store_payment(status="succeeded")
@@ -601,6 +688,20 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ApplicationTests(unittest.TestCase):
+    def test_admin_env_precedence_and_fail_closed(self):
+        cases = [
+            ({}, set()),
+            ({"ADMIN_ID": "99"}, {99}),
+            ({"ADMIN_ID": "99", "ADMIN_IDS": "1,2", "ADMINS": "3"}, {99}),
+            ({"ADMIN_ID": "", "ADMIN_IDS": "99,100"}, {99, 100}),
+            ({"ADMIN_ID": " ", "ADMIN_IDS": "", "ADMINS": "99"}, {99}),
+            ({"ADMIN_ID": "not-an-id", "ADMIN_IDS": "1"}, set()),
+            ({"ADMIN_ID": "0 -42"}, set()),
+        ]
+        for env, expected in cases:
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(bot.parse_admin_ids(), expected)
+
     def test_handlers_and_three_jobs_are_registered(self):
         with patch.object(bot, "BOT_TOKEN", "123456:TEST_ONLY_PLACEHOLDER"):
             app = bot.build_application()
