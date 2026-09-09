@@ -4,7 +4,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from contextlib import asynccontextmanager
+from decimal import Decimal
+from types import SimpleNamespace
+from urllib.parse import urlsplit, parse_qs
 import os
 import re
 import uuid
@@ -18,16 +24,24 @@ from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Mk
 from telegram import InputMediaPhoto, InputMediaVideo, Update, User
 from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 import db
+import texts
+
+try:
+    from telegram import LinkPreviewOptions
+except ImportError:  # PTB 20.0–20.7
+    LinkPreviewOptions = None
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
-PROJECT_KEY = os.getenv("PROJECT_KEY", "reshalo_channel_access")
+PROJECT_KEY = os.getenv("PROJECT_KEY", "creative_brain")
+OFFER_VERSION = os.getenv("OFFER_VERSION", "1")
+FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002468345259"))
 ENV_OFFER_URL = os.getenv("OFFER_URL", "").strip()
 YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "").strip()
@@ -35,7 +49,6 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 ScreenKind = Literal["text", "video", "photo"]
-MAX_REVIEW_PHOTOS = 8
 
 
 @dataclass(frozen=True)
@@ -44,17 +57,21 @@ class Tariff:
     title: str
     amount_rub: int
     days: int
-    first_purchase_only: bool = False
 
 
-TARIFFS: dict[str, Tariff] = {
-    "m1_first": Tariff("m1_first", "1 месяц — первая покупка", 399, 30, True),
-    "m1": Tariff("m1", "1 месяц", 500, 30),
-    "m3": Tariff("m3", "3 месяца", 1200, 90),
+CURRENT_TARIFF = Tariff("creative_30", "Креативный мозг — 30 дней", 400, 30)
+# Read-only compatibility for invoices already stored in SQLite; never exposed in the UI.
+PAYMENT_PLANS = {
+    CURRENT_TARIFF.code: CURRENT_TARIFF,
+    "m1_first": Tariff("m1_first", "Архивный доступ", 399, 30),
+    "m1": Tariff("m1", "Архивный доступ", 500, 30),
+    "m3": Tariff("m3", "Архивный доступ", 1200, 90),
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("reshalo_channel_bot")
+logger = logging.getLogger("creative_brain_bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def parse_admin_ids() -> set[int]:
@@ -123,31 +140,6 @@ async def delete_incoming(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_delete_message(ctx, update.effective_chat.id, update.effective_message.message_id)
 
 
-def markup_rows(markup: Mk | None) -> list[list[Btn]]:
-    if not markup:
-        return []
-    return [list(row) for row in markup.inline_keyboard]
-
-
-def has_callback(rows: list[list[Btn]], callback_data: str) -> bool:
-    return any(button.callback_data == callback_data for row in rows for button in row)
-
-
-async def with_admin_quick_actions(tg_user_id: int, reply_markup: Mk | None) -> Mk | None:
-    if tg_user_id not in ADMIN_IDS:
-        return reply_markup
-    rows = markup_rows(reply_markup)
-    quick_buttons: list[Btn] = []
-    if not has_callback(rows, "admin:review_add"):
-        quick_buttons.append(Btn("➕ Добавить фото", callback_data="admin:review_add"))
-    if not has_callback(rows, "admin:intro_set"):
-        video_label = "🎬 Заменить видео" if await db.get_intro_video_file_id() else "🎬 Добавить видео"
-        quick_buttons.append(Btn(video_label, callback_data="admin:intro_set"))
-    if quick_buttons:
-        rows.append(quick_buttons)
-    return Mk(rows)
-
-
 async def render_screen(
     chat_id: int,
     tg_user_id: int,
@@ -159,7 +151,6 @@ async def render_screen(
     file_id: str | None = None,
 ) -> None:
     """Render one actual bot screen and keep its coordinates in users.current_* fields."""
-    reply_markup = await with_admin_quick_actions(tg_user_id, reply_markup)
     current = await db.get_current_message(tg_user_id) or {}
     old_chat_id = int(current.get("current_chat_id") or 0)
     old_message_id = int(current.get("current_message_id") or 0)
@@ -205,38 +196,28 @@ async def render_screen(
 
 
 def offer_keyboard(offer_url: str | None) -> Mk:
-    rows: list[list[Btn]] = []
-    if offer_url:
-        rows.append([Btn("📄 Оферта", url=offer_url)])
-    else:
-        rows.append([Btn("📄 Оферта не задана", callback_data="noop_offer")])
-    rows.append([Btn("✅ Принимаю оферту", callback_data="user:accept_offer")])
-    return Mk(rows)
+    if not valid_http_url(offer_url):
+        return next_keyboard("user:product", "🧠 Креативный мозг")
+    return Mk([
+        [Btn("📄 Открыть оферту", url=offer_url)],
+        [Btn("✅ Принимаю и перехожу к оплате", callback_data="user:accept_offer_and_pay")],
+    ])
 
 
 def next_keyboard(callback_data: str, label: str = "Далее ➡️") -> Mk:
     return Mk([[Btn(label, callback_data=callback_data)]])
 
 
-def tariffs_keyboard(tariffs: list[Tariff]) -> Mk:
-    return Mk([[Btn(f"{tariff.title} — {tariff.amount_rub} ₽", callback_data=f"user:tariff:{tariff.code}")] for tariff in tariffs])
-
-
-def payment_keyboard(payment_id: str, confirmation_url: str) -> Mk:
-    return Mk(
-        [
-            [Btn("💳 Оплатить", url=confirmation_url)],
-            [Btn("🔁 Проверить оплату", callback_data=f"user:check_payment:{payment_id}")],
-            [Btn("◀️ К тарифам", callback_data="user:tariffs")],
-        ]
-    )
-
-
-async def available_tariffs(tg_user_id: int) -> list[Tariff]:
-    had_successful_payment = await db.has_successful_payment(tg_user_id)
-    if had_successful_payment:
-        return [TARIFFS["m1"], TARIFFS["m3"]]
-    return [TARIFFS["m1_first"], TARIFFS["m3"]]
+def payment_keyboard(payment_id: str, confirmation_url: str | None, retry: bool = False) -> Mk:
+    check = Btn("✅ Проверить ещё раз" if retry else "✅ Проверить оплату",
+                callback_data=f"user:check_payment:{payment_id}")
+    if retry:
+        rows = [[check]]
+        if confirmation_url:
+            rows.append([Btn("💳 Открыть оплату", url=confirmation_url)])
+    else:
+        rows = [[Btn("💳 Оплатить 400 ₽", url=confirmation_url)], [check]]
+    return Mk(rows)
 
 
 def active_subscription_until(sub: dict | None) -> str | None:
@@ -250,198 +231,38 @@ def active_subscription_until(sub: dict | None) -> str | None:
 
 
 async def show_active_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    sub = await db.get_subscription(tg_user_id)
-    access_until = active_subscription_until(sub)
+    access_until = active_subscription_until(await db.get_subscription(tg_user_id))
     if not access_until:
-        await show_welcome_intro(chat_id, tg_user_id, ctx)
+        await send_lead_magnet(chat_id, tg_user_id, ctx)
         return
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "✅ Доступ у тебя уже есть.\n\n"
-            f"Твой текущий доступ к закрытому каналу активен до {format_dt(access_until)}. "
-            "Можно спокойно продолжать обучение и возвращаться к материалам в канале.\n\n"
-            "Если хочешь продлить доступ заранее или купить ещё один период, нажми кнопку ниже — "
-            "мы просто добавим новый срок к твоему текущему доступу."
-        ),
-        reply_markup=next_keyboard("user:tariffs", "Продлить или купить ещё"),
-    )
+    await render_screen(chat_id, tg_user_id, ctx,
+                        text=texts.ACTIVE_ACCESS.format(date=format_dt(access_until)),
+                        reply_markup=next_keyboard("user:buy", "Продлить на 30 дней — 400 ₽"))
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat:
+    user, chat = update.effective_user, update.effective_chat
+    if not user or not chat or chat.type != "private":
         return
     await remember_user(user)
-    await delete_incoming(update, ctx)
-
-    if await db.has_accepted_offer(user.id):
-        if active_subscription_until(await db.get_subscription(user.id)):
-            await show_active_access(chat.id, user.id, ctx)
-            return
-        await show_welcome_intro(chat.id, user.id, ctx)
-        return
-
-    await render_screen(
-        chat.id,
-        user.id,
-        ctx,
-        text=(
-            "Приветствую тебя, любитель узнавать новое и познавать жизнь.\n\n"
-            "Перед оплатой нужно принять оферту — это откроет короткое превью, отзывы участников "
-            "и тарифы для входа в закрытый канал.\n\n"
-            "Нажми «📄 Оферта», ознакомься с условиями и затем подтверди согласие кнопкой ниже."
-        ),
-        reply_markup=offer_keyboard(await db.get_offer_url()),
-    )
-
-
-async def show_welcome_intro(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "Приветствую тебя, любитель узнавать новое и познавать жизнь.\n\n"
-            "Сейчас мы кратко покажем, что ждёт тебя внутри закрытого канала: "
-            "сначала небольшое видео-превью, затем отзывы людей, которые уже прошли через курс, "
-            "и после этого — тарифы для входа."
-        ),
-        reply_markup=next_keyboard("user:start_intro", "Смотреть превью"),
-    )
-
-
-async def show_intro_or_reviews_or_tariffs(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    intro_video_file_id = await db.get_intro_video_file_id()
-    if intro_video_file_id:
-        await render_screen(
-            chat_id,
-            tg_user_id,
-            ctx,
-            kind="video",
-            file_id=intro_video_file_id,
-            text=(
-                "Короткое превью закрытого канала.\n\n"
-                "Посмотри его, чтобы почувствовать атмосферу и понять, какие темы мы разбираем внутри."
-            ),
-            reply_markup=next_keyboard("user:after_intro"),
-        )
-        return
-    await show_reviews_intro(chat_id, tg_user_id, ctx)
-
-
-async def show_reviews_intro(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    reviews = await db.list_review_photos()
-    if not reviews:
-        await show_tariff_intro(chat_id, tg_user_id, ctx)
-        return
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "Теперь можешь кратко ознакомиться с отзывами клиентов, "
-            "которые уже прошли через курс и увидели результат на практике.\n\n"
-            "Мы покажем фото одной удобной пачкой, чтобы их было легко пролистать."
-        ),
-        reply_markup=next_keyboard("user:show_reviews", "Смотреть отзывы"),
-    )
-
-
-async def show_first_review_or_tariffs(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    reviews = (await db.list_review_photos())[:MAX_REVIEW_PHOTOS]
-    if not reviews:
-        await show_tariff_intro(chat_id, tg_user_id, ctx)
-        return
-    if len(reviews) == 1:
-        await ctx.bot.send_photo(
-            chat_id=chat_id,
-            photo=reviews[0]["file_id"],
-            caption="Отзывы участников (1/1)",
-        )
+    await db.clear_admin_state(user.id)
+    source = ctx.args[0] if ctx.args and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", ctx.args[0]) else "direct"
+    await db.record_start(user.id, source)
+    if active_subscription_until(await db.get_subscription(user.id)):
+        await show_active_access(chat.id, user.id, ctx)
     else:
-        media = [
-            InputMediaPhoto(
-                media=review["file_id"],
-                caption=f"Отзывы участников (1/{len(reviews)})" if index == 0 else None,
-            )
-            for index, review in enumerate(reviews)
-        ]
-        await ctx.bot.send_media_group(chat_id=chat_id, media=media)
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "Отлично. Если хочешь стать одним из нас, углубиться в сознание и выстроить "
-            "свои личные опоры, чтобы быстрее и увереннее принимать решения в жизни, "
-            "переходи к выбору тарифа.\n\n"
-            "Мы будем рады видеть тебя внутри."
-        ),
-        reply_markup=next_keyboard("user:tariffs", "Выбрать тариф"),
-    )
-
-
-async def show_tariff_intro(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "Если хочешь стать одним из нас, углубиться в сознание и выстроить свои личные опоры, "
-            "чтобы быстрее и увереннее принимать решения в жизни, выбирай подходящий тариф.\n\n"
-            "Мы ждём тебя внутри закрытого канала."
-        ),
-        reply_markup=next_keyboard("user:tariffs", "Выбрать тариф"),
-    )
-
-
-async def show_review(chat_id: int, tg_user_id: int, offset: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    reviews = await db.list_review_photos()
-    if not reviews or offset >= len(reviews):
-        await show_tariffs(chat_id, tg_user_id, ctx)
-        return
-    offset = max(0, offset)
-    callback = f"user:review:{offset + 1}" if offset < len(reviews) - 1 else "user:tariffs"
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        kind="photo",
-        file_id=reviews[offset]["file_id"],
-        text=f"Отзыв о закрытом канале ({offset + 1}/{len(reviews)})",
-        reply_markup=next_keyboard(callback),
-    )
-
-
-async def show_tariffs(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    sub = await db.get_subscription(tg_user_id)
-    access_until = active_subscription_until(sub)
-    if access_until:
-        text = (
-            f"Твой доступ уже активен до {format_dt(access_until)}.\n\n"
-            "Если хочешь продлить его заранее или купить ещё один период, выбери тариф ниже — "
-            "новый срок добавится к текущему доступу."
-        )
-    else:
-        text = (
-            "Выбери срок доступа к закрытому каналу. После оплаты бот выдаст одноразовую ссылку "
-            "для входа в канал."
-        )
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=text,
-        reply_markup=tariffs_keyboard(await available_tariffs(tg_user_id)),
-    )
+        await send_lead_magnet(chat.id, user.id, ctx)
 
 
 async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(chat_id, tg_user_id, ctx, text="Сначала нужно принять оферту, затем откроется оплата.", reply_markup=offer_keyboard(await db.get_offer_url()))
+    offer_url = await db.get_offer_url()
+    if not valid_http_url(offer_url):
+        await render_screen(chat_id, tg_user_id, ctx,
+                            text="Оферта пока не настроена. Оплата временно недоступна. Попробуй позже.",
+                            reply_markup=next_keyboard("user:product", "🧠 Креативный мозг"))
+        return
+    ctx.user_data["offered_terms"] = (offer_url, OFFER_VERSION)
+    await render_screen(chat_id, tg_user_id, ctx, text=texts.OFFER, reply_markup=offer_keyboard(offer_url))
 
 
 async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -449,149 +270,127 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = query.message.chat_id
     await remember_user(query.from_user)
     data = query.data or ""
-
-    if data == "user:accept_offer":
-        await db.accept_offer(tg_user_id)
+    if data in {"user:lead_magnet", "user:start_intro"}:
         if active_subscription_until(await db.get_subscription(tg_user_id)):
             await show_active_access(chat_id, tg_user_id, ctx)
-            return
-        await show_welcome_intro(chat_id, tg_user_id, ctx)
-        return
-    if data == "user:start_intro":
-        await show_intro_or_reviews_or_tariffs(chat_id, tg_user_id, ctx)
-        return
-    if data == "user:after_intro":
-        await show_reviews_intro(chat_id, tg_user_id, ctx)
-        return
-    if data == "user:show_reviews":
-        await show_first_review_or_tariffs(chat_id, tg_user_id, ctx)
-        return
-    if data.startswith("user:review:"):
-        await show_review(chat_id, tg_user_id, int(data.rsplit(":", 1)[1]), ctx)
-        return
-    if data == "user:tariffs":
-        if not await db.has_accepted_offer(tg_user_id):
+        else:
+            await send_lead_magnet(chat_id, tg_user_id, ctx, welcome=False)
+    elif (data in {"user:product", "user:after_intro", "user:show_reviews", "user:tariffs"}
+          or data.startswith(("user:review:", "user:tariff:"))):
+        # Historical tariff buttons never create a new legacy payment.
+        await show_product(chat_id, tg_user_id, ctx)
+    elif data == "user:buy":
+        await db.record_event(tg_user_id, "buy_clicked")
+        if active_subscription_until(await db.get_subscription(tg_user_id)):
+            await db.record_event(tg_user_id, "renewal_started")
+        await buy_access(chat_id, tg_user_id, ctx)
+    elif data == "user:accept_offer_and_pay":
+        terms = (await db.get_offer_url(), OFFER_VERSION)
+        if not valid_http_url(terms[0]) or ctx.user_data.get("offered_terms") != terms:
             await start_offer_again(chat_id, tg_user_id, ctx)
             return
-        await show_tariffs(chat_id, tg_user_id, ctx)
-        return
-    if data.startswith("user:tariff:"):
-        if not await db.has_accepted_offer(tg_user_id):
-            await start_offer_again(chat_id, tg_user_id, ctx)
-            return
-        tariff = TARIFFS.get(data.rsplit(":", 1)[1])
-        if not tariff:
-            await render_screen(chat_id, tg_user_id, ctx, text="Тариф не найден. Выберите тариф заново.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
-            return
-        if tariff not in await available_tariffs(tg_user_id):
-            await render_screen(
-                chat_id,
-                tg_user_id,
-                ctx,
-                text="Этот тариф сейчас недоступен для вашего аккаунта. Выберите актуальный тариф из списка.",
-                reply_markup=next_keyboard("user:tariffs", "К тарифам"),
-            )
-            return
-        await create_payment_and_render(chat_id, tg_user_id, tariff, ctx)
-        return
-    if data.startswith("user:check_payment:"):
+        if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
+            await db.accept_offer(tg_user_id, OFFER_VERSION)
+            await db.record_event(tg_user_id, "offer_accepted", {"version": OFFER_VERSION})
+        await create_payment_and_render(chat_id, tg_user_id, CURRENT_TARIFF, ctx)
+    elif data == "user:accept_offer":
+        # An old button did not disclose the new terms or authorize payment.
+        await start_offer_again(chat_id, tg_user_id, ctx)
+    elif data.startswith("user:check_payment:"):
         await check_payment_and_grant(chat_id, tg_user_id, data.split(":", 2)[2], ctx)
-        return
+    else:
+        await show_product(chat_id, tg_user_id, ctx)
 
 
 async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tariff, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if tariff != CURRENT_TARIFF:
+        raise ValueError("Only the current tariff may be purchased")
+    if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
+        await start_offer_again(chat_id, tg_user_id, ctx)
+        return
+    back = next_keyboard("user:buy", "Попробовать ещё раз — 400 ₽")
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
-        await render_screen(chat_id, tg_user_id, ctx, text="Оплата временно недоступна: YooKassa не настроена.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
+        await render_screen(chat_id, tg_user_id, ctx, text="Оплата временно недоступна: YooKassa не настроена.", reply_markup=back)
         logger.error("payment creation blocked: empty YooKassa credentials")
         return
-
+    pending = await db.get_latest_pending_payment(tg_user_id)
+    if (pending and pending["plan_id"] == CURRENT_TARIFF.code and pending.get("confirmation_url")
+            and parse_dt(pending["created_at"]) > datetime.now(timezone.utc) - timedelta(hours=24)):
+        await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_CREATED,
+                            reply_markup=payment_keyboard(pending["payment_id"], pending["confirmation_url"]))
+        return
     return_url = YOOKASSA_RETURN_URL or (f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/")
     metadata = {
-        "project_key": PROJECT_KEY,
-        "user_id": str(tg_user_id),
-        "kind": "channel_access",
-        "tariff_code": tariff.code,
-        "days": str(tariff.days),
+        "project_key": PROJECT_KEY, "user_id": str(tg_user_id), "kind": "channel_access",
+        "tariff_code": tariff.code, "days": str(tariff.days),
     }
     payload = {
         "amount": {"value": f"{tariff.amount_rub:.2f}", "currency": "RUB"},
         "capture": True,
         "confirmation": {"type": "redirect", "return_url": return_url},
-        "description": f"Доступ к закрытому каналу: {tariff.title}",
+        "description": "Доступ к «Креативному мозгу» на 30 дней",
         "metadata": metadata,
     }
-    logger.info("creating YooKassa payment user_id=%s tariff=%s amount=%s", tg_user_id, tariff.code, tariff.amount_rub)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                YOOKASSA_API_URL,
-                json=payload,
-                auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
-                headers={"Idempotence-Key": str(uuid.uuid4())},
-            )
+            response = await client.post(YOOKASSA_API_URL, json=payload,
+                                         auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+                                         headers={"Idempotence-Key": str(uuid.uuid4())})
             response.raise_for_status()
             payment = response.json()
-    except httpx.HTTPError:
-        logger.exception("failed to create YooKassa payment user_id=%s tariff=%s", tg_user_id, tariff.code)
-        await render_screen(chat_id, tg_user_id, ctx, text="Не получилось создать платёж. Попробуйте позже.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
+        payment_id = payment.get("id")
+        confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
+        if not payment_id or not valid_http_url(confirmation_url):
+            raise ValueError("Missing payment id or confirmation URL")
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
+        logger.error("payment creation failed user_id=%s error_type=%s", tg_user_id, type(exc).__name__)
+        await render_screen(chat_id, tg_user_id, ctx, text="Не получилось создать платёж. Попробуй позже.", reply_markup=back)
         return
-
-    payment_id = payment.get("id")
-    confirmation_url = payment.get("confirmation", {}).get("confirmation_url")
-    if not payment_id or not confirmation_url:
-        logger.error("YooKassa returned invalid payment response: %s", payment)
-        await render_screen(chat_id, tg_user_id, ctx, text="YooKassa не вернула ссылку на оплату. Попробуйте позже.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
-        return
-
     await db.create_payment(tg_user_id, payment_id, tariff.code, tariff.amount_rub, confirmation_url, metadata, payment)
-    logger.info("created YooKassa payment payment_id=%s user_id=%s", payment_id, tg_user_id)
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=f"Счёт создан: {tariff.title} за {tariff.amount_rub} ₽.\n\nНажмите «Оплатить», затем вернитесь в бот и нажмите «Проверить оплату».",
-        reply_markup=payment_keyboard(payment_id, confirmation_url),
-    )
+    await db.record_event(tg_user_id, "payment_created", {"payment_id": payment_id, "amount_rub": tariff.amount_rub},
+                          event_key=f"created:{payment_id}")
+    await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_CREATED,
+                        reply_markup=payment_keyboard(payment_id, confirmation_url))
 
 
 async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     payment_row = await db.get_payment(payment_id)
     if not payment_row or int(payment_row["tg_user_id"]) != tg_user_id:
-        await render_screen(chat_id, tg_user_id, ctx, text="Платёж не найден для вашего аккаунта. Создайте новый счёт.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
+        await render_screen(chat_id, tg_user_id, ctx, text="Платёж не найден для твоего аккаунта.",
+                            reply_markup=next_keyboard("user:product", "🧠 Креативный мозг"))
         return
     if payment_row.get("finalized_at"):
         await send_existing_access(chat_id, tg_user_id, payment_id, ctx)
         return
-
-    logger.info("checking YooKassa payment payment_id=%s user_id=%s", payment_id, tg_user_id)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{YOOKASSA_API_URL}/{payment_id}", auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY))
-            response.raise_for_status()
-            payment = response.json()
-    except httpx.HTTPError:
-        logger.exception("failed to check YooKassa payment payment_id=%s user_id=%s", payment_id, tg_user_id)
-        await render_screen(chat_id, tg_user_id, ctx, text="Не получилось проверить платёж. Попробуйте ещё раз через минуту.", reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url") or "https://t.me/"))
+        payment = await refresh_payment(payment_row)
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
+        logger.error("payment check failed payment_id=%s error_type=%s", payment_id, type(exc).__name__)
+        await render_screen(chat_id, tg_user_id, ctx, text="Не получилось проверить платёж. Попробуй ещё раз через минуту.",
+                            reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url"), retry=True))
         return
-
-    status = str(payment.get("status") or "")
-    paid = bool(payment.get("paid"))
-    await db.update_payment_status(payment_id, status, payment)
-    logger.info("YooKassa payment state payment_id=%s status=%s paid=%s", payment_id, status, paid)
-    if not (status == "succeeded" or paid):
-        await render_screen(chat_id, tg_user_id, ctx, text="Оплата пока не подтверждена. Если вы уже оплатили, попробуйте чуть позже.", reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url") or "https://t.me/"))
+    if payment["status"] != "succeeded":
+        if payment["status"] == "canceled":
+            await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж отменён. Можно создать новый счёт.",
+                                reply_markup=next_keyboard("user:buy", "Получить доступ — 400 ₽"))
+        else:
+            await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_PENDING,
+                                reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url"), retry=True))
         return
-
-    tariff = TARIFFS.get(payment_row["plan_id"])
+    tariff = PAYMENT_PLANS.get(payment_row["plan_id"])
     if not tariff:
-        await render_screen(chat_id, tg_user_id, ctx, text="Неизвестный тариф платежа. Напишите администратору.")
+        await render_screen(chat_id, tg_user_id, ctx, text="Неизвестный план платежа. Напиши администратору.")
         return
-    result = await db.finalize_payment_once(payment_id, tg_user_id, PROJECT_KEY, "channel_access", tariff.code, tariff.days)
+    # Compare to the immutable local binding, so pre-rebrand invoices still finalize.
+    metadata = json.loads(payment_row["metadata_json"])
+    result = await db.finalize_payment_once(payment_id, tg_user_id, metadata["project_key"],
+                                            "channel_access", tariff.code, tariff.days)
     if not result.get("ok"):
-        logger.error("payment finalize failed payment_id=%s result=%s", payment_id, result)
-        await render_screen(chat_id, tg_user_id, ctx, text="Платёж не прошёл внутреннюю проверку проекта. Напишите администратору.")
+        logger.error("payment finalize failed payment_id=%s error=%s", payment_id, result.get("error"))
+        await render_screen(chat_id, tg_user_id, ctx, text="Платёж не прошёл внутреннюю проверку. Напиши администратору.")
         return
-    await send_access_link(chat_id, tg_user_id, payment_id, result["access_until"], ctx, already_finalized=result.get("already_finalized", False))
+    await send_access_link(chat_id, tg_user_id, payment_id, result["access_until"], ctx,
+                           already_finalized=result.get("already_finalized", False))
 
 
 async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
@@ -606,97 +405,96 @@ async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) ->
     return invite.invite_link, expire_at.isoformat()
 
 
-async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE, already_finalized: bool = False) -> None:
-    existing_invite = await db.get_invite_link_by_payment(payment_id) if payment_id else None
-    if existing_invite:
-        invite_link = existing_invite["invite_link"]
-    else:
-        invite_link, expire_at = await create_invite_link(tg_user_id, ctx)
-        await db.save_invite_link(tg_user_id, invite_link, payment_id=payment_id, expire_at=expire_at)
-    prefix = "Платёж уже был обработан." if already_finalized else "✅ Оплата подтверждена."
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        text=(
-            f"{prefix} Доступ активен до {format_dt(access_until)}.\n\n"
-            "Вот твоя одноразовая ссылка для входа в канал:\n"
-            f"{invite_link}\n\n"
-            "Важно: ссылка рассчитана на одно вступление и действует 1 час. "
-            "После перехода Telegram больше не позволит использовать её повторно."
-        ),
-        reply_markup=next_keyboard("user:tariffs", "Продлить доступ"),
-    )
+async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None, access_until: str | None,
+                           ctx: ContextTypes.DEFAULT_TYPE, already_finalized: bool = False) -> None:
+    existing = await db.get_invite_link_by_payment(payment_id) if payment_id else None
+    try:
+        if existing and not existing["used"] and parse_dt(existing["expire_at"]) and parse_dt(existing["expire_at"]) > datetime.now(timezone.utc):
+            invite_link = existing["invite_link"]
+        else:
+            # Retire still-valid links before replacing one; never extend access here.
+            for row in await db.list_open_invites(tg_user_id):
+                await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, row["invite_link"])
+                await db.mark_invite_used(row["invite_link"])
+            await ctx.bot.unban_chat_member(CHANNEL_ID, tg_user_id, only_if_banned=True)
+            invite_link, expire_at = await create_invite_link(tg_user_id, ctx)
+            await db.save_invite_link(tg_user_id, invite_link, payment_id=payment_id, expire_at=expire_at)
+        await render_screen(chat_id, tg_user_id, ctx,
+                            text=texts.PAYMENT_SUCCEEDED.format(date=format_dt(access_until)),
+                            reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite_link)]]))
+        # Keep the entry button available in history even if /start is called before joining.
+        await db.clear_current_message(tg_user_id)
+    except TelegramError as exc:
+        logger.error("invite delivery failed user_id=%s channel_id=%s error_type=%s", tg_user_id, CHANNEL_ID, type(exc).__name__)
+        await render_screen(chat_id, tg_user_id, ctx,
+                            text=f"Оплата сохранена. Доступ активен до {format_dt(access_until)}. Не удалось выдать ссылку. Попробуй проверить оплату ещё раз или напиши администратору.",
+                            reply_markup=next_keyboard(f"user:check_payment:{payment_id}", "✅ Повторить выдачу ссылки") if payment_id else None)
 
 
 async def send_existing_access(chat_id: int, tg_user_id: int, payment_id: str | None, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    sub = await db.get_subscription(tg_user_id)
-    if sub and sub.get("status") == "active":
-        await send_access_link(chat_id, tg_user_id, payment_id, sub.get("access_until"), ctx, already_finalized=True)
+    access_until = active_subscription_until(await db.get_subscription(tg_user_id))
+    if access_until:
+        await send_access_link(chat_id, tg_user_id, payment_id, access_until, ctx, already_finalized=True)
         return
-    await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж уже обработан, но активный доступ не найден. Напишите администратору.", reply_markup=next_keyboard("user:tariffs", "К тарифам"))
+    await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж уже обработан. Текущий доступ закончился или был отозван.",
+                        reply_markup=next_keyboard("user:buy", "Вернуться — 400 ₽"))
 
 
 async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(
-        tg_user_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "⏳ До конца твоей подписки осталось 3 дня.\n\n"
-            f"Доступ к закрытому каналу активен до {format_dt(access_until)}. "
-            "Если хочешь остаться внутри без перерыва, можешь продлить доступ прямо сейчас — "
-            "новый срок добавится к текущей подписке.\n\n"
-            "Можно продлить сейчас или вернуться к этому позже."
-        ),
-        reply_markup=next_keyboard("user:tariffs", "Продлить сейчас"),
-    )
+    await ctx.bot.send_message(tg_user_id, texts.RENEWAL_NOTICE.format(date=format_dt(access_until)),
+                               reply_markup=next_keyboard("user:buy", "Продлить за 400 ₽"))
 
 
 async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(
-        tg_user_id,
-        tg_user_id,
-        ctx,
-        text=(
-            "🔒 Твоя подписка закончилась.\n\n"
-            "Доступ к закрытому каналу завершён, поэтому бот убрал тебя из канала. "
-            "Если хочешь вернуться к материалам и продолжить обучение, можешь продлить подписку прямо сейчас."
-        ),
-        reply_markup=next_keyboard("user:tariffs", "Купить ещё / продлить"),
-    )
+    await ctx.bot.send_message(tg_user_id, texts.EXPIRED, reply_markup=next_keyboard("user:buy", "Вернуться — 400 ₽"))
 
 
 async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for sub in await db.list_subscriptions_due_for_renewal_notice(now_iso(), days_before=3):
         tg_user_id = int(sub["tg_user_id"])
-        try:
-            await send_subscription_renewal_notice(tg_user_id, sub.get("access_until"), ctx)
-            await db.mark_renewal_notice_sent(tg_user_id)
-            logger.info("renewal notice sent user_id=%s access_until=%s", tg_user_id, sub["access_until"])
-        except TelegramError:
-            logger.exception("failed to send renewal notice user_id=%s access_until=%s", tg_user_id, sub.get("access_until"))
+        async with user_lock(tg_user_id):
+            current = await db.get_subscription(tg_user_id)
+            until = active_subscription_until(current)
+            if (not until or current["renewal_notice_sent_at"]
+                    or parse_dt(until) > datetime.now(timezone.utc) + timedelta(days=3)):
+                continue
+            try:
+                await send_subscription_renewal_notice(tg_user_id, until, ctx)
+                await db.mark_renewal_notice_sent(tg_user_id)
+            except TelegramError:
+                logger.warning("renewal notification failed user_id=%s", tg_user_id)
 
 
 async def expire_subscriptions_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for sub in await db.list_expired_subscriptions(now_iso()):
         tg_user_id = int(sub["tg_user_id"])
-        await remove_user_from_channel(ctx, tg_user_id, reason="expired")
-        try:
-            await send_subscription_expired_notice(tg_user_id, ctx)
-        except TelegramError:
-            logger.exception("failed to send expiration notice user_id=%s access_until=%s", tg_user_id, sub.get("access_until"))
-        await db.mark_subscription_expired(tg_user_id)
-        logger.info("expired subscription removed user_id=%s access_until=%s", tg_user_id, sub["access_until"])
+        async with user_lock(tg_user_id):
+            current = await db.get_subscription(tg_user_id)
+            if not current or current["status"] != "active" or active_subscription_until(current):
+                continue
+            if not await remove_user_from_channel(ctx, tg_user_id, reason="expired"):
+                continue  # Retry next job run if permissions or Telegram are unavailable.
+            await db.mark_subscription_expired(tg_user_id)
+            await db.record_event(tg_user_id, "expired", {"access_until": current["access_until"]},
+                                  event_key=f"expired:{tg_user_id}:{current['access_until']}")
+            try:
+                await send_subscription_expired_notice(tg_user_id, ctx)
+            except TelegramError:
+                logger.warning("expiration notification failed user_id=%s", tg_user_id)
 
 
-async def remove_user_from_channel(ctx: ContextTypes.DEFAULT_TYPE, tg_user_id: int, reason: str) -> None:
+async def remove_user_from_channel(ctx: ContextTypes.DEFAULT_TYPE, tg_user_id: int, reason: str) -> bool:
     try:
+        for row in await db.list_open_invites(tg_user_id):
+            await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, row["invite_link"])
+            await db.mark_invite_used(row["invite_link"])
         await ctx.bot.ban_chat_member(CHANNEL_ID, tg_user_id)
         await ctx.bot.unban_chat_member(CHANNEL_ID, tg_user_id, only_if_banned=True)
-        logger.info("removed user from channel user_id=%s channel_id=%s reason=%s", tg_user_id, CHANNEL_ID, reason)
-    except (BadRequest, Forbidden, TelegramError):
-        logger.exception("failed to remove user from channel user_id=%s reason=%s", tg_user_id, reason)
+        logger.info("removed user_id=%s channel_id=%s reason=%s", tg_user_id, CHANNEL_ID, reason)
+        return True
+    except TelegramError as exc:
+        logger.error("channel removal failed user_id=%s reason=%s error_type=%s", tg_user_id, reason, type(exc).__name__)
+        return False
 
 
 # ── Админ-панель ─────────────────────────────────────
@@ -706,40 +504,20 @@ def is_admin(tg_user_id: int) -> bool:
 
 
 def admin_menu_keyboard() -> Mk:
-    return Mk(
-        [
-            [Btn("📄 Оферта", callback_data="admin:offer"), Btn("🎬 Видео", callback_data="admin:intro")],
-            [Btn("🖼 Отзывы", callback_data="admin:reviews"), Btn("🎁 Выдать доступ", callback_data="admin:grant")],
-            [Btn("🚫 Отозвать доступ", callback_data="admin:revoke"), Btn("📊 Статистика", callback_data="admin:stats")],
-            [Btn("👤 Пользовательский экран", callback_data="admin:user_start")],
-        ]
-    )
-
-
-def admin_intro_keyboard(has_video: bool) -> Mk:
-    rows = [[Btn("➕ Загрузить/заменить видео", callback_data="admin:intro_set")]]
-    if has_video:
-        rows.append([Btn("🗑 Удалить видео", callback_data="admin:intro_clear")])
-    rows.append([Btn("◀️ В админ-панель", callback_data="admin:menu")])
-    return Mk(rows)
-
-
-def admin_reviews_keyboard(has_reviews: bool, count: int = 0) -> Mk:
-    rows: list[list[Btn]] = []
-    if count < MAX_REVIEW_PHOTOS:
-        rows.append([Btn("➕ Добавить фото", callback_data="admin:review_add")])
-    if has_reviews:
-        rows.append([Btn("👀 Показать фото", callback_data="admin:review_show:0")])
-        rows.append([Btn("🗑 Удалить выбранное фото", callback_data="admin:review_delete_menu")])
-    rows.append([Btn("◀️ В админ-панель", callback_data="admin:menu")])
-    return Mk(rows)
+    return Mk([
+        [Btn("🎬 Лид-магнит", callback_data="admin:lead_magnet")],
+        [Btn("📄 Оферта", callback_data="admin:offer")],
+        [Btn("🎁 Выдать доступ", callback_data="admin:grant")],
+        [Btn("🚫 Отозвать доступ", callback_data="admin:revoke")],
+        [Btn("📊 Воронка / статистика", callback_data="admin:stats")],
+        [Btn("👤 Посмотреть путь пользователя", callback_data="admin:user_path")],
+    ])
 
 
 async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
-    if not user or not chat or not is_admin(user.id):
-        await delete_incoming(update, ctx)
+    if not user or not chat or chat.type != "private" or not is_admin(user.id):
         return
     await remember_user(user)
     await delete_incoming(update, ctx)
@@ -755,336 +533,382 @@ async def show_admin_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAU
 
 
 async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    tg_user_id = query.from_user.id
-    chat_id = query.message.chat_id
+    tg_user_id, chat_id = query.from_user.id, query.message.chat_id
     if not is_admin(tg_user_id):
         return
     await remember_user(query.from_user)
     data = query.data or ""
-    if data == "admin:menu":
-        await show_admin_menu(chat_id, tg_user_id, ctx)
-        return
-    if data == "admin:user_start":
-        await db.clear_admin_state(tg_user_id)
-        await start_offer_again(chat_id, tg_user_id, ctx)
-        return
+    await db.clear_admin_state(tg_user_id)
     if data == "admin:offer":
         await db.set_admin_state(tg_user_id, "offer_url")
-        await render_screen(chat_id, tg_user_id, ctx, text=f"Текущая оферта:\n{await db.get_offer_url() or 'не задана'}\n\nОтправьте новой строкой ссылку на оферту.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-        return
-    if data == "admin:intro":
-        await db.clear_admin_state(tg_user_id)
-        await render_screen(chat_id, tg_user_id, ctx, text="Управление превью-видео.", reply_markup=admin_intro_keyboard(bool(await db.get_intro_video_file_id())))
-        return
-    if data == "admin:intro_set":
-        await db.set_admin_state(tg_user_id, "intro_video")
-        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте следующим сообщением видео-файл для превью. Старое видео будет заменено.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:intro")]]))
-        return
-    if data == "admin:intro_clear":
-        await db.clear_intro_video_file_id()
-        await render_screen(chat_id, tg_user_id, ctx, text="✅ Превью-видео удалено.", reply_markup=admin_intro_keyboard(False))
-        return
-    if data == "admin:reviews":
-        await db.clear_admin_state(tg_user_id)
-        await show_admin_reviews_menu(chat_id, tg_user_id, ctx)
-        return
-    if data == "admin:review_add":
-        count = await db.count_review_photos()
-        if count >= MAX_REVIEW_PHOTOS:
-            await show_admin_reviews_menu(chat_id, tg_user_id, ctx, f"⚠️ Уже добавлено максимум фото: {MAX_REVIEW_PHOTOS}.")
-            return
-        await db.set_admin_state(tg_user_id, "review_photo")
-        await render_screen(
-            chat_id,
-            tg_user_id,
-            ctx,
-            text=(
-                f"Отправьте фото. Можно прислать несколько фото подряд, максимум — {MAX_REVIEW_PHOTOS}.\n"
-                f"Сейчас добавлено: {count}/{MAX_REVIEW_PHOTOS}."
-            ),
-            reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
-        )
-        return
-    if data == "admin:reviews_clear":
-        await db.clear_review_photos()
-        await render_screen(chat_id, tg_user_id, ctx, text="✅ Все отзывы удалены.", reply_markup=admin_reviews_keyboard(False, 0))
-        return
-    if data.startswith("admin:review_show:"):
-        await show_admin_review(chat_id, tg_user_id, int(data.rsplit(":", 1)[1]), ctx)
-        return
-    if data == "admin:review_delete_menu":
-        await show_review_delete_menu(chat_id, tg_user_id, ctx)
-        return
-    if data.startswith("admin:review_delete:"):
-        photo_id = int(data.rsplit(":", 1)[1])
-        await db.delete_review_photo(photo_id)
-        await show_review_delete_menu(chat_id, tg_user_id, ctx, "✅ Фото удалено.")
-        return
-    if data == "admin:grant":
-        await db.set_admin_state(tg_user_id, "grant")
-        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте: <telegram_id> <days>\nНапример: 123456789 30", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-        return
-    if data == "admin:revoke":
-        await db.set_admin_state(tg_user_id, "revoke")
-        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте telegram_id пользователя, у которого нужно отозвать доступ.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-        return
-    if data == "admin:stats":
-        await db.clear_admin_state(tg_user_id)
+        await render_screen(chat_id, tg_user_id, ctx,
+                            text=f"Текущая оферта:\n{await db.get_offer_url() or 'не задана'}\n\nОтправьте ссылку на оферту.",
+                            reply_markup=admin_cancel_keyboard())
+    elif data in {"admin:lead_magnet", "admin:intro"}:
+        await show_admin_lead_magnet(chat_id, tg_user_id, ctx)
+    elif data in {"admin:lead_set", "admin:intro_set"}:
+        await db.set_admin_state(tg_user_id, "lead_magnet_url")
+        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте YouTube URL урока: https://youtube.com/watch?v=… или https://youtu.be/…",
+                            reply_markup=admin_cancel_keyboard())
+    elif data in {"admin:lead_clear", "admin:intro_clear"}:
+        await db.clear_lead_magnet_url()
+        await show_admin_lead_magnet(chat_id, tg_user_id, ctx)
+    elif data in {"admin:lead_test", "admin:user_start"}:
+        await send_lead_magnet(chat_id, tg_user_id, ctx, track=False)
+    elif data in {"admin:grant", "admin:revoke", "admin:user_path"}:
+        state = data.split(":")[1]
+        await db.set_admin_state(tg_user_id, state)
+        prompt = "Отправьте: <telegram_id> <days>\nНапример: 123456789 30" if state == "grant" else "Отправьте telegram_id пользователя."
+        await render_screen(chat_id, tg_user_id, ctx, text=prompt, reply_markup=admin_cancel_keyboard())
+    elif data == "admin:stats":
         await show_stats(chat_id, tg_user_id, ctx)
-        return
-
-
-
-async def show_admin_reviews_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, note: str = "") -> None:
-    reviews = await db.list_review_photos()
-    text = (
-        f"{note}\n\n" if note else ""
-    ) + (
-        "Управление фото-отзывами.\n"
-        f"Добавлено: {len(reviews)}/{MAX_REVIEW_PHOTOS}.\n\n"
-        "Пользователю фото отправляются одной пачкой перед выбором тарифа."
-    )
-    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=admin_reviews_keyboard(bool(reviews), len(reviews)))
-
-
-async def show_review_delete_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, note: str = "") -> None:
-    reviews = await db.list_review_photos()
-    if not reviews:
-        await render_screen(chat_id, tg_user_id, ctx, text="Фото не добавлены.", reply_markup=admin_reviews_keyboard(False, 0))
-        return
-    lines = [f"{index}. Фото ID {row['id']} — добавлено {format_dt(row['created_at'])}" for index, row in enumerate(reviews, start=1)]
-    text = (f"{note}\n\n" if note else "") + "Выберите, какое фото удалить:\n\n" + "\n".join(lines)
-    rows = [[Btn(f"🗑 Фото {index}", callback_data=f"admin:review_delete:{row['id']}")] for index, row in enumerate(reviews, start=1)]
-    rows.append([Btn("◀️ К фото", callback_data="admin:reviews")])
-    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=Mk(rows))
-
-
-async def show_admin_review(chat_id: int, tg_user_id: int, offset: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    reviews = await db.list_review_photos()
-    if not reviews:
-        await render_screen(chat_id, tg_user_id, ctx, text="Фото не добавлены.", reply_markup=admin_reviews_keyboard(False, 0))
-        return
-    offset = max(0, min(offset, len(reviews) - 1))
-    rows: list[list[Btn]] = []
-    nav: list[Btn] = []
-    if offset > 0:
-        nav.append(Btn("⬅️", callback_data=f"admin:review_show:{offset - 1}"))
-    if offset < len(reviews) - 1:
-        nav.append(Btn("➡️", callback_data=f"admin:review_show:{offset + 1}"))
-    if nav:
-        rows.append(nav)
-    row = reviews[offset]
-    rows.append([Btn(f"🗑 Удалить фото {offset + 1}", callback_data=f"admin:review_delete:{row['id']}")])
-    rows.append([Btn("◀️ К фото", callback_data="admin:reviews")])
-    await render_screen(
-        chat_id,
-        tg_user_id,
-        ctx,
-        kind="photo",
-        file_id=row["file_id"],
-        text=f"Фото {offset + 1}/{len(reviews)}\nID: {row['id']}\nДобавлено: {format_dt(row['created_at'])}",
-        reply_markup=Mk(rows),
-    )
+    else:
+        await show_admin_menu(chat_id, tg_user_id, ctx)
 
 
 async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    s = await db.stats()
-    text = (
-        "📊 Статистика\n\n"
-        f"Пользователей: {s['users_count']}\n"
-        f"Приняли оферту: {s['accepted_offer_count']}\n"
-        f"Успешных оплат: {s['paid_count']}\n"
-        f"Выручка: {s['revenue_rub']} ₽\n"
-        f"Активных подписок: {s['active_subscriptions_count']}"
-    )
-    await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=Mk([[Btn("◀️ В админ-панель", callback_data="admin:menu")]]))
+    s = await db.funnel_stats()
+    events = s["events"]
+    def count(event, field="users"):
+        return events.get(event, {}).get(field, 0)
+    def conversion(event):
+        denominator = count(event)
+        return f"{100 * s['conversions'][event] / denominator:.1f}%" if denominator else "0.0%"
+    lines = [
+        "📊 Воронка «Креативный мозг»",
+        f"Всего Start: {count('start', 'total')} (людей: {count('start')})",
+        f"Получили лид-магнит: {count('lead_magnet_sent')}",
+        f"Открыли оффер: {count('product_opened')}",
+        f"Создали платёж: {count('payment_created')} чел. / {count('payment_created', 'total')} счетов",
+        f"Успешные оплаты: {s['paid_count']} (в новой воронке: {count('payment_succeeded', 'total')})",
+        f"Start → Payment: {conversion('start')}",
+        f"Product open → Payment: {conversion('product_opened')}",
+        f"Активных подписок: {s['active_subscriptions_count']}",
+        f"Общая выручка: {s['revenue_rub']} ₽",
+        f"Всего пользователей: {s['users_count']}",
+        f"Приняли оферту (включая историю): {s['accepted_offer_count']}",
+        "",
+        "Source: Start / Paid (уникальные люди, первый источник)",
+    ]
+    lines.extend(f"{row['source']}: {row['starts']} / {row['paid']}" for row in s["sources"])
+    # Paginate long source lists without exceeding Telegram's 4096-character limit.
+    pages, page = [], ""
+    for line in lines:
+        if len(page) + len(line) + 1 > 3500:
+            pages.append(page)
+            page = ""
+        page += line + "\n"
+    pages.append(page)
+    for page in pages[:-1]:
+        await ctx.bot.send_message(chat_id, page)
+    await render_screen(chat_id, tg_user_id, ctx, text=pages[-1], reply_markup=admin_cancel_keyboard())
 
 
 async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    chat = update.effective_chat
-    message = update.effective_message
+    user, chat, message = update.effective_user, update.effective_chat, update.effective_message
     if not user or not chat or not message or not is_admin(user.id):
         return False
     state = await db.get_admin_state(user.id)
     if not state:
         return False
-    state_name = state["state"]
     await remember_user(user)
-
-    if state_name == "offer_url":
-        if not message.text:
-            await delete_incoming(update, ctx)
-            await render_screen(chat.id, user.id, ctx, text="Нужно отправить ссылку текстом.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
+    name, raw = state["state"], (message.text or "").strip()
+    if name in {"lead_magnet_url", "intro_video", "offer_url"}:
+        valid = valid_http_url(raw) if name == "offer_url" else valid_youtube_url(raw)
+        if not valid:
+            await render_screen(chat.id, user.id, ctx,
+                                text="Нужна корректная http/https ссылка." if name == "offer_url" else "Нужна ссылка на видео YouTube (youtube.com или youtu.be).",
+                                reply_markup=admin_cancel_keyboard())
             return True
-        url = message.text.strip()
-        await db.set_offer_url(url)
+        if name == "offer_url":
+            await db.set_offer_url(raw)
+        else:
+            await db.set_lead_magnet_url(raw)
         await db.clear_admin_state(user.id)
         await delete_incoming(update, ctx)
-        await show_admin_menu(chat.id, user.id, ctx, f"✅ Оферта обновлена:\n{url}")
+        if name == "offer_url":
+            await show_admin_menu(chat.id, user.id, ctx, "✅ Оферта обновлена.")
+        else:
+            await show_admin_lead_magnet(chat.id, user.id, ctx)
         return True
-
-    if state_name == "intro_video":
-        if not message.video:
-            await delete_incoming(update, ctx)
-            await render_screen(chat.id, user.id, ctx, text="Нужно отправить именно видео-файл.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:intro")]]))
+    if name == "user_path":
+        if not raw.isdigit() or int(raw) <= 0:
+            await render_screen(chat.id, user.id, ctx, text="telegram_id должен быть положительным числом.", reply_markup=admin_cancel_keyboard())
             return True
-        await db.set_intro_video_file_id(message.video.file_id)
+        rows = await db.get_user_path(int(raw))
+        lines = [f"Путь пользователя {raw} — последние 25 событий"]
+        lines += [f"{format_dt(row['created_at'])} · {row['event_name']} · {row['source']}" for row in rows]
+        if not rows:
+            lines.append("Событий пока нет.")
         await db.clear_admin_state(user.id)
-        await delete_incoming(update, ctx)
-        await render_screen(chat.id, user.id, ctx, text="✅ Превью-видео сохранено.", reply_markup=admin_intro_keyboard(True))
+        await render_screen(chat.id, user.id, ctx, text="\n".join(lines), reply_markup=admin_cancel_keyboard())
         return True
-
-    if state_name == "review_photo":
-        count = await db.count_review_photos()
-        if count >= MAX_REVIEW_PHOTOS:
-            await db.clear_admin_state(user.id)
-            await delete_incoming(update, ctx)
-            await show_admin_reviews_menu(chat.id, user.id, ctx, f"⚠️ Уже добавлено максимум фото: {MAX_REVIEW_PHOTOS}.")
-            return True
-        if not message.photo:
-            await delete_incoming(update, ctx)
-            await render_screen(
-                chat.id,
-                user.id,
-                ctx,
-                text="Нужно отправить именно фото. Видео добавляется отдельной кнопкой «Заменить видео».",
-                reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
-            )
-            return True
-        await db.add_review_photo(message.photo[-1].file_id)
-        count += 1
-        await delete_incoming(update, ctx)
-        if count >= MAX_REVIEW_PHOTOS:
-            await db.clear_admin_state(user.id)
-            await show_admin_reviews_menu(chat.id, user.id, ctx, f"✅ Фото добавлено. Достигнут лимит {MAX_REVIEW_PHOTOS}/{MAX_REVIEW_PHOTOS}.")
-            return True
-        await render_screen(
-            chat.id,
-            user.id,
-            ctx,
-            text=(
-                f"✅ Фото добавлено: {count}/{MAX_REVIEW_PHOTOS}.\n"
-                "Можно отправить ещё фото или нажать «Готово»."
-            ),
-            reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
-        )
-        return True
-
-    if state_name == "grant":
-        raw = (message.text or "").split()
-        await delete_incoming(update, ctx)
-        if len(raw) != 2:
-            await render_screen(chat.id, user.id, ctx, text="Нужно отправить два числа: <telegram_id> <days>.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-            return True
+    if name in {"grant", "revoke"}:
+        parts = raw.split()
         try:
-            target_user_id = int(raw[0])
-            days = int(raw[1])
+            if len(parts) != (2 if name == "grant" else 1):
+                raise ValueError
+            target = int(parts[0])
+            days = int(parts[1]) if name == "grant" else 0
+            if target <= 0 or (name == "grant" and not 1 <= days <= 36500):
+                raise ValueError
         except ValueError:
-            await render_screen(chat.id, user.id, ctx, text="telegram_id и days должны быть числами.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
+            await render_screen(chat.id, user.id, ctx,
+                                text="Нужны положительный telegram_id и срок 1–36500 дней." if name == "grant" else "Нужен положительный telegram_id.",
+                                reply_markup=admin_cancel_keyboard())
             return True
+        async with user_lock(target):
+            if name == "grant":
+                sub = await db.grant_access(target, days)
+                note = f"✅ Доступ для {target} активен до {format_dt(sub['access_until'])}."
+                try:
+                    await ctx.bot.unban_chat_member(CHANNEL_ID, target, only_if_banned=True)
+                    invite, expires = await create_invite_link(target, ctx)
+                    await db.save_invite_link(target, invite, expire_at=expires)
+                    await ctx.bot.send_message(target, f"✅ Администратор выдал доступ к «Креативному мозгу» до {format_dt(sub['access_until'])}. Ссылка действует 1 час. Начни с закреплённого сообщения и Урока 1.",
+                                               reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite)]]))
+                except TelegramError:
+                    note += "\nНе удалось доставить ссылку. Проверьте права бота и доступность личного чата; срок уже записан."
+                    logger.warning("admin grant delivery failed user_id=%s", target)
+            else:
+                if not await remove_user_from_channel(ctx, target, reason="revoke"):
+                    await render_screen(chat.id, user.id, ctx, text="Не удалось удалить пользователя из канала. Проверьте права бота и повторите telegram_id.", reply_markup=admin_cancel_keyboard())
+                    return True
+                await db.revoke_access(target)
+                note = f"✅ Доступ для {target} отозван."
         await db.clear_admin_state(user.id)
-        sub = await db.grant_access(target_user_id, days)
-        try:
-            invite_link, expire_at = await create_invite_link(target_user_id, ctx)
-            await db.save_invite_link(target_user_id, invite_link, expire_at=expire_at)
-            await ctx.bot.send_message(target_user_id, f"✅ Администратор выдал доступ до {format_dt(sub['access_until'])}.\n{invite_link}")
-        except TelegramError:
-            logger.exception("failed to notify granted user_id=%s", target_user_id)
-        await show_admin_menu(chat.id, user.id, ctx, f"✅ Доступ для {target_user_id} активен до {format_dt(sub['access_until'])}.")
-        return True
-
-    if state_name == "revoke":
         await delete_incoming(update, ctx)
-        try:
-            target_user_id = int((message.text or "").strip())
-        except ValueError:
-            await render_screen(chat.id, user.id, ctx, text="telegram_id должен быть числом.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-            return True
-        await db.clear_admin_state(user.id)
-        await db.revoke_access(target_user_id)
-        await remove_user_from_channel(ctx, target_user_id, reason="revoke")
-        await show_admin_menu(chat.id, user.id, ctx, f"✅ Доступ для {target_user_id} отозван.")
+        await show_admin_menu(chat.id, user.id, ctx, note)
         return True
-
-    return False
+    await db.clear_admin_state(user.id)
+    await show_admin_menu(chat.id, user.id, ctx, "Это действие больше не используется.")
+    return True
 
 
 async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    if data == "noop_offer":
-        await render_screen(query.message.chat_id, query.from_user.id, ctx, text="Оферта пока не задана. Попробуйте позже.")
+    if not query or not query.message or query.message.chat.type != "private":
         return
-    if data.startswith("admin:"):
+    try:
+        await query.answer()
+    except TelegramError:
+        logger.debug("callback answer unavailable")
+    if (query.data or "").startswith("admin:"):
         await admin_router(query, ctx)
-        return
-    if data.startswith("user:"):
-        await user_router(query, ctx)
+    else:
+        async with user_lock(query.from_user.id):
+            await user_router(query, ctx)
 
 
 async def fallback_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user, chat = update.effective_user, update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return
     if await handle_admin_input(update, ctx):
         return
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat:
-        return
     await remember_user(user)
-    await delete_incoming(update, ctx)
-    await start_offer_again(chat.id, user.id, ctx)
+    if active_subscription_until(await db.get_subscription(user.id)):
+        await show_active_access(chat.id, user.id, ctx)
+    else:
+        await render_screen(chat.id, user.id, ctx, text=texts.FALLBACK, reply_markup=Mk([
+            [Btn("▶️ Бесплатный урок", callback_data="user:lead_magnet")],
+            [Btn("🧠 Креативный мозг", callback_data="user:product")],
+        ]))
 
 
 async def admin_shortcut(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat or not is_admin(user.id):
-        await delete_incoming(update, ctx)
+    user, chat = update.effective_user, update.effective_chat
+    if not user or not chat or chat.type != "private" or not is_admin(user.id):
         return
     await remember_user(user)
-    await delete_incoming(update, ctx)
-    command = (update.effective_message.text or "").split()[0]
-    if command == "/set_offer":
-        await db.set_admin_state(user.id, "offer_url")
-        await render_screen(chat.id, user.id, ctx, text="Отправьте новой строкой ссылку на оферту.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-    elif command == "/set_intro_video":
-        await db.set_admin_state(user.id, "intro_video")
-        await render_screen(chat.id, user.id, ctx, text="Отправьте следующим сообщением видео-файл для превью.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:intro")]]))
-    elif command == "/clear_intro_video":
-        await db.clear_intro_video_file_id()
-        await render_screen(chat.id, user.id, ctx, text="✅ Превью-видео удалено.", reply_markup=admin_intro_keyboard(False))
-    elif command == "/add_review":
-        count = await db.count_review_photos()
-        if count >= MAX_REVIEW_PHOTOS:
-            await show_admin_reviews_menu(chat.id, user.id, ctx, f"⚠️ Уже добавлено максимум фото: {MAX_REVIEW_PHOTOS}.")
-            return
-        await db.set_admin_state(user.id, "review_photo")
-        await render_screen(
-            chat.id,
-            user.id,
-            ctx,
-            text=(
-                f"Отправьте фото. Можно прислать несколько фото подряд, максимум — {MAX_REVIEW_PHOTOS}.\n"
-                f"Сейчас добавлено: {count}/{MAX_REVIEW_PHOTOS}."
-            ),
-            reply_markup=Mk([[Btn("◀️ Готово", callback_data="admin:reviews")]]),
-        )
-    elif command == "/reviews":
-        await show_admin_reviews_menu(chat.id, user.id, ctx)
-    elif command == "/clear_reviews":
-        await db.clear_review_photos()
-        await render_screen(chat.id, user.id, ctx, text="✅ Все отзывы удалены.", reply_markup=admin_reviews_keyboard(False, 0))
-    elif command == "/grant":
-        await db.set_admin_state(user.id, "grant")
-        await render_screen(chat.id, user.id, ctx, text="Отправьте: <telegram_id> <days>", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-    elif command == "/revoke":
-        await db.set_admin_state(user.id, "revoke")
-        await render_screen(chat.id, user.id, ctx, text="Отправьте telegram_id пользователя.", reply_markup=Mk([[Btn("◀️ Отмена", callback_data="admin:menu")]]))
-    elif command == "/stats":
-        await show_stats(chat.id, user.id, ctx)
+    command = (update.effective_message.text or "").split()[0].split("@")[0]
+    routes = {
+        "/set_offer": "admin:offer", "/set_lead_magnet": "admin:lead_set",
+        "/set_intro_video": "admin:lead_set", "/clear_lead_magnet": "admin:lead_clear",
+        "/clear_intro_video": "admin:lead_clear", "/grant": "admin:grant",
+        "/revoke": "admin:revoke", "/stats": "admin:stats", "/user_path": "admin:user_path",
+    }
+    query = SimpleNamespace(from_user=user, message=SimpleNamespace(chat_id=chat.id),
+                            data=routes.get(command, "admin:menu"))
+    await admin_router(query, ctx)
+
+
+_user_locks: dict[int, asyncio.Lock] = {}
+
+
+@asynccontextmanager
+async def user_lock(tg_user_id: int):
+    lock = _user_locks.setdefault(tg_user_id, asyncio.Lock())
+    async with lock:
+        yield
+
+
+def valid_http_url(url: str | None) -> bool:
+    if not isinstance(url, str) or not url or len(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        return bool(parsed.scheme in {"http", "https"} and parsed.hostname
+                    and not parsed.username and not parsed.password
+                    and (parsed.port is None or 1 <= parsed.port <= 65535))
+    except ValueError:
+        return False
+
+
+def valid_youtube_url(url: str | None) -> bool:
+    if not valid_http_url(url):
+        return False
+    parsed = urlsplit(url)
+    host = parsed.hostname.lower()
+    if host in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/")
+    elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
+        if parsed.path == "/watch":
+            video_id = parse_qs(parsed.query).get("v", [""])[0]
+        else:
+            parts = parsed.path.strip("/").split("/")
+            video_id = parts[1] if len(parts) == 2 and parts[0] in {"shorts", "live", "embed"} else ""
     else:
-        await show_admin_menu(chat.id, user.id, ctx)
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id))
+
+
+async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE,
+                           welcome: bool = True, track: bool = True) -> None:
+    url = await db.get_lead_magnet_url()
+    if not valid_youtube_url(url):
+        await ctx.bot.send_message(chat_id, "Бесплатный урок пока не добавлен. Загляни чуть позже.",
+                                   reply_markup=next_keyboard("user:product", "🧠 Узнать про «Креативный мозг»"))
+        return
+    text = (texts.WELCOME if welcome else texts.LEAD_CAPTION + "\n\n👇 Сам урок:") + "\n" + url
+    label = "🧠 Узнать про «Креативный мозг»" if welcome else "🧠 Креативный мозг — 400 ₽ / месяц"
+    kwargs = {"chat_id": chat_id, "text": text, "reply_markup": next_keyboard("user:product", label)}
+    if LinkPreviewOptions is not None:
+        kwargs["link_preview_options"] = LinkPreviewOptions(
+            url=url, is_disabled=False, prefer_large_media=True, show_above_text=True)
+    else:
+        kwargs["disable_web_page_preview"] = False
+    try:
+        await ctx.bot.send_message(**kwargs)
+    except BadRequest:
+        if "link_preview_options" not in kwargs:
+            raise
+        kwargs.pop("link_preview_options")
+        await ctx.bot.send_message(**kwargs, disable_web_page_preview=False)
+    # Never store the lesson as an editable/deletable current screen.
+    await db.clear_current_message(tg_user_id)
+    if track:
+        await db.record_event(tg_user_id, "lead_magnet_sent")
+
+
+async def show_product(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await render_screen(chat_id, tg_user_id, ctx, text=texts.PRODUCT,
+                        reply_markup=next_keyboard("user:buy", "Получить доступ — 400 ₽"))
+    await db.record_event(tg_user_id, "product_opened")
+
+
+async def buy_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
+        await start_offer_again(chat_id, tg_user_id, ctx)
+    else:
+        await create_payment_and_render(chat_id, tg_user_id, CURRENT_TARIFF, ctx)
+
+
+async def refresh_payment(row: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(f"{YOOKASSA_API_URL}/{row['payment_id']}",
+                                    auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY))
+        response.raise_for_status()
+        payment = response.json()
+    expected = json.loads(row["metadata_json"])
+    metadata = payment.get("metadata") or {}
+    amount = payment.get("amount") or {}
+    if (payment.get("id") != row["payment_id"] or not expected.get("project_key")
+            or metadata.get("project_key") != expected["project_key"]
+            or str(metadata.get("user_id")) != str(row["tg_user_id"])
+            or metadata.get("kind") != "channel_access"
+            or metadata.get("tariff_code") != row["plan_id"]
+            or metadata.get("days") != expected.get("days")
+            or amount.get("currency") != "RUB"
+            or Decimal(str(amount.get("value"))) != Decimal(str(row["amount_rub"]))):
+        raise ValueError("Payment identity, metadata or amount mismatch")
+    status = payment.get("status")
+    if status not in {"pending", "waiting_for_capture", "succeeded", "canceled"}:
+        raise ValueError("Unknown payment status")
+    if status == "succeeded" and payment.get("paid") is not True:
+        raise ValueError("Succeeded payment is not paid")
+    await db.update_payment_status(row["payment_id"], status, payment)
+    return payment
+
+
+def admin_cancel_keyboard() -> Mk:
+    return next_keyboard("admin:menu", "◀️ В админ-панель")
+
+
+async def show_admin_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    url = await db.get_lead_magnet_url()
+    rows = [[Btn("🔗 Установить / заменить ссылку", callback_data="admin:lead_set")],
+            [Btn("👀 Проверить как пользователь", callback_data="admin:lead_test")]]
+    if url:
+        rows.append([Btn("🗑 Удалить ссылку", callback_data="admin:lead_clear")])
+    rows.append([Btn("◀️ В админ-панель", callback_data="admin:menu")])
+    await render_screen(chat_id, tg_user_id, ctx, text=f"🎬 Лид-магнит\n\nТекущая YouTube-ссылка:\n{url or 'не задана'}",
+                        reply_markup=Mk(rows))
+
+
+async def followup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not FOLLOWUP_ENABLED:
+        return
+    for tg_user_id in await db.followup_candidates():
+        async with user_lock(tg_user_id):
+            # A buyer may have paid at YooKassa without pressing Check in Telegram.
+            try:
+                for pending in await db.list_unfinalized_payments(tg_user_id):
+                    await refresh_payment(pending)
+            except (httpx.HTTPError, ValueError, TypeError, AttributeError, ArithmeticError):
+                logger.warning("followup skipped: payment state unavailable user_id=%s", tg_user_id)
+                continue
+            if not await db.claim_followup(tg_user_id):
+                continue
+            try:
+                await ctx.bot.send_message(tg_user_id, texts.FOLLOWUP,
+                                           reply_markup=next_keyboard("user:product", "Посмотреть «Креативный мозг»"))
+                await db.mark_followup_sent(tg_user_id)
+            except TelegramError:
+                # An ambiguous timeout must not cause a second marketing message.
+                logger.warning("followup delivery unconfirmed; no retry user_id=%s", tg_user_id)
+
+
+async def channel_member_updated(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    event = update.chat_member
+    if not event or event.chat.id != CHANNEL_ID or not event.invite_link:
+        return
+    if event.new_chat_member.status not in {"member", "administrator", "creator"}:
+        return
+    invite = await db.get_invite_link(event.invite_link.invite_link)
+    if not invite:
+        return
+    target = event.new_chat_member.user.id
+    async with user_lock(target):
+        valid = target == invite["tg_user_id"] and active_subscription_until(await db.get_subscription(target))
+        if not valid:
+            await remove_user_from_channel(ctx, target, reason="invalid_invite")
+        # member_limit=1 limits concurrent members; revocation enforces one entry.
+        try:
+            await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, invite["invite_link"])
+            await db.mark_invite_used(invite["invite_link"])
+        except TelegramError:
+            logger.warning("invite revocation failed user_id=%s", target)
+
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # No update/payment payloads or exception strings containing request credentials.
+    logger.error("handler failed error_type=%s", type(ctx.error).__name__)
+    if isinstance(update, Update) and update.effective_chat and update.effective_chat.type == "private":
+        try:
+            await ctx.bot.send_message(update.effective_chat.id, "Не удалось выполнить действие. Попробуй ещё раз чуть позже.")
+        except TelegramError:
+            pass
 
 
 def build_application() -> Application:
@@ -1093,13 +917,16 @@ def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).post_init(init_storage).post_shutdown(close_storage).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CommandHandler(["set_offer", "set_intro_video", "clear_intro_video", "add_review", "reviews", "clear_reviews", "grant", "revoke", "stats"], admin_shortcut))
+    app.add_handler(CommandHandler(["set_offer", "set_lead_magnet", "clear_lead_magnet", "set_intro_video", "clear_intro_video", "grant", "revoke", "stats", "user_path"], admin_shortcut))
     app.add_handler(CallbackQueryHandler(router))
+    app.add_handler(ChatMemberHandler(channel_member_updated, ChatMemberHandler.CHAT_MEMBER))
+    app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, fallback_message))
     if app.job_queue is None:
         raise RuntimeError("JobQueue is unavailable. Install python-telegram-bot[job-queue].")
     app.job_queue.run_repeating(renewal_notices_job, interval=3600, first=60, name="renewal_notices")
     app.job_queue.run_repeating(expire_subscriptions_job, interval=3600, first=120, name="expire_subscriptions")
+    app.job_queue.run_repeating(followup_job, interval=3600, first=180, name="lead_followup")
     return app
 
 
