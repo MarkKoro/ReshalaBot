@@ -289,6 +289,7 @@ async def create_tables() -> None:
         );
     """)
     await _add_missing_columns(db,"renewal_contracts",{"warned_until":"TEXT","warned_at":"TEXT"})
+    await _add_missing_columns(db,"checkout_requests",{"offer_url":"TEXT","offer_version":"TEXT","offer_presented_at":"TEXT"})
     await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('creative_30','Креативный мозг — 30 дней',400,30,1,?)", (iso_now(),))
     await db.commit()
 
@@ -604,6 +605,18 @@ async def finalize_payment_once(
             "UPDATE payments SET finalized_at = ?, paid_at = COALESCE(paid_at, ?), status = 'succeeded' WHERE payment_id = ?",
             (now, now, payment_id),
         )
+        async with db.execute("SELECT * FROM checkout_requests WHERE payment_id=?",(payment_id,)) as cur:
+            checkout=await cur.fetchone()
+        if checkout and checkout['offer_presented_at']:
+            # A URL button does not send a callback. Record acceptance only once the
+            # customer has completed payment after the offer was displayed.
+            await db.execute("UPDATE users SET accepted_offer_at=?,accepted_offer_url=?,accepted_offer_version=? WHERE tg_user_id=?",
+                             (now,checkout['offer_url'],checkout['offer_version'],tg_user_id))
+            await _insert_funnel_event(tg_user_id,'offer_accepted',
+                                      {'source':'payment_after_offer','version':checkout['offer_version']},
+                                      event_key='offer_paid:'+payment_id)
+            await db.execute("UPDATE renewal_contracts SET enabled=0,disabled_at=?,disabled_reason='manual_payment' WHERE tg_user_id=?",
+                             (now,tg_user_id))
         await _insert_funnel_event(tg_user_id, "payment_succeeded",
                                    {"payment_id": payment_id, "amount_rub": payment_dict["amount_rub"]},
                                    event_key=f"paid:{payment_id}")
@@ -995,7 +1008,7 @@ async def pending_checkout(tg_user_id):
 
 
 @serialized
-async def prepare_checkout(tg_user_id, tariff, payload, *, auto_opt_in=False, cycle_until=None):
+async def prepare_checkout(tg_user_id, tariff, payload, *, auto_opt_in=False, cycle_until=None, direct_offer=None):
     """Persist the exact request before sending money-related network traffic."""
     con = await connection()
     await con.execute("BEGIN IMMEDIATE")
@@ -1019,13 +1032,14 @@ async def prepare_checkout(tg_user_id, tariff, payload, *, auto_opt_in=False, cy
                 consent_key=excluded.consent_key,consented_at=excluded.consented_at,disabled_at=NULL,disabled_reason=NULL,
                 warned_until=NULL,warned_at=NULL""",
                 (tg_user_id,tariff.code,tariff.amount_rub,tariff.days,consent_key,now))
-        elif not cycle_until:
+        elif not cycle_until and not direct_offer:
             # A deliberate manual checkout cancels future scheduled attempts.
             await con.execute("UPDATE renewal_contracts SET enabled=0,disabled_at=?,disabled_reason='manual_checkout' WHERE tg_user_id=?",(now,tg_user_id))
         await con.execute("""INSERT INTO checkout_requests(id,tg_user_id,plan_id,title,amount_rub,days,
-            request_json,created_at,auto_opt_in,cycle_until,consent_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            request_json,created_at,auto_opt_in,cycle_until,consent_key,offer_url,offer_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (order_id,tg_user_id,tariff.code,tariff.title,tariff.amount_rub,tariff.days,
-             json.dumps(payload,ensure_ascii=False),now,int(auto_opt_in),cycle_until,consent_key))
+             json.dumps(payload,ensure_ascii=False),now,int(auto_opt_in),cycle_until,consent_key,
+             direct_offer[0] if direct_offer else None,direct_offer[1] if direct_offer else None))
         await con.commit()
         return await get_checkout(order_id)
     except BaseException:
@@ -1038,6 +1052,21 @@ async def get_checkout(order_id):
     con = await connection()
     async with con.execute("SELECT * FROM checkout_requests WHERE id=?",(order_id,)) as cur:
         return row_to_dict(await cur.fetchone())
+
+
+@serialized
+async def get_checkout_by_payment(payment_id):
+    con=await connection()
+    async with con.execute("SELECT * FROM checkout_requests WHERE payment_id=?",(payment_id,)) as cur:
+        return row_to_dict(await cur.fetchone())
+
+
+@serialized
+async def mark_offer_presented(payment_id):
+    con=await connection()
+    await con.execute("UPDATE checkout_requests SET offer_presented_at=COALESCE(offer_presented_at,?) WHERE payment_id=? AND offer_url IS NOT NULL",
+                      (iso_now(),payment_id))
+    await con.commit()
 
 
 @serialized

@@ -294,6 +294,9 @@ async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEF
         await render_screen(chat_id,tg_user_id,ctx,text='Условия оплаты пока не настроены. Можно вернуться к бесплатному уроку.',reply_markup=next_keyboard('user:lead_magnet','Открыть урок'))
         return
     ctx.user_data['offered_terms'] = (offer_url,OFFER_VERSION,tariff.code,tariff.amount_rub,tariff.days)
+    if not await auto_available() or tariff.days < 3:
+        await create_payment_and_render(chat_id,tg_user_id,tariff,ctx,direct_offer=(offer_url,OFFER_VERSION))
+        return
     text = await content('OFFER')
     text += f'\n\n{tariff.title}\n{tariff.amount_rub} ₽ · {tariff.days} дней.'
     rows = [[Btn('📄 Условия',url=offer_url)]]
@@ -301,7 +304,6 @@ async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEF
     if await auto_available() and tariff.days >= 3:
         text += f'\n\nМожно выбрать автопродление: {tariff.amount_rub} ₽ за каждые {tariff.days} дней, списание за сутки до окончания. Перед списанием предупредим. Отключить можно здесь в любой момент. Если способ оплаты не сохранится, останется разовая покупка.'
         rows.append([Btn('Принимаю · с автопродлением',callback_data='user:accept_offer_auto')])
-    rows.append([Btn('Назад к тарифам',callback_data='user:tariffs')])
     await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows))
 
 
@@ -316,18 +318,6 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send_existing_access(chat_id,tg_user_id,(sub or {}).get('last_payment_id'),ctx)
     elif data=='user:activity':
         await show_user_activity(chat_id,tg_user_id,ctx)
-    elif data=='user:goal':
-        await render_screen(chat_id,tg_user_id,ctx,text='Если хочется, выбери задачу — покажу небольшой пример. Это необязательно.',reply_markup=Mk([
-            [Btn('Работа и проекты',callback_data='user:goal:work')],
-            [Btn('Контент и творчество',callback_data='user:goal:content')],
-            [Btn('Повседневные задачи',callback_data='user:goal:everyday')],
-            [Btn('Продолжить без выбора →',callback_data='user:product')]]))
-    elif data.startswith('user:goal:'):
-        goal=data.rsplit(':',1)[-1]
-        if goal not in texts.GOAL_HINTS:
-            return
-        await db.set_goal(tg_user_id,goal)
-        await render_screen(chat_id,tg_user_id,ctx,text=texts.GOAL_HINTS[goal],reply_markup=next_keyboard('user:product','Посмотреть программу →'))
     elif data=='user:quiet':
         await db.set_marketing_opt_out(tg_user_id,True)
         await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Открыть программу'))
@@ -336,7 +326,7 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data=='user:status':
         await show_active_access(chat_id,tg_user_id,ctx)
     elif data=='user:tariffs':
-        await show_tariffs(chat_id,tg_user_id,ctx)
+        await buy_access(chat_id,tg_user_id,ctx)
     elif data.startswith('user:choose:'):
         ctx.user_data['selected_tariff']=data.split(':',2)[2]
         tariff=await selected_tariff(ctx)
@@ -373,16 +363,16 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_product(chat_id,tg_user_id,ctx)
 
 
-async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tariff, ctx: ContextTypes.DEFAULT_TYPE, *, auto_opt_in=False) -> None:
+async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tariff, ctx: ContextTypes.DEFAULT_TYPE, *, auto_opt_in=False, direct_offer=None) -> None:
     published={r['code']:r for r in await db.list_tariffs()}
     current=published.get(tariff.code)
     if not current or (current['amount_rub'],current['days'])!=(tariff.amount_rub,tariff.days):
         await show_tariffs(chat_id,tg_user_id,ctx)
         return
-    if not await db.has_accepted_offer(tg_user_id,OFFER_VERSION):
+    if not direct_offer and not await db.has_accepted_offer(tg_user_id,OFFER_VERSION):
         await start_offer_again(chat_id,tg_user_id,ctx)
         return
-    back=next_keyboard('user:buy','Вернуться к оплате →')
+    back=next_keyboard('user:buy','Попробовать ещё раз')
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         await render_screen(chat_id,tg_user_id,ctx,text='Оплата временно недоступна. Попробуй позже или открой помощь через /paysupport.',reply_markup=back)
         return
@@ -406,7 +396,7 @@ async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tarif
             return
     if not order:
         payload=payment_payload(tg_user_id,tariff,auto_opt_in=auto_opt_in)
-        order=await db.prepare_checkout(tg_user_id,tariff,payload,auto_opt_in=auto_opt_in)
+        order=await db.prepare_checkout(tg_user_id,tariff,payload,auto_opt_in=auto_opt_in,direct_offer=direct_offer)
     try:
         row=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
     except billing.PaymentRejected:
@@ -925,13 +915,18 @@ async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFA
 
 
 async def show_product(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(chat_id,tg_user_id,ctx,text=await content('PRODUCT'),reply_markup=Mk([
-        [Btn('Посмотреть доступ →',callback_data='user:tariffs')],
-        [Btn('Пример под мою задачу',callback_data='user:goal')]]))
+    tariffs=await db.list_tariffs()
+    markup=tariff_keyboard(tariffs) if len(tariffs)>1 else next_keyboard('user:buy','Я хочу')
+    await render_screen(chat_id,tg_user_id,ctx,text=await content('PRODUCT'),
+                        reply_markup=markup)
     await db.record_event(tg_user_id,'product_opened')
+    if len(tariffs)>1:
+        await db.record_event(tg_user_id,'tariffs_opened')
 
 
 async def buy_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # A new purchase/renewal must offer all currently published plans.
+    ctx.user_data.pop('selected_tariff',None)
     await start_offer_again(chat_id,tg_user_id,ctx)
 
 
@@ -1020,7 +1015,7 @@ async def extended_admin_route(data,chat_id,uid,ctx):
         tariffs=await db.list_tariffs(include_disabled=True)
         rows=[[Btn(('🟢 ' if t['enabled'] else '⚪ ')+f"{t['title']}: {t['amount_rub']} ₽ / {t['days']} дн.",callback_data='admin:tariff:'+t['code'])] for t in tariffs]
         rows += [[Btn('Добавить тариф',callback_data='admin:tariff_new')],[Btn('Назад',callback_data='admin:menu')]]
-        await render_screen(chat_id,uid,ctx,text='Тарифы\n\nИзменения действуют для новых счетов. Выставленные счета сохраняют свою цену и срок. При изменении условий автопродление потребует нового выбора клиента.',reply_markup=Mk(rows))
+        await render_screen(chat_id,uid,ctx,text='Тарифы\n\nОдин включённый тариф: кнопка «Я хочу» сразу ведёт к условиям оплаты. Несколько: под описанием появляются кнопки с названием и ценой каждого тарифа. Скрытые тарифы покупатель не видит.\n\nИзменения действуют для новых счетов. Выставленные счета сохраняют свою цену и срок. При изменении условий автопродление потребует нового выбора клиента.',reply_markup=Mk(rows))
     elif data=='admin:tariff_new':
         if len(await db.list_tariffs(include_disabled=True))>=20:
             await render_screen(chat_id,uid,ctx,text='Доступно до 20 тарифов. Можно отредактировать или включить существующий.',reply_markup=admin_cancel_keyboard())
@@ -1057,6 +1052,8 @@ async def extended_admin_route(data,chat_id,uid,ctx):
             return True
         await db.set_admin_state(uid,'content',{'key':key})
         current=await db.get_setting('text:'+key,getattr(texts,key))
+        if current==texts.PREVIOUS_DEFAULTS.get(key):
+            current=getattr(texts,key)
         await render_screen(chat_id,uid,ctx,text=f'{texts.EDITABLE[key]}\n\n{current}\n\nОтправьте новый текст (до 2000 знаков; эмодзи могут занимать два). Сохраните поля в фигурных скобках, если они есть.',reply_markup=Mk([[Btn('Вернуть исходный текст',callback_data='admin:text_reset:'+key)],[Btn('Отмена',callback_data='admin:texts')]]))
     elif data.startswith('admin:text_reset:'):
         key=data.split(':',2)[2]
@@ -1184,6 +1181,8 @@ async def extended_admin_input(name,raw,state,update,ctx):
 
 async def content(key, **values):
     template = await db.get_setting('text:'+key,getattr(texts,key))
+    if template == texts.PREVIOUS_DEFAULTS.get(key):
+        template=getattr(texts,key)
     return template.format(**values)
 
 
@@ -1200,12 +1199,16 @@ async def selected_tariff(ctx):
     return Tariff(row['code'],row['title'],row['amount_rub'],row['days']) if row else None
 
 
+def tariff_keyboard(tariffs):
+    return Mk([[Btn(f"{t['title']} · {t['amount_rub']} ₽",callback_data='user:choose:'+t['code'])] for t in tariffs])
+
+
 async def show_tariffs(chat_id,user_id,ctx):
     tariffs=await db.list_tariffs()
-    rows=[[Btn(f"{t['title']} · {t['amount_rub']} ₽ / {t['days']} дн.",callback_data='user:choose:'+t['code'])] for t in tariffs]
-    rows.append([Btn('Назад к программе',callback_data='user:product')])
     text='Выбери удобный срок доступа. При продлении оставшиеся дни сохраняются.' if tariffs else 'Новые покупки пока приостановлены. Бесплатный урок остаётся доступным.'
-    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=Mk(rows))
+    if tariffs:
+        text+='\n\n'+'\n'.join(f"{t['title']}: {t['amount_rub']} ₽ / {t['days']} дней" for t in tariffs)
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=tariff_keyboard(tariffs))
     await db.record_event(user_id,'tariffs_opened')
 
 
@@ -1230,9 +1233,15 @@ async def render_payment(chat_id,user_id,row,ctx):
         await render_screen(chat_id,user_id,ctx,text='Счёт отменён. Выбери оплату заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
         return
     metadata=json.loads(row['metadata_json'])
-    con=await db.connection()
-    async with con.execute('SELECT auto_opt_in,cycle_until,title FROM checkout_requests WHERE payment_id=?',(row['payment_id'],)) as cur:
-        order=await cur.fetchone()
+    order=await db.get_checkout_by_payment(row['payment_id'])
+    if order and order['offer_url'] and row['status']=='pending' and valid_http_url(row['confirmation_url']):
+        text=await content('OFFER')
+        text+=f"\n\n{order['title']}\n{row['amount_rub']} ₽ · {metadata['days']} дней.\nРазовая покупка, без автоматических списаний."
+        await render_screen(chat_id,user_id,ctx,text=text,reply_markup=Mk([
+            [Btn('📄 Условия',url=order['offer_url'])],
+            [Btn('Принимаю · оплатить разово',url=row['confirmation_url'])]]))
+        await db.mark_offer_presented(row['payment_id'])
+        return
     auto=bool(order and (order['auto_opt_in'] or order['cycle_until']))
     text=await content('PAYMENT_CREATED')
     text+=f"\n\n{order['title'] if order else 'Доступ в канал'}: {row['amount_rub']} ₽ / {metadata['days']} дней."

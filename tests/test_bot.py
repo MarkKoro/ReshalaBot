@@ -70,8 +70,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.http = MagicMock()
         self.http.__aenter__ = AsyncMock(return_value=self.http)
         self.http.__aexit__ = AsyncMock(return_value=False)
-        self.http.post = AsyncMock()
-        self.http.get = AsyncMock()
+        self.http.post = AsyncMock(return_value=self.response(self.payment()))
+        self.http.get = AsyncMock(return_value=self.response(self.payment()))
         self.client_patch = patch.object(bot.httpx, "AsyncClient", return_value=self.http)
         self.client_patch.start()
 
@@ -142,9 +142,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.press("user:buy")
         self.assertIn(texts.OFFER, self.last()["text"])
         self.assertEqual(self.buttons()[0].url, OFFER)
-        self.http.post.return_value = self.response(self.payment())
-        await self.press("user:accept_offer_and_pay")
-        self.assertIn(texts.PAYMENT_CREATED, self.last()["text"])
+        self.assertEqual(self.buttons()[1].text, "Принимаю · оплатить разово")
+        self.assertEqual(self.buttons()[1].url, "https://example.com/pay")
+        self.assertIsNone(self.buttons()[1].callback_data)
+        self.assertFalse(await db.has_accepted_offer(1))
         payload = self.http.post.call_args.kwargs["json"]
         self.assertEqual(payload["amount"], {"value": "400.00", "currency": "RUB"})
         self.assertEqual(payload["metadata"]["days"], "30")
@@ -167,7 +168,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.delete_message.assert_not_awaited()
         events = [row["event_name"] for row in await db.get_user_path(1)]
         self.assertEqual(events, ["start", "lead_magnet_sent", "product_opened", "buy_clicked",
-                                  "offer_accepted", "payment_created", "payment_succeeded", "access_granted"])
+                                  "payment_created", "offer_accepted", "payment_succeeded", "access_granted"])
         success_id = max(self.messages)
         success = dict(self.messages[success_id])
         await bot.start(self.update, self.ctx)
@@ -288,6 +289,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.http.post.await_count, 1)
 
     async def test_offer_missing_stale_or_changed_blocks_payment(self):
+        await db.set_setting("auto_renew_enabled","1")
         await self.sql("DELETE FROM settings WHERE key = 'offer_url'")
         await self.press("user:buy")
         await self.press("user:accept_offer_and_pay")
@@ -603,16 +605,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.start(self.update, self.ctx)
         await self.press("user:product")
         self.assertLess(len(self.last()["text"]), 450)
-        self.assertEqual(self.buttons()[0].text, "Посмотреть доступ →")
+        self.assertEqual(self.buttons()[0].text, "Я хочу")
         self.assertNotIn("400", self.last()["text"])
         await self.press("user:buy")
         self.assertIn("400", self.last()["text"])
         self.assertIn("30", self.last()["text"])
-        self.http.post.return_value = self.response(self.payment())
-        await self.press("user:accept_offer_and_pay")
-        self.assertIn("400", self.last()["text"])
-        self.assertEqual(sum("400" in b.text for b in self.buttons()), 1)
-        self.assertEqual(self.buttons()[0].text, "💳 Оплатить 400 ₽")
+        self.assertEqual(sum("400" in b.text for b in self.buttons()), 0)
+        self.assertEqual(self.buttons()[1].text, "Принимаю · оплатить разово")
+        self.assertEqual(self.buttons()[1].url, "https://example.com/pay")
+        self.assertEqual(len(self.buttons()), 2)
         for message in self.messages.values():
             markup = message.get("reply_markup")
             if markup:
@@ -705,7 +706,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await db.set_setting("auto_renew_enabled","1")
         self.http.post.return_value = self.response(payment or self.payment())
         await self.press("user:buy")
-        await self.press("user:accept_offer_auto" if auto else "user:accept_offer_and_pay")
+        if auto or await bot.auto_available():
+            await self.press("user:accept_offer_auto" if auto else "user:accept_offer_and_pay")
 
     async def enable_auto(self):
         paid = self.payment(status="succeeded")
@@ -745,8 +747,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await bot.auto_available())
         await self.press("user:buy")
         self.assertFalse(any(b.callback_data=="user:accept_offer_auto" for b in self.buttons()))
-        self.http.post.return_value=self.response(self.payment())
-        await self.press("user:accept_offer_and_pay")
+        self.assertEqual(self.buttons()[1].url,"https://example.com/pay")
+        self.assertIsNone(self.buttons()[1].callback_data)
+        self.assertFalse(await db.has_accepted_offer(1))
         request=self.http.post.call_args
         self.assertEqual(request.args[0],"https://api.yookassa.ru/v3/payments")
         payload=request.kwargs["json"]
@@ -755,6 +758,64 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(payload["capture"],True)
         self.assertEqual(payload["confirmation"]["type"],"redirect")
         self.assertIsNone(await db.get_renewal(1))
+
+    async def test_direct_offer_repeated_click_and_restart_reuse_invoice_without_consent(self):
+        await asyncio.gather(self.press("user:buy"),self.press("user:buy"))
+        self.assertEqual(self.http.post.await_count,1)
+        self.assertFalse(await db.has_accepted_offer(1))
+        self.assertIsNone(await db.get_subscription(1))
+        self.assertEqual([b.text for b in self.buttons()],["📄 Условия","Принимаю · оплатить разово"])
+        order=await db.get_checkout_by_payment("p1")
+        self.assertEqual(order["offer_url"],OFFER)
+        self.assertIsNotNone(order["offer_presented_at"])
+        await db.close_db()
+        await db.init_db()
+        self.ctx.user_data={}
+        await self.press("user:buy")
+        self.assertEqual(self.http.post.await_count,1)
+        self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests")),1)
+        self.assertFalse(any(r["event_name"]=="offer_accepted" for r in await db.get_user_path(1)))
+        self.assertEqual(self.buttons()[1].url,"https://example.com/pay")
+
+    async def test_direct_payment_keeps_presented_offer_and_records_acceptance_only_when_paid(self):
+        await self.press("user:buy")
+        await db.set_offer_url(OFFER+"/changed")
+        with patch.object(bot,"OFFER_VERSION","2"):
+            await self.press("user:buy")
+            self.assertEqual(self.buttons()[0].url,OFFER)
+            self.assertEqual(self.http.post.await_count,1)
+            self.assertFalse(await db.has_accepted_offer(1))
+            self.http.get.return_value=self.response(self.payment(status="succeeded"))
+            await bot.payment_reconciliation_job(self.ctx)
+        user=dict((await self.sql("SELECT * FROM users WHERE tg_user_id=1"))[0])
+        self.assertEqual(user["accepted_offer_url"],OFFER)
+        self.assertEqual(user["accepted_offer_version"],"1")
+        events=[r for r in await db.get_user_path(1) if r["event_name"]=="offer_accepted"]
+        self.assertEqual(len(events),1)
+        self.assertEqual(json.loads(events[0]["payload_json"])["source"],"payment_after_offer")
+        until=(await db.get_subscription(1))["access_until"]
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))["access_until"],until)
+
+    async def test_viewing_direct_offer_preserves_previous_renewal_until_manual_purchase(self):
+        await self.enable_auto()
+        await db.set_setting("auto_renew_enabled","0")
+        self.http.post.return_value=self.response(self.payment("manual"))
+        await self.press("user:buy")
+        self.assertEqual((await db.get_renewal(1))["enabled"],1)
+        self.assertNotIn("save_payment_method",self.http.post.call_args.kwargs["json"])
+        self.http.get.return_value=self.response(self.payment("manual","succeeded"))
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.get_renewal(1))["enabled"],0)
+        self.assertEqual((await db.get_renewal(1))["disabled_reason"],"manual_payment")
+
+    async def test_updated_default_copy_preserves_custom_admin_text(self):
+        for key,previous in texts.PREVIOUS_DEFAULTS.items():
+            await db.set_setting("text:"+key,previous)
+            self.assertEqual(await bot.content(key),getattr(texts,key))
+        custom="Мой авторский текст урока"
+        await db.set_setting("text:LEAD_CAPTION",custom)
+        self.assertEqual(await bot.content("LEAD_CAPTION"),custom)
 
     async def test_delivery_failure_retries_separately_without_blocking_new_payments(self):
         await self.store_payment(status="succeeded")
@@ -788,7 +849,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["json"], second["json"])
         self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests")), 1)
         self.assertEqual(len(await self.sql("SELECT * FROM payments")), 1)
-        self.assertEqual(self.buttons()[0].url, "https://example.com/pay")
+        self.assertTrue(any(b.url == "https://example.com/pay" for b in self.buttons()))
 
     async def test_old_unknown_request_never_reissued_outside_idempotence_window(self):
         order = await db.prepare_checkout(1, bot.CURRENT_TARIFF, bot.payment_payload(1, bot.CURRENT_TARIFF))
@@ -822,14 +883,20 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_published_multi_tariff_button_flow_and_hidden_tariffs(self):
         await db.save_tariff("quarter","Три месяца",990,90,True,99)
         await self.press("user:product")
+        self.assertEqual(self.last()["text"],texts.PRODUCT)
+        self.assertEqual(len(self.buttons()),2)
+        self.assertEqual(next(b.text for b in self.buttons() if b.callback_data=="user:choose:quarter"),"Три месяца · 990 ₽")
+        self.http.post.assert_not_awaited()
+        self.ctx.user_data['selected_tariff']='creative_30'
         await self.press("user:tariffs")
+        self.http.post.assert_not_awaited()
         self.assertTrue(any(b.callback_data=="user:choose:quarter" for b in self.buttons()))
+        plan=bot.Tariff("quarter","Три месяца",990,90)
+        self.http.post.return_value=self.response(self.payment(plan=plan))
         await self.press("user:choose:quarter")
         self.assertIn("990",self.last()["text"])
         self.assertIn("90",self.last()["text"])
-        plan=bot.Tariff("quarter","Три месяца",990,90)
-        self.http.post.return_value=self.response(self.payment(plan=plan))
-        await self.press("user:accept_offer_and_pay")
+        self.assertEqual(self.buttons()[1].url,"https://example.com/pay")
         self.assertEqual(self.http.post.call_args.kwargs["json"]["amount"]["value"],"990.00")
         self.http.get.return_value=self.response(self.payment(status="succeeded",plan=plan))
         await bot.payment_reconciliation_job(self.ctx)
@@ -840,7 +907,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await db.save_tariff(tariff["code"],tariff["title"],tariff["amount_rub"],tariff["days"],False,99)
         await self.press("user:tariffs")
         self.assertIn("приостановлены",self.last()["text"])
-        self.assertEqual(len(self.buttons()),1)
+        self.assertEqual(len(self.buttons()),0)
 
     async def test_expired_invite_does_not_block_recovery_when_provider_cannot_revoke_it(self):
         await self.store_payment(status="succeeded")
@@ -853,6 +920,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.buttons()[0].url,"https://t.me/+test-invite")
 
     async def test_stale_tariff_price_requires_showing_new_terms(self):
+        await db.set_setting("auto_renew_enabled","1")
         await self.press("user:buy")
         await db.save_tariff("creative_30", "Новый", 500, 60, True, 99)
         await self.press("user:accept_offer_auto")
@@ -1052,7 +1120,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         plans = await db.list_tariffs(True)
         added = next(p for p in plans if p["code"]!="creative_30")
         self.assertEqual(added["enabled"], 0)
+        await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
+        self.assertEqual([b.text for b in self.buttons()],["Я хочу"])
         await self.press("admin:tariff_toggle:"+added["code"])
+        await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
+        self.assertEqual(len(self.buttons()),2)
+        self.assertEqual(next(b.text for b in self.buttons() if b.callback_data=="user:choose:"+added["code"]),"Три месяца · 900 ₽")
         await self.press("admin:setting:reminder_days")
         self.update.effective_message.text = "1"
         await bot.handle_admin_input(self.update, self.ctx)
@@ -1071,6 +1144,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await db.list_tariffs()), 2)
         self.assertEqual(await bot.content("RENEWAL_NOTICE",date="завтра",activity="Спасибо"), "До завтра.\nСпасибо\nПродолжим?")
         self.assertGreaterEqual(len(await self.sql("SELECT * FROM admin_audit")), 4)
+        await self.press("admin:tariff_edit:"+added["code"]+":amount_rub")
+        self.update.effective_message.text = "1100"
+        await bot.handle_admin_input(self.update,self.ctx)
+        await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
+        self.assertEqual(next(b.text for b in self.buttons() if b.callback_data=="user:choose:"+added["code"]),"Три месяца · 1100 ₽")
+        await self.press("admin:tariff_toggle:"+added["code"])
+        await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
+        self.assertEqual([b.text for b in self.buttons()],["Я хочу"])
+        self.http.post.assert_not_awaited()
 
     async def test_nonadmin_cannot_change_extended_settings(self):
         for route in ("admin:tariff_new","admin:tariff_toggle:creative_30","admin:text_reset:WELCOME",
@@ -1080,12 +1162,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.sql("SELECT * FROM admin_audit")), 0)
         self.assertEqual(len(await db.list_tariffs()), 1)
 
-    async def test_optional_goal_never_blocks_product_and_marketing_optout_works(self):
+    async def test_removed_goal_buttons_return_to_product_and_marketing_optout_works(self):
         await self.press("user:product")
-        self.assertEqual(self.buttons()[0].callback_data, "user:tariffs")
+        self.assertEqual(self.buttons()[0].callback_data, "user:buy")
+        self.assertEqual(len(self.buttons()), 1)
         await self.press("user:goal:work")
-        self.assertIn("рабочей", self.last()["text"])
-        self.assertEqual(self.buttons()[0].callback_data, "user:product")
+        self.assertEqual(self.last()["text"], texts.PRODUCT)
+        self.assertEqual(self.buttons()[0].callback_data, "user:buy")
+        self.assertFalse(any(r["event_name"]=="goal_selected" for r in await db.get_user_path(1)))
         await self.age_lead()
         await self.press("user:quiet")
         before = self.telegram.send_message.await_count
