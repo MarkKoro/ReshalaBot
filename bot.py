@@ -8,13 +8,13 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from decimal import Decimal
 from types import SimpleNamespace
 from urllib.parse import urlsplit, parse_qs
 import os
 import re
 import uuid
 from dataclasses import dataclass
+from string import Formatter
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -23,11 +23,12 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Mk
 from telegram import InputMediaPhoto, InputMediaVideo, Update, User
-from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, ChatJoinRequestHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 import db
 import texts
+import billing
 
 try:
     from telegram import LinkPreviewOptions
@@ -112,6 +113,10 @@ async def init_storage(app: Application) -> None:
     await db.init_db()
     if ENV_OFFER_URL and not await db.get_offer_url():
         await db.set_offer_url(ENV_OFFER_URL)
+    for key, value in {'followup_enabled': str(int(FOLLOWUP_ENABLED)), 'auto_renew_enabled': '0',
+                       'reminder_days': '3', 'activity_chat_id': os.getenv('ACTIVITY_CHAT_ID','0')}.items():
+        if await db.get_setting(key) is None:
+            await db.set_setting(key,value)
     logger.info("database initialized at %s", db.DB_PATH)
 
 
@@ -201,10 +206,6 @@ async def render_screen(
         except TelegramError:
             logger.exception("screen edit failed, recreating message")
 
-    if old_chat_id and old_message_id:
-        await safe_delete_message(ctx, old_chat_id, old_message_id)
-        await db.clear_current_message(tg_user_id)
-
     if kind == "video":
         msg = await ctx.bot.send_video(chat_id=chat_id, video=file_id, caption=text, reply_markup=reply_markup)
     elif kind == "photo":
@@ -212,6 +213,8 @@ async def render_screen(
     else:
         msg = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     await db.set_current_message(tg_user_id, chat_id, msg.message_id, kind)
+    if old_chat_id and old_message_id:
+        await safe_delete_message(ctx, old_chat_id, old_message_id)
 
 
 def offer_keyboard(offer_url: str | None) -> Mk:
@@ -227,7 +230,7 @@ def next_keyboard(callback_data: str, label: str = "Далее ➡️") -> Mk:
     return Mk([[Btn(label, callback_data=callback_data)]])
 
 
-def payment_keyboard(payment_id: str, confirmation_url: str | None, retry: bool = False) -> Mk:
+def payment_keyboard(payment_id: str, confirmation_url: str | None, retry: bool = False, amount_rub: int = 400) -> Mk:
     check = Btn("✅ Проверить ещё раз" if retry else "✅ Проверить оплату",
                 callback_data=f"user:check_payment:{payment_id}")
     if retry:
@@ -235,7 +238,7 @@ def payment_keyboard(payment_id: str, confirmation_url: str | None, retry: bool 
         if confirmation_url:
             rows.append([Btn("💳 Открыть оплату", url=confirmation_url)])
     else:
-        rows = [[Btn("💳 Оплатить 400 ₽", url=confirmation_url)], [check]]
+        rows = ([[Btn(f"💳 Оплатить {amount_rub} ₽", url=confirmation_url)]] if valid_http_url(confirmation_url) else []) + [[check]]
     return Mk(rows)
 
 
@@ -252,11 +255,19 @@ def active_subscription_until(sub: dict | None) -> str | None:
 async def show_active_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     access_until = active_subscription_until(await db.get_subscription(tg_user_id))
     if not access_until:
-        await send_lead_magnet(chat_id, tg_user_id, ctx)
+        await send_lead_magnet(chat_id,tg_user_id,ctx)
         return
-    await render_screen(chat_id, tg_user_id, ctx,
-                        text=texts.ACTIVE_ACCESS.format(date=format_dt(access_until)),
-                        reply_markup=next_keyboard("user:buy", "Продлить доступ →"))
+    contract = await db.get_renewal(tg_user_id)
+    auto = bool(contract and contract['enabled'])
+    text = await content('ACTIVE_ACCESS',date=format_dt(access_until))
+    text += ('\n\nАвтопродление: включено.' if auto and await auto_available() else
+             '\n\nАвтопродление приостановлено администратором.' if auto else '\n\nАвтопродление: выключено.')
+    rows = [[Btn('🧠 Получить ссылку входа',callback_data='user:access')],
+            [Btn('Продлить доступ →',callback_data='user:buy')]]
+    if auto or await auto_available():
+        rows.append([Btn('Отключить автопродление' if auto else 'Настроить автопродление',callback_data='user:auto_off' if auto else 'user:auto_setup')])
+    rows.append([Btn('Моя активность',callback_data='user:activity')])
+    await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows))
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -275,141 +286,172 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     offer_url = await db.get_offer_url()
-    if not valid_http_url(offer_url):
-        await render_screen(chat_id, tg_user_id, ctx,
-                            text="Оферта пока не настроена. Оплата временно недоступна. Попробуй позже.",
-                            reply_markup=next_keyboard("user:product", "🧠 Креативный мозг"))
+    tariff = await selected_tariff(ctx)
+    if not tariff:
+        await show_tariffs(chat_id,tg_user_id,ctx)
         return
-    ctx.user_data["offered_terms"] = (offer_url, OFFER_VERSION)
-    await render_screen(chat_id, tg_user_id, ctx, text=texts.OFFER, reply_markup=offer_keyboard(offer_url))
+    if not valid_http_url(offer_url):
+        await render_screen(chat_id,tg_user_id,ctx,text='Условия оплаты пока не настроены. Можно вернуться к бесплатному уроку.',reply_markup=next_keyboard('user:lead_magnet','Открыть урок'))
+        return
+    ctx.user_data['offered_terms'] = (offer_url,OFFER_VERSION,tariff.code,tariff.amount_rub,tariff.days)
+    text = await content('OFFER')
+    text += f'\n\n{tariff.title}\n{tariff.amount_rub} ₽ · {tariff.days} дней.'
+    rows = [[Btn('📄 Условия',url=offer_url)]]
+    rows.append([Btn('Принимаю · оплатить разово',callback_data='user:accept_offer_and_pay')])
+    if await auto_available() and tariff.days >= 3:
+        text += f'\n\nМожно выбрать автопродление: {tariff.amount_rub} ₽ за каждые {tariff.days} дней, списание за сутки до окончания. Перед списанием предупредим. Отключить можно здесь в любой момент. Если способ оплаты не сохранится, останется разовая покупка.'
+        rows.append([Btn('Принимаю · с автопродлением',callback_data='user:accept_offer_auto')])
+    rows.append([Btn('Назад к тарифам',callback_data='user:tariffs')])
+    await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows))
 
 
 async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    tg_user_id = query.from_user.id
-    chat_id = query.message.chat_id
+    tg_user_id, chat_id = query.from_user.id, query.message.chat_id
     await remember_user(query.from_user)
-    data = query.data or ""
-    if data in {"user:lead_magnet", "user:start_intro"}:
-        if active_subscription_until(await db.get_subscription(tg_user_id)):
-            await show_active_access(chat_id, tg_user_id, ctx)
-        else:
-            await send_lead_magnet(chat_id, tg_user_id, ctx, welcome=False)
-    elif (data in {"user:product", "user:after_intro", "user:show_reviews", "user:tariffs"}
-          or data.startswith(("user:review:", "user:tariff:"))):
-        # Historical tariff buttons never create a new legacy payment.
-        await show_product(chat_id, tg_user_id, ctx)
-    elif data == "user:buy":
-        await db.record_event(tg_user_id, "buy_clicked")
-        if active_subscription_until(await db.get_subscription(tg_user_id)):
-            await db.record_event(tg_user_id, "renewal_started")
-        await buy_access(chat_id, tg_user_id, ctx)
-    elif data == "user:accept_offer_and_pay":
-        terms = (await db.get_offer_url(), OFFER_VERSION)
-        if not valid_http_url(terms[0]) or ctx.user_data.get("offered_terms") != terms:
-            await start_offer_again(chat_id, tg_user_id, ctx)
+    data = query.data or ''
+    if data in {'user:lead_magnet','user:start_intro'}:
+        await send_lead_magnet(chat_id,tg_user_id,ctx,welcome=False)
+    elif data=='user:access':
+        sub=await db.get_subscription(tg_user_id)
+        await send_existing_access(chat_id,tg_user_id,(sub or {}).get('last_payment_id'),ctx)
+    elif data=='user:activity':
+        await show_user_activity(chat_id,tg_user_id,ctx)
+    elif data=='user:goal':
+        await render_screen(chat_id,tg_user_id,ctx,text='Если хочется, выбери задачу — покажу небольшой пример. Это необязательно.',reply_markup=Mk([
+            [Btn('Работа и проекты',callback_data='user:goal:work')],
+            [Btn('Контент и творчество',callback_data='user:goal:content')],
+            [Btn('Повседневные задачи',callback_data='user:goal:everyday')],
+            [Btn('Продолжить без выбора →',callback_data='user:product')]]))
+    elif data.startswith('user:goal:'):
+        goal=data.rsplit(':',1)[-1]
+        if goal not in texts.GOAL_HINTS:
             return
-        if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
-            await db.accept_offer(tg_user_id, OFFER_VERSION)
-            await db.record_event(tg_user_id, "offer_accepted", {"version": OFFER_VERSION})
-        await create_payment_and_render(chat_id, tg_user_id, CURRENT_TARIFF, ctx)
-    elif data == "user:accept_offer":
-        # An old button did not disclose the new terms or authorize payment.
-        await start_offer_again(chat_id, tg_user_id, ctx)
-    elif data.startswith("user:check_payment:"):
-        await check_payment_and_grant(chat_id, tg_user_id, data.split(":", 2)[2], ctx)
+        await db.set_goal(tg_user_id,goal)
+        await render_screen(chat_id,tg_user_id,ctx,text=texts.GOAL_HINTS[goal],reply_markup=next_keyboard('user:product','Посмотреть программу →'))
+    elif data=='user:quiet':
+        await db.set_marketing_opt_out(tg_user_id,True)
+        await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Открыть программу'))
+    elif data=='user:auto_off':
+        await disable_auto_and_render(chat_id,tg_user_id,ctx)
+    elif data=='user:status':
+        await show_active_access(chat_id,tg_user_id,ctx)
+    elif data=='user:tariffs':
+        await show_tariffs(chat_id,tg_user_id,ctx)
+    elif data.startswith('user:choose:'):
+        ctx.user_data['selected_tariff']=data.split(':',2)[2]
+        tariff=await selected_tariff(ctx)
+        if not tariff:
+            await show_tariffs(chat_id,tg_user_id,ctx)
+            return
+        await db.record_event(tg_user_id,'tariff_selected',{'code':tariff.code})
+        await db.record_event(tg_user_id,'buy_clicked')
+        await start_offer_again(chat_id,tg_user_id,ctx)
+    elif data in {'user:buy','user:auto_setup'}:
+        await db.record_event(tg_user_id,'buy_clicked')
+        if active_subscription_until(await db.get_subscription(tg_user_id)):
+            await db.record_event(tg_user_id,'renewal_started')
+        await buy_access(chat_id,tg_user_id,ctx)
+    elif data in {'user:accept_offer_and_pay','user:accept_offer_auto'}:
+        tariff=await selected_tariff(ctx)
+        terms=(await db.get_offer_url(),OFFER_VERSION,tariff.code,tariff.amount_rub,tariff.days) if tariff else None
+        if not terms or not valid_http_url(terms[0]) or ctx.user_data.get('offered_terms')!=terms:
+            await start_offer_again(chat_id,tg_user_id,ctx)
+            return
+        auto=data.endswith('_auto')
+        if auto and (not await auto_available() or tariff.days < 3):
+            await start_offer_again(chat_id,tg_user_id,ctx)
+            return
+        if not await db.has_accepted_offer(tg_user_id,OFFER_VERSION):
+            await db.accept_offer(tg_user_id,OFFER_VERSION)
+            await db.record_event(tg_user_id,'offer_accepted',{'version':OFFER_VERSION})
+        await create_payment_and_render(chat_id,tg_user_id,tariff,ctx,auto_opt_in=auto)
+    elif data=='user:accept_offer':
+        await start_offer_again(chat_id,tg_user_id,ctx)
+    elif data.startswith('user:check_payment:'):
+        await check_payment_and_grant(chat_id,tg_user_id,data.split(':',2)[2],ctx)
     else:
-        await show_product(chat_id, tg_user_id, ctx)
+        await show_product(chat_id,tg_user_id,ctx)
 
 
-async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tariff, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if tariff != CURRENT_TARIFF:
-        raise ValueError("Only the current tariff may be purchased")
-    if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
-        await start_offer_again(chat_id, tg_user_id, ctx)
+async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tariff, ctx: ContextTypes.DEFAULT_TYPE, *, auto_opt_in=False) -> None:
+    published={r['code']:r for r in await db.list_tariffs()}
+    current=published.get(tariff.code)
+    if not current or (current['amount_rub'],current['days'])!=(tariff.amount_rub,tariff.days):
+        await show_tariffs(chat_id,tg_user_id,ctx)
         return
-    back = next_keyboard("user:buy", "Попробовать ещё раз →")
+    if not await db.has_accepted_offer(tg_user_id,OFFER_VERSION):
+        await start_offer_again(chat_id,tg_user_id,ctx)
+        return
+    back=next_keyboard('user:buy','Вернуться к оплате →')
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
-        await render_screen(chat_id, tg_user_id, ctx, text="Оплата временно недоступна: YooKassa не настроена.", reply_markup=back)
-        logger.error("payment creation blocked: empty YooKassa credentials")
+        await render_screen(chat_id,tg_user_id,ctx,text='Оплата временно недоступна. Попробуй позже или открой помощь через /paysupport.',reply_markup=back)
         return
-    pending = await db.get_latest_pending_payment(tg_user_id)
-    if (pending and pending["plan_id"] == CURRENT_TARIFF.code and pending.get("confirmation_url")
-            and parse_dt(pending["created_at"]) > datetime.now(timezone.utc) - timedelta(hours=24)):
-        await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_CREATED,
-                            reply_markup=payment_keyboard(pending["payment_id"], pending["confirmation_url"]))
-        return
-    return_url = YOOKASSA_RETURN_URL or (f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/")
-    metadata = {
-        "project_key": PROJECT_KEY, "user_id": str(tg_user_id), "kind": "channel_access",
-        "tariff_code": tariff.code, "days": str(tariff.days),
-    }
-    payload = {
-        "amount": {"value": f"{tariff.amount_rub:.2f}", "currency": "RUB"},
-        "capture": True,
-        "confirmation": {"type": "redirect", "return_url": return_url},
-        "description": "Доступ к «Креативному мозгу» на 30 дней",
-        "metadata": metadata,
-    }
+    order=await db.pending_checkout(tg_user_id)
+    # Older installations could leave several invoices. Every unresolved invoice
+    # must settle before a new one is created.
+    for pending in await db.list_unfinalized_payments(tg_user_id):
+        try:
+            remote=await refresh_payment(pending)
+            if remote['status']=='succeeded':
+                result=await billing.finalize(pending)
+                if result.get('ok'):
+                    await send_access_link(chat_id,tg_user_id,pending['payment_id'],result['access_until'],ctx)
+                    return
+            elif remote['status']!='canceled':
+                await render_payment(chat_id,tg_user_id,pending,ctx)
+                return
+            order=await db.pending_checkout(tg_user_id)
+        except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+            await render_payment(chat_id,tg_user_id,pending,ctx)
+            return
+    if not order:
+        payload=payment_payload(tg_user_id,tariff,auto_opt_in=auto_opt_in)
+        order=await db.prepare_checkout(tg_user_id,tariff,payload,auto_opt_in=auto_opt_in)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(YOOKASSA_API_URL, json=payload,
-                                         auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
-                                         headers={"Idempotence-Key": str(uuid.uuid4())})
-            response.raise_for_status()
-            payment = response.json()
-        payment_id = payment.get("id")
-        confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
-        if not payment_id or not valid_http_url(confirmation_url):
-            raise ValueError("Missing payment id or confirmation URL")
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
-        logger.error("payment creation failed user_id=%s error_type=%s", tg_user_id, type(exc).__name__)
-        await render_screen(chat_id, tg_user_id, ctx, text="Не получилось создать платёж. Попробуй позже.", reply_markup=back)
+        row=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+    except billing.PaymentRejected:
+        if order['auto_opt_in']:
+            # A definitive API rejection created no payment. Offer a new manual quote.
+            await db.disable_renewal(tg_user_id,'provider_rejected_setup')
+            await render_screen(chat_id,tg_user_id,ctx,text='ЮKassa отклонила создание счёта с автопродлением. Можно попробовать разовую оплату; перед окончанием пришлю напоминание.',reply_markup=next_keyboard('user:accept_offer_and_pay','Оформить разовую оплату'))
+        else:
+            await render_screen(chat_id,tg_user_id,ctx,text='ЮKassa отклонила создание счёта. Попробуй позже или открой /paysupport.',reply_markup=back)
         return
-    await db.create_payment(tg_user_id, payment_id, tariff.code, tariff.amount_rub, confirmation_url, metadata, payment)
-    await db.record_event(tg_user_id, "payment_created", {"payment_id": payment_id, "amount_rub": tariff.amount_rub},
-                          event_key=f"created:{payment_id}")
-    await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_CREATED,
-                        reply_markup=payment_keyboard(payment_id, confirmation_url))
+    except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+        logger.warning('checkout outcome unresolved user_id=%s order=%s',tg_user_id,order['id'])
+        await render_screen(chat_id,tg_user_id,ctx,text='Проверяю результат запроса к ЮKassa. Повторно оплачивать не нужно. Я продолжу проверку автоматически; повторная кнопка использует тот же счёт.',reply_markup=back)
+        return
+    if row['status']=='succeeded':
+        result=await billing.finalize(row)
+        if result.get('ok'):
+            await send_access_link(chat_id,tg_user_id,row['payment_id'],result['access_until'],ctx)
+            return
+    await render_payment(chat_id,tg_user_id,row,ctx)
 
 
 async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    payment_row = await db.get_payment(payment_id)
-    if not payment_row or int(payment_row["tg_user_id"]) != tg_user_id:
-        await render_screen(chat_id, tg_user_id, ctx, text="Платёж не найден для твоего аккаунта.",
-                            reply_markup=next_keyboard("user:product", "🧠 Креативный мозг"))
+    row=await db.get_payment(payment_id)
+    if not row or row['tg_user_id']!=tg_user_id:
+        await render_screen(chat_id,tg_user_id,ctx,text='Платёж не найден для твоего аккаунта.',reply_markup=next_keyboard('user:product','Посмотреть программу'))
         return
-    if payment_row.get("finalized_at"):
-        await send_existing_access(chat_id, tg_user_id, payment_id, ctx)
+    if row['finalized_at']:
+        await send_existing_access(chat_id,tg_user_id,payment_id,ctx)
         return
     try:
-        payment = await refresh_payment(payment_row)
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
-        logger.error("payment check failed payment_id=%s error_type=%s", payment_id, type(exc).__name__)
-        await render_screen(chat_id, tg_user_id, ctx, text="Не получилось проверить платёж. Попробуй ещё раз через минуту.",
-                            reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url"), retry=True))
-        return
-    if payment["status"] != "succeeded":
-        if payment["status"] == "canceled":
-            await render_screen(chat_id, tg_user_id, ctx, text="Этот платёж отменён. Можно создать новый счёт.",
-                                reply_markup=next_keyboard("user:buy", "Поехали →"))
+        payment=await refresh_payment(row)
+        if payment['status']=='succeeded':
+            result=await billing.finalize(row)
+            if not result.get('ok'):
+                raise ValueError('Finalization failed')
+            await send_access_link(chat_id,tg_user_id,payment_id,result['access_until'],ctx)
+        elif payment['status']=='canceled':
+            await handle_auto_failure(row,ctx)
+            await render_screen(chat_id,tg_user_id,ctx,text='Этот платёж отменён. Можно выбрать способ оплаты заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
         else:
-            await render_screen(chat_id, tg_user_id, ctx, text=texts.PAYMENT_PENDING,
-                                reply_markup=payment_keyboard(payment_id, payment_row.get("confirmation_url"), retry=True))
-        return
-    tariff = PAYMENT_PLANS.get(payment_row["plan_id"])
-    if not tariff:
-        await render_screen(chat_id, tg_user_id, ctx, text="Неизвестный план платежа. Напиши администратору.")
-        return
-    # Compare to the immutable local binding, so pre-rebrand invoices still finalize.
-    metadata = json.loads(payment_row["metadata_json"])
-    result = await db.finalize_payment_once(payment_id, tg_user_id, metadata["project_key"],
-                                            "channel_access", tariff.code, tariff.days)
-    if not result.get("ok"):
-        logger.error("payment finalize failed payment_id=%s error=%s", payment_id, result.get("error"))
-        await render_screen(chat_id, tg_user_id, ctx, text="Платёж не прошёл внутреннюю проверку. Напиши администратору.")
-        return
-    await send_access_link(chat_id, tg_user_id, payment_id, result["access_until"], ctx,
-                           already_finalized=result.get("already_finalized", False))
+            await render_screen(chat_id,tg_user_id,ctx,text=texts.PAYMENT_PENDING,reply_markup=payment_keyboard(payment_id,row['confirmation_url'],retry=True,amount_rub=row['amount_rub']))
+    except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+        logger.warning('payment check deferred payment_id=%s',payment_id)
+        await render_screen(chat_id,tg_user_id,ctx,text='Подтверждение пока недоступно. Я продолжу проверку; повторно оплачивать не нужно.',reply_markup=payment_keyboard(payment_id,row['confirmation_url'],retry=True,amount_rub=row['amount_rub']))
 
 
 async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
@@ -417,7 +459,7 @@ async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) ->
     invite = await ctx.bot.create_chat_invite_link(
         chat_id=CHANNEL_ID,
         name=f"access_{tg_user_id}_{int(datetime.now().timestamp())}",
-        member_limit=1,
+        creates_join_request=True,
         expire_date=expire_at,
     )
     logger.info("created invite link user_id=%s channel_id=%s expire_at=%s", tg_user_id, CHANNEL_ID, expire_at.isoformat())
@@ -428,25 +470,36 @@ async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None
                            ctx: ContextTypes.DEFAULT_TYPE, already_finalized: bool = False) -> None:
     existing = await db.get_invite_link_by_payment(payment_id) if payment_id else None
     try:
-        if existing and not existing["used"] and parse_dt(existing["expire_at"]) and parse_dt(existing["expire_at"]) > datetime.now(timezone.utc):
+        if existing and existing.get('requires_approval') and not existing["used"] and parse_dt(existing["expire_at"]) and parse_dt(existing["expire_at"]) > datetime.now(timezone.utc):
             invite_link = existing["invite_link"]
         else:
             # Retire still-valid links before replacing one; never extend access here.
             for row in await db.list_open_invites(tg_user_id):
-                await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, row["invite_link"])
+                expires=parse_dt(row["expire_at"])
+                if not expires or expires>db.utcnow():
+                    await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, row["invite_link"])
                 await db.mark_invite_used(row["invite_link"])
             await ctx.bot.unban_chat_member(CHANNEL_ID, tg_user_id, only_if_banned=True)
             invite_link, expire_at = await create_invite_link(tg_user_id, ctx)
             await db.save_invite_link(tg_user_id, invite_link, payment_id=payment_id, expire_at=expire_at)
+        paid = await db.get_payment(payment_id) if payment_id else None
+        message = await content('PAYMENT_SUCCEEDED',date=format_dt(access_until)) if paid else f'Доступ открыт до {format_dt(access_until)}. Нажми кнопку и отправь заявку — бот подтвердит вход для твоего аккаунта.'
+        contract = await db.get_renewal(tg_user_id)
+        if contract and contract['enabled'] and await auto_available():
+            message += f"\n\nАвтопродление включено: {contract['amount_rub']} ₽ / {contract['days']} дней. Отключение — /cancel_subscription."
+        elif contract and contract.get('disabled_reason')=='method_not_saved':
+            message += '\n\nСпособ оплаты не сохранился: автопродление не включено. Перед окончанием пришлю напоминание.'
         await render_screen(chat_id, tg_user_id, ctx,
-                            text=texts.PAYMENT_SUCCEEDED.format(date=format_dt(access_until)),
+                            text=message,
                             reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite_link)]]))
         # Keep the entry button available in history even if /start is called before joining.
         await db.clear_current_message(tg_user_id)
+        if paid:
+            await db.mark_access_notified(payment_id)
     except TelegramError as exc:
         logger.error("invite delivery failed user_id=%s channel_id=%s error_type=%s", tg_user_id, CHANNEL_ID, type(exc).__name__)
         await render_screen(chat_id, tg_user_id, ctx,
-                            text=f"Оплата сохранена. Доступ активен до {format_dt(access_until)}. Не удалось выдать ссылку. Попробуй проверить оплату ещё раз или напиши администратору.",
+                                text=f"Доступ сохранён до {format_dt(access_until)}. Не удалось выдать ссылку. Повтори получение ссылки или открой /paysupport.",
                             reply_markup=next_keyboard(f"user:check_payment:{payment_id}", "✅ Повторить выдачу ссылки") if payment_id else None)
 
 
@@ -460,60 +513,93 @@ async def send_existing_access(chat_id: int, tg_user_id: int, payment_id: str | 
 
 
 async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ctx.bot.send_message(tg_user_id, texts.RENEWAL_NOTICE.format(date=format_dt(access_until)),
-                               reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:buy", "Продолжить с нами →")))
+    stats=await db.activity_summary(tg_user_id)
+    activity=activity_phrase(stats)
+    if stats['messages']:
+        activity='За последние 30 дней в нашей группе:\n'+activity+'\nСпасибо, что участвуешь!'
+    contract=await db.get_renewal(tg_user_id)
+    if contract and contract['enabled'] and await auto_available():
+        due=parse_dt(access_until)-timedelta(days=1)
+        text=f"Доступ к «Креативному мозгу» действует до {format_dt(access_until)}.\n\n{activity}\n\nАвтопродление: {contract['amount_rub']} ₽ за {contract['days']} дней. Списание запланировано на {format_dt(due.isoformat())}, но не раньше чем через 12 часов после этого предупреждения. При отказе пришлю кнопку ручной оплаты."
+        rows=[[Btn('Отключить автопродление',callback_data='user:auto_off')],[Btn('Мой доступ',callback_data='user:status')]]
+    else:
+        text=await content('RENEWAL_NOTICE',date=format_dt(access_until),activity=activity)
+        rows=[[Btn('Продолжить с нами →',callback_data='user:buy')]]
+    await ctx.bot.send_message(tg_user_id,text,reply_markup=with_admin_menu(tg_user_id,Mk(rows)))
+    if contract and contract['enabled'] and await auto_available():
+        await db.mark_auto_warning(tg_user_id,access_until)
 
 
 async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ctx.bot.send_message(tg_user_id, texts.EXPIRED,
-                               reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:buy", "Вернуться в канал →")))
+    await ctx.bot.send_message(tg_user_id,await content('EXPIRED'),reply_markup=with_admin_menu(tg_user_id,next_keyboard('user:buy','Вернуться в канал →')))
 
 
 async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    for sub in await db.list_subscriptions_due_for_renewal_notice(now_iso(), days_before=3):
-        tg_user_id = int(sub["tg_user_id"])
-        async with user_lock(tg_user_id):
-            current = await db.get_subscription(tg_user_id)
-            until = active_subscription_until(current)
-            if (not until or current["renewal_notice_sent_at"]
-                    or parse_dt(until) > datetime.now(timezone.utc) + timedelta(days=3)):
+    days=int(await db.get_setting('reminder_days','3'))
+    for sub in await db.list_subscriptions_due_for_renewal_notice(now_iso(),days_before=days):
+        uid=sub['tg_user_id']
+        async with user_lock(uid):
+            current=await db.get_subscription(uid)
+            until=active_subscription_until(current)
+            if not until or current['renewal_notice_sent_at'] or parse_dt(until)>db.utcnow()+timedelta(days=days):
+                continue
+            key='renewal:'+str(uid)+':'+until
+            if not await db.claim_notification(key,uid):
                 continue
             try:
-                await send_subscription_renewal_notice(tg_user_id, until, ctx)
-                await db.mark_renewal_notice_sent(tg_user_id)
+                await send_subscription_renewal_notice(uid,until,ctx)
+                await db.mark_renewal_notice_sent(uid)
+                await db.mark_notification_sent(key)
             except TelegramError:
-                logger.warning("renewal notification failed user_id=%s", tg_user_id)
+                # An uncertain warning must not authorize an unseen automatic charge.
+                logger.warning('renewal warning unconfirmed user_id=%s',uid)
 
 
 async def expire_subscriptions_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for sub in await db.list_expired_subscriptions(now_iso()):
-        tg_user_id = int(sub["tg_user_id"])
-        async with user_lock(tg_user_id):
-            current = await db.get_subscription(tg_user_id)
-            if not current or current["status"] != "active" or active_subscription_until(current):
+        uid=sub['tg_user_id']
+        async with user_lock(uid):
+            current=await db.get_subscription(uid)
+            if not current or current['status']!='active' or active_subscription_until(current):
                 continue
-            if not await remove_user_from_channel(ctx, tg_user_id, reason="expired"):
-                continue  # Retry next job run if permissions or Telegram are unavailable.
-            await db.mark_subscription_expired(tg_user_id)
-            await db.record_event(tg_user_id, "expired", {"access_until": current["access_until"]},
-                                  event_key=f"expired:{tg_user_id}:{current['access_until']}")
+            if await db.list_unfinalized_payments(uid) or await db.pending_checkout(uid):
+                known=await reconcile_user(uid,ctx)
+                current=await db.get_subscription(uid)
+                if active_subscription_until(current):
+                    continue
+                if not known and parse_dt(current['access_until'])>db.utcnow()-timedelta(hours=24):
+                    continue  # Bounded grace while the already initiated payment is unresolved.
+            if not await remove_user_from_channel(ctx,uid,reason='expired'):
+                continue
+            await db.mark_subscription_expired(uid)
+            await db.disable_renewal(uid,'expired')
+            await db.record_event(uid,'expired',{'access_until':current['access_until']},event_key=f"expired:{uid}:{current['access_until']}")
             try:
-                await send_subscription_expired_notice(tg_user_id, ctx)
+                await send_subscription_expired_notice(uid,ctx)
             except TelegramError:
-                logger.warning("expiration notification failed user_id=%s", tg_user_id)
+                logger.warning('expiration notification failed user_id=%s',uid)
 
 
 async def remove_user_from_channel(ctx: ContextTypes.DEFAULT_TYPE, tg_user_id: int, reason: str) -> bool:
+    if is_admin(tg_user_id):
+        logger.warning('configured administrator removal blocked user_id=%s',tg_user_id)
+        return False
+    links_ok=True
+    for row in await db.list_open_invites(tg_user_id):
+        try:
+            expires=parse_dt(row['expire_at'])
+            if not expires or expires>db.utcnow():
+                await ctx.bot.revoke_chat_invite_link(CHANNEL_ID,row['invite_link'])
+            await db.mark_invite_used(row['invite_link'])
+        except TelegramError:
+            links_ok=False
+            logger.warning('invite revocation deferred user_id=%s',tg_user_id)
     try:
-        for row in await db.list_open_invites(tg_user_id):
-            await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, row["invite_link"])
-            await db.mark_invite_used(row["invite_link"])
-        await ctx.bot.ban_chat_member(CHANNEL_ID, tg_user_id)
-        await ctx.bot.unban_chat_member(CHANNEL_ID, tg_user_id, only_if_banned=True)
-        logger.info("removed user_id=%s channel_id=%s reason=%s", tg_user_id, CHANNEL_ID, reason)
-        return True
-    except TelegramError as exc:
-        logger.error("channel removal failed user_id=%s reason=%s error_type=%s", tg_user_id, reason, type(exc).__name__)
+        await ctx.bot.ban_chat_member(CHANNEL_ID,tg_user_id)
+        # Keep the ban until a verified new purchase/grant; otherwise old links allow re-entry.
+        return links_ok
+    except TelegramError:
+        logger.warning('channel removal deferred user_id=%s reason=%s',tg_user_id,reason)
         return False
 
 
@@ -526,11 +612,15 @@ def is_admin(tg_user_id: int) -> bool:
 def admin_menu_keyboard() -> Mk:
     return Mk([
         [Btn("🎬 Лид-магнит", callback_data="admin:lead_magnet")],
+        [Btn("💰 Тарифы и сроки", callback_data="admin:tariffs")],
+        [Btn("✍️ Тексты бота", callback_data="admin:texts")],
+        [Btn("⚙️ Напоминания и настройки", callback_data="admin:settings")],
         [Btn("📄 Оферта", callback_data="admin:offer")],
         [Btn("🎁 Выдать доступ", callback_data="admin:grant")],
         [Btn("🚫 Отозвать доступ", callback_data="admin:revoke")],
         [Btn("📊 Воронка / статистика", callback_data="admin:stats")],
         [Btn("👤 Посмотреть путь пользователя", callback_data="admin:user_path")],
+        [Btn("🔎 Проверить подключение", callback_data="admin:diagnostics")],
     ])
 
 
@@ -565,6 +655,8 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await remember_user(query.from_user)
     data = query.data or ""
     await db.clear_admin_state(tg_user_id)
+    if await extended_admin_route(data,chat_id,tg_user_id,ctx):
+        return
     if data == "admin:offer":
         await db.set_admin_state(tg_user_id, "offer_url")
         await render_screen(chat_id, tg_user_id, ctx,
@@ -574,7 +666,7 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_admin_lead_magnet(chat_id, tg_user_id, ctx)
     elif data in {"admin:lead_set", "admin:intro_set"}:
         await db.set_admin_state(tg_user_id, "lead_magnet_url")
-        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте YouTube URL урока: https://youtube.com/watch?v=… или https://youtu.be/…",
+        await render_screen(chat_id, tg_user_id, ctx, text="Отправьте публичную ссылку на урок (https://…). Бот покажет её отдельным сообщением после приветствия.",
                             reply_markup=admin_cancel_keyboard())
     elif data in {"admin:lead_clear", "admin:intro_clear"}:
         await db.clear_lead_magnet_url()
@@ -592,44 +684,38 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_admin_menu(chat_id, tg_user_id, ctx)
 
 
-async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if chat_id != tg_user_id or not is_admin(tg_user_id):
+async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, days=30) -> None:
+    if chat_id!=tg_user_id or not is_admin(tg_user_id):
         return
-    s = await db.funnel_stats()
-    events = s["events"]
-    def count(event, field="users"):
-        return events.get(event, {}).get(field, 0)
-    def conversion(event):
-        denominator = count(event)
-        return f"{100 * s['conversions'][event] / denominator:.1f}%" if denominator else "0.0%"
-    lines = [
-        "📊 Воронка «Креативный мозг»",
-        f"Всего Start: {count('start', 'total')} (людей: {count('start')})",
-        f"Получили лид-магнит: {count('lead_magnet_sent')}",
-        f"Открыли оффер: {count('product_opened')}",
-        f"Создали платёж: {count('payment_created')} чел. / {count('payment_created', 'total')} счетов",
-        f"Успешные оплаты: {s['paid_count']} (в новой воронке: {count('payment_succeeded', 'total')})",
-        f"Start → Payment: {conversion('start')}",
-        f"Product open → Payment: {conversion('product_opened')}",
-        f"Активных подписок: {s['active_subscriptions_count']}",
-        f"Общая выручка: {s['revenue_rub']} ₽",
-        f"Всего пользователей: {s['users_count']}",
-        f"Приняли оферту (включая историю): {s['accepted_offer_count']}",
-        "",
-        "Source: Start / Paid (уникальные люди, первый источник)",
-    ]
-    lines.extend(f"{row['source']}: {row['starts']} / {row['paid']}" for row in s["sources"])
-    # Paginate long source lists without exceeding Telegram's 4096-character limit.
-    pages, page = [], ""
+    s=await db.funnel_stats()
+    f=await db.funnel_breakdown(days)
+    activity=await db.activity_summary()
+    labels={'start':'Start: знакомство','lead_magnet_sent':'Получили ссылку урока','product_opened':'Открыли программу',
+            'tariffs_opened':'Посмотрели тарифы','buy_clicked':'Начали оформление','offer_accepted':'Приняли условия',
+            'payment_created':'Получили счёт','payment_succeeded':'Оплатили','channel_joined':'Вступили в канал'}
+    paid=f['reached']['payment_succeeded']
+    conversion=100*paid/f['cohort'] if f['cohort'] else 0
+    lines=['📊 Воронка «Креативный мозг»',f"Первые запуски: {'за '+str(days)+' дней' if days else 'за всё время'} — {f['cohort']} чел.",
+           f'От первого запуска до оплаты: {conversion:.1f}%',
+           'Этап: дошли / пока не пошли дальше']
+    lines += [f"{label}: {f['reached'][event]} / {f['stopped'][event]}" for event,label in labels.items()]
+    lines += ['','Отправка ссылки ≠ просмотр видео. Последний этап показывает максимум достигнутого; причина остановки не угадывается.',
+              f"\nАктивных подписок: {s['active_subscriptions_count']}",f"Оплат за всё время: {s['paid_count']}",
+              f"Выручка за всё время: {s['revenue_rub']} ₽",f"Старых запросов с неизвестным результатом: {f['unknown_payments']}",
+              f"\nГруппа за 30 дней: {activity['people']} участников · {activity['messages']} сообщений · {activity['files']} файлов/медиа",
+              '\nПервый источник: люди / покупатели (всё время)']
+    lines += [f"{r['source']}: {r['starts']} / {r['paid']}" for r in s['sources']]
+    pages=[]; page=''
     for line in lines:
-        if len(page) + len(line) + 1 > 3500:
-            pages.append(page)
-            page = ""
-        page += line + "\n"
+        if len(page)+len(line)>3500:
+            pages.append(page); page=''
+        page+=line+'\n'
     pages.append(page)
     for page in pages[:-1]:
-        await ctx.bot.send_message(chat_id, page, reply_markup=with_admin_menu(tg_user_id))
-    await render_screen(chat_id, tg_user_id, ctx, text=pages[-1], reply_markup=admin_cancel_keyboard())
+        await ctx.bot.send_message(chat_id,page)
+    rows=[[Btn('7 дней',callback_data='admin:stats:7'),Btn('30 дней',callback_data='admin:stats:30'),Btn('Всё время',callback_data='admin:stats:0')],
+          [Btn('Назад',callback_data='admin:menu')]]
+    await render_screen(chat_id,tg_user_id,ctx,text=pages[-1],reply_markup=Mk(rows))
 
 
 async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -641,11 +727,13 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return False
     await remember_user(user)
     name, raw = state["state"], (message.text or "").strip()
+    if await extended_admin_input(name,raw,state,update,ctx):
+        return True
     if name in {"lead_magnet_url", "intro_video", "offer_url"}:
-        valid = valid_http_url(raw) if name == "offer_url" else valid_youtube_url(raw)
+        valid = valid_http_url(raw)
         if not valid:
             await render_screen(chat.id, user.id, ctx,
-                                text="Нужна корректная http/https ссылка." if name == "offer_url" else "Нужна ссылка на видео YouTube (youtube.com или youtu.be).",
+                                text="Нужна корректная публичная http/https ссылка.",
                                 reply_markup=admin_cancel_keyboard())
             return True
         if name == "offer_url":
@@ -660,7 +748,7 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await show_admin_lead_magnet(chat.id, user.id, ctx)
         return True
     if name == "user_path":
-        if not raw.isdigit() or int(raw) <= 0:
+        if not raw.isdigit() or not 0 < int(raw) < 2**63:
             await render_screen(chat.id, user.id, ctx, text="telegram_id должен быть положительным числом.", reply_markup=admin_cancel_keyboard())
             return True
         rows = await db.get_user_path(int(raw))
@@ -668,6 +756,10 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         lines += [f"{format_dt(row['created_at'])} · {row['event_name']} · {row['source']}" for row in rows]
         if not rows:
             lines.append("Событий пока нет.")
+        activity = await db.activity_summary(int(raw))
+        lines.append('\nАктивность за 30 дней:\n'+activity_phrase(activity))
+        renewal = await db.get_renewal(int(raw))
+        lines.append('Автопродление: '+('включено' if renewal and renewal['enabled'] else 'выключено'))
         await db.clear_admin_state(user.id)
         await render_screen(chat.id, user.id, ctx, text="\n".join(lines), reply_markup=admin_cancel_keyboard())
         return True
@@ -678,7 +770,7 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 raise ValueError
             target = int(parts[0])
             days = int(parts[1]) if name == "grant" else 0
-            if target <= 0 or (name == "grant" and not 1 <= days <= 36500):
+            if not 0 < target < 2**63 or (name == "grant" and not 1 <= days <= 36500):
                 raise ValueError
         except ValueError:
             await render_screen(chat.id, user.id, ctx,
@@ -699,6 +791,7 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     note += "\nНе удалось доставить ссылку. Проверьте права бота и доступность личного чата; срок уже записан."
                     logger.warning("admin grant delivery failed user_id=%s", target)
             else:
+                await db.disable_renewal(target,'admin_revoke')
                 if not await remove_user_from_channel(ctx, target, reason="revoke"):
                     await render_screen(chat.id, user.id, ctx, text="Не удалось удалить пользователя из канала. Проверьте права бота и повторите telegram_id.", reply_markup=admin_cancel_keyboard())
                     return True
@@ -772,7 +865,7 @@ async def user_lock(tg_user_id: int):
 
 
 def valid_http_url(url: str | None) -> bool:
-    if not isinstance(url, str) or not url or len(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
+    if not isinstance(url, str) or not url or telegram_length(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
         return False
     try:
         parsed = urlsplit(url)
@@ -781,6 +874,10 @@ def valid_http_url(url: str | None) -> bool:
                     and (parsed.port is None or 1 <= parsed.port <= 65535))
     except ValueError:
         return False
+
+
+def telegram_length(value: str) -> int:
+    return len(value.encode('utf-16-le')) // 2
 
 
 def valid_youtube_url(url: str | None) -> bool:
@@ -803,71 +900,43 @@ def valid_youtube_url(url: str | None) -> bool:
 
 async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE,
                            welcome: bool = True, track: bool = True) -> None:
-    url = await db.get_lead_magnet_url()
-    if not valid_youtube_url(url):
-        await ctx.bot.send_message(chat_id, "Урок скоро появится здесь. А пока можно заглянуть в «Креативный мозг» 🧠",
-                                   reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:product", "Что внутри? →")))
+    if welcome:
+        await ctx.bot.send_message(chat_id,await content('WELCOME'),disable_web_page_preview=True)
+    url=await db.get_lead_magnet_url()
+    if not valid_http_url(url):
+        await ctx.bot.send_message(chat_id,'Урок пока готовится. Когда ссылка появится, здесь можно будет открыть его бесплатно.',reply_markup=with_admin_menu(tg_user_id,next_keyboard('user:product','Что будет дальше? →')))
         return
-    text = (texts.WELCOME if welcome else texts.LEAD_CAPTION + "\n\n👇 Сам урок:") + "\n" + url
-    label = "🧠 Что внутри «Креативного мозга»?"
-    kwargs = {"chat_id": chat_id, "text": text,
-              "reply_markup": with_admin_menu(tg_user_id, next_keyboard("user:product", label))}
+    kwargs={'chat_id':chat_id,'text':await content('LEAD_CAPTION')+'\n\n'+url,
+            'reply_markup':with_admin_menu(tg_user_id,next_keyboard('user:product','Хочу продолжить →'))}
     if LinkPreviewOptions is not None:
-        kwargs["link_preview_options"] = LinkPreviewOptions(
-            url=url, is_disabled=False, prefer_large_media=True, show_above_text=True)
+        kwargs['link_preview_options']=LinkPreviewOptions(url=url,is_disabled=False,prefer_large_media=True,show_above_text=False)
     else:
-        kwargs["disable_web_page_preview"] = False
+        kwargs['disable_web_page_preview']=False
     try:
         await ctx.bot.send_message(**kwargs)
     except BadRequest:
-        if "link_preview_options" not in kwargs:
+        if 'link_preview_options' not in kwargs:
             raise
-        kwargs.pop("link_preview_options")
-        await ctx.bot.send_message(**kwargs, disable_web_page_preview=False)
-    # Never store the lesson as an editable/deletable current screen.
+        kwargs.pop('link_preview_options')
+        await ctx.bot.send_message(**kwargs,disable_web_page_preview=False)
     await db.clear_current_message(tg_user_id)
     if track:
-        await db.record_event(tg_user_id, "lead_magnet_sent")
+        await db.record_event(tg_user_id,'lead_magnet_sent')
 
 
 async def show_product(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(chat_id, tg_user_id, ctx, text=texts.PRODUCT,
-                        reply_markup=next_keyboard("user:buy", "Поехали →"))
-    await db.record_event(tg_user_id, "product_opened")
+    await render_screen(chat_id,tg_user_id,ctx,text=await content('PRODUCT'),reply_markup=Mk([
+        [Btn('Посмотреть доступ →',callback_data='user:tariffs')],
+        [Btn('Пример под мою задачу',callback_data='user:goal')]]))
+    await db.record_event(tg_user_id,'product_opened')
 
 
 async def buy_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await db.has_accepted_offer(tg_user_id, OFFER_VERSION):
-        await start_offer_again(chat_id, tg_user_id, ctx)
-    else:
-        await create_payment_and_render(chat_id, tg_user_id, CURRENT_TARIFF, ctx)
+    await start_offer_again(chat_id,tg_user_id,ctx)
 
 
 async def refresh_payment(row: dict) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(f"{YOOKASSA_API_URL}/{row['payment_id']}",
-                                    auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY))
-        response.raise_for_status()
-        payment = response.json()
-    expected = json.loads(row["metadata_json"])
-    metadata = payment.get("metadata") or {}
-    amount = payment.get("amount") or {}
-    if (payment.get("id") != row["payment_id"] or not expected.get("project_key")
-            or metadata.get("project_key") != expected["project_key"]
-            or str(metadata.get("user_id")) != str(row["tg_user_id"])
-            or metadata.get("kind") != "channel_access"
-            or metadata.get("tariff_code") != row["plan_id"]
-            or metadata.get("days") != expected.get("days")
-            or amount.get("currency") != "RUB"
-            or Decimal(str(amount.get("value"))) != Decimal(str(row["amount_rub"]))):
-        raise ValueError("Payment identity, metadata or amount mismatch")
-    status = payment.get("status")
-    if status not in {"pending", "waiting_for_capture", "succeeded", "canceled"}:
-        raise ValueError("Unknown payment status")
-    if status == "succeeded" and payment.get("paid") is not True:
-        raise ValueError("Succeeded payment is not paid")
-    await db.update_payment_status(row["payment_id"], status, payment)
-    return payment
+    return await billing.refresh_payment(row,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
 
 
 def admin_cancel_keyboard() -> Mk:
@@ -883,31 +952,26 @@ async def show_admin_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextType
     if url:
         rows.append([Btn("🗑 Удалить ссылку", callback_data="admin:lead_clear")])
     rows.append([Btn("◀️ В админ-панель", callback_data="admin:menu")])
-    await render_screen(chat_id, tg_user_id, ctx, text=f"🎬 Лид-магнит\n\nТекущая YouTube-ссылка:\n{url or 'не задана'}",
+    await render_screen(chat_id, tg_user_id, ctx, text=f"🎬 Лид-магнит\n\nТекущая ссылка:\n{url or 'не задана'}",
                         reply_markup=Mk(rows))
 
 
 async def followup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not FOLLOWUP_ENABLED:
+    if await db.get_setting('followup_enabled',str(int(FOLLOWUP_ENABLED)))!='1':
         return
-    for tg_user_id in await db.followup_candidates():
-        async with user_lock(tg_user_id):
-            # A buyer may have paid at YooKassa without pressing Check in Telegram.
-            try:
-                for pending in await db.list_unfinalized_payments(tg_user_id):
-                    await refresh_payment(pending)
-            except (httpx.HTTPError, ValueError, TypeError, AttributeError, ArithmeticError):
-                logger.warning("followup skipped: payment state unavailable user_id=%s", tg_user_id)
+    for uid in await db.followup_candidates():
+        async with user_lock(uid):
+            if not await reconcile_user(uid,ctx):
                 continue
-            if not await db.claim_followup(tg_user_id):
+            if not await db.claim_followup(uid):
                 continue
             try:
-                await ctx.bot.send_message(tg_user_id, texts.FOLLOWUP,
-                                           reply_markup=with_admin_menu(tg_user_id, next_keyboard("user:product", "Посмотреть «Креативный мозг»")))
-                await db.mark_followup_sent(tg_user_id)
+                await ctx.bot.send_message(uid,await content('FOLLOWUP'),reply_markup=with_admin_menu(uid,Mk([
+                    [Btn('Посмотреть программу →',callback_data='user:product')],
+                    [Btn('Не напоминать об уроке',callback_data='user:quiet')]])))
+                await db.mark_followup_sent(uid)
             except TelegramError:
-                # An ambiguous timeout must not cause a second marketing message.
-                logger.warning("followup delivery unconfirmed; no retry user_id=%s", tg_user_id)
+                logger.warning('followup delivery unconfirmed; no retry user_id=%s',uid)
 
 
 async def channel_member_updated(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -924,7 +988,9 @@ async def channel_member_updated(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         valid = target == invite["tg_user_id"] and active_subscription_until(await db.get_subscription(target))
         if not valid:
             await remove_user_from_channel(ctx, target, reason="invalid_invite")
-        # member_limit=1 limits concurrent members; revocation enforces one entry.
+        else:
+            await db.record_event(target,'channel_joined',event_key='join:'+invite['invite_link'])
+        # Also retire legacy links created before join-request approval was used.
         try:
             await ctx.bot.revoke_chat_invite_link(CHANNEL_ID, invite["invite_link"])
             await db.mark_invite_used(invite["invite_link"])
@@ -943,21 +1009,502 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+SETTING_LABELS = {
+    'reminder_days':'За сколько дней напоминать', 'activity_chat_id':'Группа для учёта активности',
+    'support_url':'Ссылка на поддержку', 'onboarding_url':'Ссылка на первый урок в канале',
+}
+
+
+async def extended_admin_route(data,chat_id,uid,ctx):
+    if data=='admin:tariffs':
+        tariffs=await db.list_tariffs(include_disabled=True)
+        rows=[[Btn(('🟢 ' if t['enabled'] else '⚪ ')+f"{t['title']}: {t['amount_rub']} ₽ / {t['days']} дн.",callback_data='admin:tariff:'+t['code'])] for t in tariffs]
+        rows += [[Btn('Добавить тариф',callback_data='admin:tariff_new')],[Btn('Назад',callback_data='admin:menu')]]
+        await render_screen(chat_id,uid,ctx,text='Тарифы\n\nИзменения действуют для новых счетов. Выставленные счета сохраняют свою цену и срок. При изменении условий автопродление потребует нового выбора клиента.',reply_markup=Mk(rows))
+    elif data=='admin:tariff_new':
+        if len(await db.list_tariffs(include_disabled=True))>=20:
+            await render_screen(chat_id,uid,ctx,text='Доступно до 20 тарифов. Можно отредактировать или включить существующий.',reply_markup=admin_cancel_keyboard())
+            return True
+        await db.set_admin_state(uid,'tariff_new')
+        await render_screen(chat_id,uid,ctx,text='Отправьте три строки:\nНазвание тарифа\nЦена в рублях\nКоличество дней\n\nНапример:\nТри месяца\n990\n90\n\nНовый тариф появится выключенным: его можно проверить и включить отдельно.',reply_markup=admin_cancel_keyboard())
+    elif data.startswith(('admin:tariff:','admin:tariff_toggle:','admin:tariff_edit:')):
+        parts=data.split(':')
+        code=parts[2]
+        tariff=next((t for t in await db.list_tariffs(True) if t['code']==code),None)
+        if not tariff:
+            await extended_admin_route('admin:tariffs',chat_id,uid,ctx)
+            return True
+        if parts[1]=='tariff_toggle':
+            await db.save_tariff(code,tariff['title'],tariff['amount_rub'],tariff['days'],not tariff['enabled'],uid)
+            tariff['enabled']=not tariff['enabled']
+        if parts[1]=='tariff_edit':
+            field=parts[3] if len(parts)==4 else ''
+            if field not in {'title','amount_rub','days'}:
+                return True
+            await db.set_admin_state(uid,'tariff_edit',{'code':code,'field':field})
+            await render_screen(chat_id,uid,ctx,text=f"Текущее значение: {tariff[field]}\n\nОтправьте новое значение.",reply_markup=admin_cancel_keyboard())
+            return True
+        rows=[[Btn(label,callback_data=f'admin:tariff_edit:{code}:{field}')] for field,label in [('title','Название'),('amount_rub','Цена'),('days','Срок')]]
+        rows += [[Btn('Выключить' if tariff['enabled'] else 'Включить',callback_data='admin:tariff_toggle:'+code)],[Btn('Все тарифы',callback_data='admin:tariffs')]]
+        await render_screen(chat_id,uid,ctx,text=f"{tariff['title']}\n{tariff['amount_rub']} ₽ · {tariff['days']} дней\n{'Доступен для покупки' if tariff['enabled'] else 'Скрыт от покупателей'}",reply_markup=Mk(rows))
+    elif data=='admin:texts':
+        rows=[[Btn(label,callback_data='admin:text:'+key)] for key,label in texts.EDITABLE.items()]
+        rows.append([Btn('Назад',callback_data='admin:menu')])
+        await render_screen(chat_id,uid,ctx,text='Тексты бота\n\nИзменения увидят следующие пользователи. Цена, срок и обязательное описание способа продления добавляются отдельно.',reply_markup=Mk(rows))
+    elif data.startswith('admin:text:'):
+        key=data.split(':',2)[2]
+        if key not in texts.EDITABLE:
+            return True
+        await db.set_admin_state(uid,'content',{'key':key})
+        current=await db.get_setting('text:'+key,getattr(texts,key))
+        await render_screen(chat_id,uid,ctx,text=f'{texts.EDITABLE[key]}\n\n{current}\n\nОтправьте новый текст (до 2000 знаков; эмодзи могут занимать два). Сохраните поля в фигурных скобках, если они есть.',reply_markup=Mk([[Btn('Вернуть исходный текст',callback_data='admin:text_reset:'+key)],[Btn('Отмена',callback_data='admin:texts')]]))
+    elif data.startswith('admin:text_reset:'):
+        key=data.split(':',2)[2]
+        if key in texts.EDITABLE:
+            await db.set_admin_setting('text:'+key,getattr(texts,key),uid)
+            await extended_admin_route('admin:texts',chat_id,uid,ctx)
+    elif data=='admin:settings':
+        auto=await auto_available()
+        follow=await db.get_setting('followup_enabled',str(int(FOLLOWUP_ENABLED)))=='1'
+        rows=[[Btn('Автопродление: '+('включено' if auto else 'выключено'),callback_data='admin:toggle:auto_renew_enabled')],
+              [Btn('Напоминание об уроке: '+('включено' if follow else 'выключено'),callback_data='admin:toggle:followup_enabled')]]
+        rows += [[Btn(label,callback_data='admin:setting:'+key)] for key,label in SETTING_LABELS.items()]
+        rows.append([Btn('Назад',callback_data='admin:menu')])
+        await render_screen(chat_id,uid,ctx,text='Настройки\n\nАвтопродление предлагается покупателю отдельно. Оно работает только после его согласия, успешной оплаты и подтверждения сохранённого способа оплаты от ЮKassa.\n\nАктивность: только сообщения и файлы в указанной группе, без сохранения их содержания.',reply_markup=Mk(rows))
+    elif data.startswith('admin:toggle:'):
+        key=data.split(':',2)[2]
+        if key in {'auto_renew_enabled','followup_enabled'}:
+            current=await db.get_setting(key,'0' if key=='auto_renew_enabled' else str(int(FOLLOWUP_ENABLED)))
+            await db.set_admin_setting(key,'0' if current=='1' else '1',uid)
+        await extended_admin_route('admin:settings',chat_id,uid,ctx)
+    elif data.startswith('admin:setting:'):
+        key=data.split(':',2)[2]
+        if key not in SETTING_LABELS:
+            return True
+        await db.set_admin_state(uid,'setting',{'key':key})
+        prompt={'reminder_days':'Целое число от 2 до 14.',
+                'activity_chat_id':'Числовой ID группы, начинающийся с минуса. 0 отключает учёт. Добавьте бота администратором группы; старые сообщения недоступны.',
+                'support_url':'Публичная https-ссылка на поддержку. Для удаления отправьте «удалить».',
+                'onboarding_url':'Ссылка на первый урок или навигацию внутри канала. Для удаления отправьте «удалить».'}[key]
+        await render_screen(chat_id,uid,ctx,text=SETTING_LABELS[key]+f"\nСейчас: {await db.get_setting(key,'не задано')}\n\n"+prompt,reply_markup=admin_cancel_keyboard())
+    elif data.startswith('admin:stats:'):
+        value=data.rsplit(':',1)[-1]
+        if value in {'7','30','0'}:
+            await show_stats(chat_id,uid,ctx,days=int(value))
+    elif data=='admin:diagnostics':
+        lines=['Проверка подключения',f'Канал: {CHANNEL_ID}']
+        try:
+            me=await ctx.bot.get_me()
+            member=await ctx.bot.get_chat_member(CHANNEL_ID,me.id)
+            lines.append('Бот — администратор: '+('да' if member.status in {'administrator','creator'} else 'нет'))
+            lines.append('Приглашения: '+('да' if getattr(member,'can_invite_users',False) else 'нет'))
+            lines.append('Удаление участников: '+('да' if getattr(member,'can_restrict_members',False) else 'нет'))
+            group=int(await db.get_setting('activity_chat_id','0'))
+            if group:
+                chat=await ctx.bot.get_chat(group)
+                group_member=await ctx.bot.get_chat_member(group,me.id)
+                lines.append('Группа доступна: '+str(chat.title))
+                lines.append('Учёт всех новых сообщений: '+('бот — администратор' if group_member.status in {'administrator','creator'} else 'проверьте режим приватности BotFather'))
+        except TelegramError:
+            lines.append('Telegram не подтвердил права. Проверьте ID и доступ бота.')
+        lines += ['Ключи ЮKassa: '+('заданы' if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY else 'не заданы'),
+                  'Возможность автоплатежей магазина: подтверждается только платёжным ответом или кабинетом ЮKassa. Проверка не списывает деньги.']
+        await render_screen(chat_id,uid,ctx,text='\n'.join(lines),reply_markup=admin_cancel_keyboard())
+    else:
+        return False
+    return True
+
+
+async def extended_admin_input(name,raw,state,update,ctx):
+    if name not in {'tariff_new','tariff_edit','content','setting'}:
+        return False
+    uid=update.effective_user.id
+    payload=state['payload']
+    next_page='admin:menu'
+    try:
+        if name=='tariff_new':
+            parts=[s.strip() for s in raw.splitlines() if s.strip()]
+            if len(parts)!=3 or len(await db.list_tariffs(True))>=20:
+                raise ValueError('Нужны три строки: название, цена в рублях, число дней. Доступно до 20 тарифов.')
+            code='plan_'+uuid.uuid4().hex[:12]
+            await db.save_tariff(code,parts[0],int(parts[1]),int(parts[2]),False,uid)
+            next_page='admin:tariff:'+code
+        elif name=='tariff_edit':
+            tariff=next((t for t in await db.list_tariffs(True) if t['code']==payload['code']),None)
+            if not tariff:
+                raise ValueError('Тариф не найден.')
+            field=payload['field']
+            if field not in {'title','amount_rub','days'}:
+                raise ValueError('Неизвестная настройка.')
+            tariff[field]=raw if field=='title' else int(raw)
+            await db.save_tariff(tariff['code'],tariff['title'],tariff['amount_rub'],tariff['days'],tariff['enabled'],uid)
+            next_page='admin:tariff:'+tariff['code']
+        elif name=='content':
+            key=payload['key']
+            if key not in texts.EDITABLE or not 1<=telegram_length(raw)<=2000:
+                raise ValueError('Нужен текст от 1 до 2000 знаков; эмодзи могут занимать два.')
+            allowed={f for _,f,_,_ in Formatter().parse(getattr(texts,key)) if f}
+            fields=set()
+            for _,field,spec,conversion in Formatter().parse(raw):
+                if field is not None:
+                    if field not in allowed or spec or conversion:
+                        raise ValueError('Допустимые поля: '+(', '.join(sorted(allowed)) or 'нет'))
+                    fields.add(field)
+            if fields!=allowed:
+                raise ValueError('Сохраните поля: '+', '.join(sorted(allowed)))
+            await db.set_admin_setting('text:'+key,raw,uid)
+            next_page='admin:texts'
+        else:
+            key=payload['key']
+            if key not in SETTING_LABELS:
+                raise ValueError('Неизвестная настройка.')
+            value=raw
+            if key=='reminder_days':
+                value=int(raw)
+                if not 2<=value<=14:
+                    raise ValueError('Введите число от 2 до 14.')
+            elif key=='activity_chat_id':
+                value=int(raw)
+                if not -(2**63)<value<=0:
+                    raise ValueError('Нужен отрицательный ID группы или 0.')
+            else:
+                value='' if raw.lower()=='удалить' else raw
+                if value and not valid_http_url(value):
+                    raise ValueError('Нужна публичная http/https ссылка.')
+            await db.set_admin_setting(key,value,uid)
+            next_page='admin:settings'
+    except (ValueError,TypeError) as exc:
+        await render_screen(uid,uid,ctx,text='Не сохранено. '+str(exc)+'\n\nПопробуйте ещё раз.',reply_markup=admin_cancel_keyboard())
+        return True
+    await db.clear_admin_state(uid)
+    await delete_incoming(update,ctx)
+    await extended_admin_route(next_page,uid,uid,ctx)
+    return True
+
+
+async def content(key, **values):
+    template = await db.get_setting('text:'+key,getattr(texts,key))
+    return template.format(**values)
+
+
+async def auto_available():
+    return await db.get_setting('auto_renew_enabled','0') == '1'
+
+
+async def selected_tariff(ctx):
+    rows = await db.list_tariffs()
+    code = ctx.user_data.get('selected_tariff')
+    row = next((r for r in rows if r['code']==code),None)
+    if row is None and len(rows)==1:
+        row=rows[0]
+    return Tariff(row['code'],row['title'],row['amount_rub'],row['days']) if row else None
+
+
+async def show_tariffs(chat_id,user_id,ctx):
+    tariffs=await db.list_tariffs()
+    rows=[[Btn(f"{t['title']} · {t['amount_rub']} ₽ / {t['days']} дн.",callback_data='user:choose:'+t['code'])] for t in tariffs]
+    rows.append([Btn('Назад к программе',callback_data='user:product')])
+    text='Выбери удобный срок доступа. При продлении оставшиеся дни сохраняются.' if tariffs else 'Новые покупки пока приостановлены. Бесплатный урок остаётся доступным.'
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=Mk(rows))
+    await db.record_event(user_id,'tariffs_opened')
+
+
+def payment_payload(user_id,tariff,*,auto_opt_in=False,method_id=None):
+    payload={
+        'amount':{'value':f'{tariff.amount_rub:.2f}','currency':'RUB'},'capture':True,
+        'description':f'Доступ к «Креативному мозгу»: {tariff.days} дней',
+        'metadata':{'project_key':PROJECT_KEY,'user_id':str(user_id),'kind':'channel_access',
+                    'tariff_code':tariff.code,'days':str(tariff.days)},
+    }
+    if method_id:
+        payload['payment_method_id']=method_id
+    else:
+        payload['confirmation']={'type':'redirect','return_url':YOOKASSA_RETURN_URL or (f'https://t.me/{BOT_USERNAME}' if BOT_USERNAME else 'https://t.me/')}
+        if auto_opt_in:
+            payload['save_payment_method']=True
+    return payload
+
+
+async def render_payment(chat_id,user_id,row,ctx):
+    if row['status']=='canceled':
+        await render_screen(chat_id,user_id,ctx,text='Счёт отменён. Выбери оплату заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
+        return
+    metadata=json.loads(row['metadata_json'])
+    con=await db.connection()
+    async with con.execute('SELECT auto_opt_in,cycle_until,title FROM checkout_requests WHERE payment_id=?',(row['payment_id'],)) as cur:
+        order=await cur.fetchone()
+    auto=bool(order and (order['auto_opt_in'] or order['cycle_until']))
+    text=await content('PAYMENT_CREATED')
+    text+=f"\n\n{order['title'] if order else 'Доступ в канал'}: {row['amount_rub']} ₽ / {metadata['days']} дней."
+    text+='\nВыбрано автопродление. Оно включится только после успешной оплаты и сохранения способа оплаты.' if auto else '\nРазовая покупка, без автоматических списаний.'
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=payment_keyboard(row['payment_id'],row['confirmation_url'],amount_rub=row['amount_rub']))
+
+
+async def handle_auto_failure(row,ctx):
+    con=await db.connection()
+    async with con.execute('SELECT * FROM checkout_requests WHERE payment_id=?',(row['payment_id'],)) as cur:
+        order=await cur.fetchone()
+    if not order or not order['cycle_until']:
+        return
+    await db.disable_renewal(row['tg_user_id'],'payment_canceled')
+    await db.record_event(row['tg_user_id'],'auto_failed',event_key='auto_failed:'+row['payment_id'])
+    key='auto_failed:'+row['payment_id']
+    if await db.claim_notification(key,row['tg_user_id']):
+        sub=await db.get_subscription(row['tg_user_id'])
+        text=f"Автопродление не прошло. Новых автоматических попыток не будет.\n\nДоступ оплачен до {format_dt(sub['access_until'])}. Можно продлить вручную удобным способом."
+        try:
+            await ctx.bot.send_message(row['tg_user_id'],text,reply_markup=next_keyboard('user:buy','Продлить вручную →'))
+            await db.mark_notification_sent(key)
+        except TelegramError:
+            logger.warning('auto failure notice unconfirmed user_id=%s',row['tg_user_id'])
+
+
+async def reconcile_user(user_id,ctx):
+    """Returns False when an unsettled payment still has an unknown outcome."""
+    ok=True
+    order=await db.pending_checkout(user_id)
+    if order and not order['payment_id']:
+        try:
+            recovered=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+            if not order['cycle_until'] and recovered['status']=='pending' and valid_http_url(recovered['confirmation_url']):
+                key='checkout_ready:'+order['id']
+                if await db.claim_notification(key,user_id):
+                    try:
+                        await db.clear_current_message(user_id)
+                        await render_payment(user_id,user_id,recovered,ctx)
+                        await db.mark_notification_sent(key)
+                    except TelegramError:
+                        logger.warning('recovered checkout delivery unconfirmed user_id=%s',user_id)
+        except billing.PaymentRejected:
+            if order['cycle_until']:
+                await db.disable_renewal(user_id,'provider_rejected')
+                await send_auto_problem(user_id,'ЮKassa не разрешила автоматическое продление. Можно оплатить вручную.',ctx,key='auto_rejected:'+order['id'])
+        except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+            return False
+    for row in await db.list_unfinalized_payments(user_id):
+        try:
+            remote=billing.validate_payment(json.loads(row['raw_json']),row) if row['status']=='succeeded' else await refresh_payment(row)
+            if remote['status']=='succeeded':
+                result=await billing.finalize(await db.get_payment(row['payment_id']))
+                ok=ok and bool(result.get('ok'))
+            elif remote['status']=='canceled':
+                await handle_auto_failure(row,ctx)
+            else:
+                ok=False
+        except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+            ok=False
+    return ok
+
+
+async def payment_reconciliation_job(ctx):
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        return
+    payments,orders=await db.reconciliation_candidates()
+    users=list(dict.fromkeys([r['tg_user_id'] for r in payments+orders]))
+    for user_id in users:
+        async with user_lock(user_id):
+            try:
+                await reconcile_user(user_id,ctx)
+            except Exception:
+                logger.exception('payment reconciliation deferred user_id=%s',user_id)
+    # Delivery is retried separately from financial fulfilment, including after restart.
+    for row in await db.access_notifications():
+        async with user_lock(row['tg_user_id']):
+            sub=await db.get_subscription(row['tg_user_id'])
+            if not active_subscription_until(sub):
+                await db.mark_access_notified(row['payment_id'])
+                continue
+            try:
+                await db.touch_access_delivery(row['payment_id'])
+                await db.clear_current_message(row['tg_user_id'])
+                await send_access_link(row['tg_user_id'],row['tg_user_id'],row['payment_id'],sub['access_until'],ctx)
+            except TelegramError:
+                logger.warning('automatic access delivery deferred user_id=%s',row['tg_user_id'])
+
+
+async def send_auto_problem(user_id,text,ctx,*,key):
+    if await db.claim_notification(key,user_id):
+        try:
+            await ctx.bot.send_message(user_id,text,reply_markup=next_keyboard('user:buy','Продлить вручную →'))
+            await db.mark_notification_sent(key)
+        except TelegramError:
+            logger.warning('renewal notification unconfirmed user_id=%s',user_id)
+
+
+async def automatic_renewals_job(ctx):
+    if not await auto_available() or not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        return
+    for candidate in await db.due_renewals():
+        uid=candidate['tg_user_id']
+        async with user_lock(uid):
+            contract=await db.get_renewal(uid)
+            sub=await db.get_subscription(uid)
+            if not contract or not contract['enabled'] or sub['access_until']!=candidate['access_until'] or sub['status']!='active':
+                continue
+            tariff=next((t for t in await db.list_tariffs() if t['code']==contract['plan_id']),None)
+            if not tariff or (tariff['amount_rub'],tariff['days'])!=(contract['amount_rub'],contract['days']):
+                await db.disable_renewal(uid,'tariff_changed')
+                await send_auto_problem(uid,'Условия тарифа изменились. Автопродление приостановлено: выбери новый вариант, когда будет удобно.',ctx,key='changed:'+contract['consent_key'])
+                continue
+            until=parse_dt(sub['access_until'])
+            if until < db.utcnow()-timedelta(hours=24):
+                await db.disable_renewal(uid,'missed_cycle')
+                await send_auto_problem(uid,'Автопродление не было выполнено вовремя. Запоздалого списания не будет; доступ можно восстановить вручную.',ctx,key='missed:'+contract['consent_key']+sub['access_until'])
+                continue
+            warned=parse_dt(contract.get('warned_at'))
+            if contract.get('warned_until')!=sub['access_until'] or not warned or db.utcnow()-warned<timedelta(hours=12):
+                continue  # Always give the user time to read the warning and cancel.
+            if await db.pending_checkout(uid) or await db.list_unfinalized_payments(uid):
+                continue  # A manual/uncertain payment must settle before any automatic charge.
+            plan=Tariff(tariff['code'],tariff['title'],contract['amount_rub'],contract['days'])
+            payload=payment_payload(uid,plan,method_id=contract['payment_method_id'])
+            order=await db.prepare_checkout(uid,plan,payload,cycle_until=sub['access_until'])
+            if order['status']=='canceled' and order['payment_id']:
+                await handle_auto_failure(await db.get_payment(order['payment_id']),ctx)
+                continue
+            if order['status']=='failed':
+                await db.disable_renewal(uid,'provider_rejected')
+                await send_auto_problem(uid,'Автопродление отклонено. Можно продлить доступ вручную.',ctx,key='auto_rejected:'+order['id'])
+                continue
+            if order['status'] not in {'creating','created'}:
+                continue
+            try:
+                row=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+                if row['status']=='succeeded':
+                    await billing.finalize(row)
+                elif row['status']=='canceled':
+                    await handle_auto_failure(row,ctx)
+            except billing.PaymentRejected:
+                await db.disable_renewal(uid,'provider_rejected')
+                await send_auto_problem(uid,'ЮKassa не разрешила автопродление. Новых автоматических попыток не будет; можно оплатить вручную.',ctx,key='auto_rejected:'+order['id'])
+            except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+                logger.warning('automatic payment outcome unknown order=%s',order['id'])
+
+
+async def channel_join_request(update,ctx):
+    request=update.chat_join_request
+    if not request or request.chat.id!=CHANNEL_ID:
+        return
+    uid=request.from_user.id
+    async with user_lock(uid):
+        invite=await db.get_invite_link(request.invite_link.invite_link) if request.invite_link else None
+        valid=(invite and invite['tg_user_id']==uid and not invite['used']
+               and (not invite['expire_at'] or parse_dt(invite['expire_at'])>db.utcnow())
+               and active_subscription_until(await db.get_subscription(uid)))
+        if not valid:
+            await ctx.bot.decline_chat_join_request(CHANNEL_ID,uid)
+            return
+        await ctx.bot.approve_chat_join_request(CHANNEL_ID,uid)
+        await db.record_event(uid,'channel_joined',event_key='join:'+invite['invite_link'])
+        try:
+            await ctx.bot.revoke_chat_invite_link(CHANNEL_ID,invite['invite_link'])
+            await db.mark_invite_used(invite['invite_link'])
+        except TelegramError:
+            logger.warning('used invite revocation deferred user_id=%s',uid)
+        onboarding=await db.get_setting('onboarding_url','')
+        if valid_http_url(onboarding) and await db.claim_notification('onboarding:'+str(uid),uid):
+            try:
+                await ctx.bot.send_message(uid,'Ты в «Креативном мозге». Начни с первого материала — дальше двигайся в удобном темпе.',
+                                           reply_markup=Mk([[Btn('Начать →',url=onboarding)]]))
+                await db.mark_notification_sent('onboarding:'+str(uid))
+            except TelegramError:
+                logger.warning('onboarding delivery unconfirmed user_id=%s',uid)
+
+
+async def group_activity(update,ctx):
+    message=getattr(update,'message',None)
+    if not message or not message.from_user or message.from_user.is_bot or message.sender_chat:
+        return
+    group_id=int(await db.get_setting('activity_chat_id','0'))
+    if not group_id or message.chat.id!=group_id or message.chat.type not in {'group','supergroup'}:
+        return
+    uid=message.from_user.id
+    if not active_subscription_until(await db.get_subscription(uid)):
+        return
+    file_present=any(bool(getattr(message,key,None)) for key in ('document','photo','video','audio','voice','video_note','animation'))
+    if not file_present and not message.text:
+        return
+    when=message.date.astimezone(timezone.utc).isoformat()
+    await db.record_activity(group_id,message.message_id,uid,when,file_present)
+
+
+async def show_user_activity(chat_id,user_id,ctx):
+    stats=await db.activity_summary(user_id)
+    text='За последние 30 дней в подключённой группе:\n'+activity_phrase(stats)
+    text+='\n\nУчитываются только сообщения, полученные ботом после подключения. Содержимое сообщений и файлов не сохраняется.'
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=next_keyboard('user:status','Мой доступ'))
+
+
+def activity_phrase(stats):
+    parts=[]
+    if stats['messages']:
+        parts.append(f"Сообщений: {stats['messages']}")
+    if stats['files']:
+        parts.append(f"Файлов и медиа: {stats['files']}")
+    return '\n'.join(parts) if parts else 'Можно продолжать в своём темпе — в том числе просто читать и пробовать идеи самостоятельно.'
+
+
+async def support(update,ctx):
+    if not update.effective_user or update.effective_chat.type!='private':
+        return
+    uid=update.effective_user.id
+    url=await db.get_setting('support_url','')
+    text='По вопросам доступа и оплаты можно обратиться в поддержку. Укажи свой номер пользователя: '+str(uid)+'. Данные карты присылать не нужно.'
+    rows=[[Btn('Написать в поддержку',url=url)]] if valid_http_url(url) else []
+    if not rows:
+        text='Контакт поддержки пока не настроен. Сохрани номер пользователя '+str(uid)+' и чек для обращения к автору канала. Статус покупки можно проверить через /start.'
+    rows.append([Btn('Мой доступ',callback_data='user:status')])
+    rows.append([Btn('Отключить автопродление',callback_data='user:auto_off')])
+    text+='\n\nАвтопродление можно отключить в любое время командой /cancel_subscription. В подключённой группе бот считает сообщения и медиа участников, без сохранения их содержания.'
+    await render_screen(uid,uid,ctx,text=text,reply_markup=Mk(rows))
+
+
+async def terms(update,ctx):
+    if not update.effective_user or not update.effective_chat or update.effective_chat.type!='private':
+        return
+    uid=update.effective_user.id
+    await remember_user(update.effective_user)
+    url=await db.get_offer_url()
+    markup=Mk([[Btn('Открыть условия',url=url)]]) if valid_http_url(url) else None
+    await render_screen(uid,uid,ctx,text='Условия доступа и оплаты:' if markup else 'Условия пока не опубликованы. Оформление доступа временно недоступно.',reply_markup=markup)
+
+
+async def disable_auto_and_render(chat_id,user_id,ctx):
+    await db.disable_renewal(user_id)
+    await render_screen(chat_id,user_id,ctx,text='Автопродление отключено. Оплаченный срок сохраняется. Если банк уже обрабатывает ранее отправленный платёж, дождёмся его результата; новых списаний не запустим.',reply_markup=next_keyboard('user:status','Мой доступ'))
+
+
+async def cancel_subscription(update,ctx):
+    if not update.effective_user or not update.effective_chat or update.effective_chat.type!='private':
+        return
+    uid=update.effective_user.id
+    async with user_lock(uid):
+        await remember_user(update.effective_user)
+        await disable_auto_and_render(update.effective_chat.id,uid,ctx)
+
+
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
     app = Application.builder().token(BOT_TOKEN).post_init(init_storage).post_shutdown(close_storage).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler(["help","support","paysupport"],support))
+    app.add_handler(CommandHandler("terms",terms))
+    app.add_handler(CommandHandler("cancel_subscription",cancel_subscription))
     app.add_handler(CommandHandler(["set_offer", "set_lead_magnet", "clear_lead_magnet", "set_intro_video", "clear_intro_video", "grant", "revoke", "stats", "user_path"], admin_shortcut))
     app.add_handler(CallbackQueryHandler(router))
     app.add_handler(ChatMemberHandler(channel_member_updated, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(channel_join_request))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND,group_activity),group=1)
     app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, fallback_message))
     if app.job_queue is None:
         raise RuntimeError("JobQueue is unavailable. Install python-telegram-bot[job-queue].")
-    app.job_queue.run_repeating(renewal_notices_job, interval=3600, first=60, name="renewal_notices")
-    app.job_queue.run_repeating(expire_subscriptions_job, interval=3600, first=120, name="expire_subscriptions")
+    app.job_queue.run_repeating(payment_reconciliation_job, interval=20, first=5, name="payment_reconciliation")
+    app.job_queue.run_repeating(automatic_renewals_job, interval=60, first=25, name="automatic_renewals")
+    app.job_queue.run_repeating(renewal_notices_job, interval=300, first=15, name="renewal_notices")
+    app.job_queue.run_repeating(expire_subscriptions_job, interval=60, first=45, name="expire_subscriptions")
     app.job_queue.run_repeating(followup_job, interval=3600, first=180, name="lead_followup")
     return app
 
