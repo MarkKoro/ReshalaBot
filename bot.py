@@ -444,7 +444,7 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_user_activity(chat_id,tg_user_id,ctx)
     elif data=='user:quiet':
         await db.set_marketing_opt_out(tg_user_id,True)
-        await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Открыть программу'),back_callback='user:lesson')
+        await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Посмотреть, что внутри'),back_callback='user:lesson')
     elif data=='user:auto_off':
         await disable_auto_and_render(chat_id,tg_user_id,ctx)
     elif data=='user:status':
@@ -546,7 +546,7 @@ async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tarif
 async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     row=await db.get_payment(payment_id)
     if not row or row['tg_user_id']!=tg_user_id:
-        await render_screen(chat_id,tg_user_id,ctx,text='Платёж не найден для твоего аккаунта.',reply_markup=next_keyboard('user:product','Посмотреть программу'))
+        await render_screen(chat_id,tg_user_id,ctx,text='Платёж не найден для твоего аккаунта.',reply_markup=next_keyboard('user:product','Посмотреть, что внутри'))
         return
     if row['finalized_at']:
         await send_existing_access(chat_id,tg_user_id,payment_id,ctx)
@@ -1115,7 +1115,7 @@ async def followup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             try:
                 await render_screen(uid,uid,ctx,text=await content('FOLLOWUP'),reply_markup=Mk([
-                    [Btn('Посмотреть программу →',callback_data='user:product')],
+                    [Btn('Посмотреть, что внутри',callback_data='user:product')],
                     [Btn('Не напоминать об уроке',callback_data='user:quiet')]]),
                     back_callback='user:lesson',force_new=True)
                 await db.mark_followup_sent(uid)

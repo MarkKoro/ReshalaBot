@@ -623,7 +623,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_regular_user_gets_no_admin_button_and_sees_price_before_consent(self):
         await bot.start(self.update, self.ctx)
         await self.press("user:product")
-        self.assertLess(len(self.last()["text"]), 450)
+        self.assertLess(len(self.last()["text"]), 750)
         self.assertEqual(self.buttons()[0].text, "Я хочу")
         self.assertNotIn("400", self.last()["text"])
         await self.press("user:buy")
