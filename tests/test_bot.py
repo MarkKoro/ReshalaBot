@@ -40,21 +40,31 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await db.set_lead_magnet_url(URL)
         await db.set_offer_url(OFFER)
         self.messages = {}
+        self.deleted = set()
+        self.last_active_id = None
         self.next_id = 1
 
         async def send(chat_id, text, **kwargs):
             mid = self.next_id
             self.next_id += 1
             self.messages[mid] = dict(chat_id=chat_id, text=text, **kwargs)
+            self.last_active_id = mid
             return NS(message_id=mid)
 
         async def edit(chat_id, message_id, text, **kwargs):
+            if message_id in self.deleted or message_id not in self.messages:
+                raise BadRequest('message to edit not found')
             self.messages[message_id] = dict(chat_id=chat_id, text=text, **kwargs)
+            self.last_active_id = message_id
+
+        async def delete(chat_id, message_id):
+            self.deleted.add(message_id)
 
         self.telegram = NS(
             send_message=AsyncMock(side_effect=send),
             edit_message_text=AsyncMock(side_effect=edit),
-            delete_message=AsyncMock(),
+            delete_message=AsyncMock(side_effect=delete),
+            edit_message_reply_markup=AsyncMock(),
             create_chat_invite_link=AsyncMock(return_value=NS(invite_link="https://t.me/+test-invite")),
             revoke_chat_invite_link=AsyncMock(),
             ban_chat_member=AsyncMock(),
@@ -102,14 +112,20 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                                 value["metadata"], value)
         return value
 
-    async def press(self, data, user=None):
+    async def press(self, data, user=None, message_id=None):
         user = user or self.user
-        query = NS(from_user=user, message=NS(chat_id=user.id, chat=NS(type="private")),
+        if message_id is None:
+            candidates=[mid for mid,value in self.messages.items() if value['chat_id']==user.id and mid not in self.deleted]
+            message_id=max(candidates) if candidates else None
+        message=self.messages.get(message_id,{})
+        query = NS(from_user=user, message=NS(chat_id=user.id, chat=NS(type="private"),
+                                           message_id=message_id,text=message.get('text'),
+                                           reply_markup=message.get('reply_markup')),
                    data=data, answer=AsyncMock())
         await bot.router(NS(callback_query=query), self.ctx)
 
     def last(self):
-        return self.messages[max(self.messages)]
+        return self.messages[self.last_active_id]
 
     def buttons(self):
         return [b for row in self.last()["reply_markup"].inline_keyboard for b in row]
@@ -161,18 +177,20 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(args["creates_join_request"])
         self.assertNotIn("member_limit", args)
         self.assertAlmostEqual((args["expire_date"] - db.utcnow()).total_seconds(), 3600, delta=5)
-        self.assertEqual(len(self.buttons()), 1)
+        self.assertEqual(len(self.buttons()), 2)
         self.assertEqual(self.buttons()[0].url, "https://t.me/+test-invite")
         self.assertNotIn("https://t.me/", self.last()["text"])
         self.assertEqual(self.messages[2], lesson)
-        self.telegram.delete_message.assert_not_awaited()
+        self.assertIn(1,self.deleted)
+        self.assertNotIn(2,self.deleted)
         events = [row["event_name"] for row in await db.get_user_path(1)]
         self.assertEqual(events, ["start", "lead_magnet_sent", "product_opened", "buy_clicked",
                                   "payment_created", "offer_accepted", "payment_succeeded", "access_granted"])
         success_id = max(self.messages)
-        success = dict(self.messages[success_id])
+        sent = self.telegram.send_message.await_count
         await bot.start(self.update, self.ctx)
-        self.assertEqual(self.messages[success_id], success)
+        self.assertIn('активен до',self.messages[success_id]['text'])
+        self.assertEqual(self.telegram.send_message.await_count,sent)
 
     async def test_repeat_start_preserves_first_source_without_duplicate_users(self):
         self.ctx.args = ["youtube_creative"]
@@ -521,7 +539,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_menu_stats_and_user_path_routes(self):
         admin_user = NS(id=99, username="admin", first_name="Admin", last_name=None)
         await self.press("admin:menu", admin_user)
-        self.assertEqual(len(self.buttons()), 10)
+        self.assertEqual(len(self.buttons()), 11)
         await self.press("admin:stats", admin_user)
         self.assertIn("Воронка", self.last()["text"])
         await db.record_start(1, "shorts_creative")
@@ -557,7 +575,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.user.id = self.chat.id = 99
         self.update.effective_message.text = "/admin"
         await bot.admin(self.update, self.ctx)
-        self.assertEqual(len(self.buttons()), 10)
+        self.assertEqual(len(self.buttons()), 11)
         await db.set_admin_state(99, "grant")
         self.chat.id = -100123
         self.chat.type = "supergroup"
@@ -599,7 +617,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             assert_menu()
             await self.press("admin:menu")
             self.assertIsNone(await db.get_admin_state(1))
-            self.assertEqual(len(self.buttons()), 10)
+            self.assertEqual(len(self.buttons()), 11)
 
     async def test_regular_user_gets_no_admin_button_and_sees_price_before_consent(self):
         await bot.start(self.update, self.ctx)
@@ -613,7 +631,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum("400" in b.text for b in self.buttons()), 0)
         self.assertEqual(self.buttons()[1].text, "Принимаю · оплатить разово")
         self.assertEqual(self.buttons()[1].url, "https://example.com/pay")
-        self.assertEqual(len(self.buttons()), 2)
+        self.assertEqual(len(self.buttons()), 3)
         for message in self.messages.values():
             markup = message.get("reply_markup")
             if markup:
@@ -764,7 +782,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.http.post.await_count,1)
         self.assertFalse(await db.has_accepted_offer(1))
         self.assertIsNone(await db.get_subscription(1))
-        self.assertEqual([b.text for b in self.buttons()],["📄 Условия","Принимаю · оплатить разово"])
+        self.assertEqual([b.text for b in self.buttons()],["📄 Условия","Принимаю · оплатить разово","◀️ Назад"])
         order=await db.get_checkout_by_payment("p1")
         self.assertEqual(order["offer_url"],OFFER)
         self.assertIsNotNone(order["offer_presented_at"])
@@ -884,7 +902,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await db.save_tariff("quarter","Три месяца",990,90,True,99)
         await self.press("user:product")
         self.assertEqual(self.last()["text"],texts.PRODUCT)
-        self.assertEqual(len(self.buttons()),2)
+        self.assertEqual(len(self.buttons()),3)
         self.assertEqual(next(b.text for b in self.buttons() if b.callback_data=="user:choose:quarter"),"Три месяца · 990 ₽")
         self.http.post.assert_not_awaited()
         self.ctx.user_data['selected_tariff']='creative_30'
@@ -907,7 +925,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await db.save_tariff(tariff["code"],tariff["title"],tariff["amount_rub"],tariff["days"],False,99)
         await self.press("user:tariffs")
         self.assertIn("приостановлены",self.last()["text"])
-        self.assertEqual(len(self.buttons()),0)
+        self.assertEqual([b.callback_data for b in self.buttons()],['user:product'])
 
     async def test_expired_invite_does_not_block_recovery_when_provider_cannot_revoke_it(self):
         await self.store_payment(status="succeeded")
@@ -1121,10 +1139,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         added = next(p for p in plans if p["code"]!="creative_30")
         self.assertEqual(added["enabled"], 0)
         await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
-        self.assertEqual([b.text for b in self.buttons()],["Я хочу"])
+        self.assertEqual([b.text for b in self.buttons()],["Я хочу","◀️ Назад"])
         await self.press("admin:tariff_toggle:"+added["code"])
         await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
-        self.assertEqual(len(self.buttons()),2)
+        self.assertEqual(len(self.buttons()),3)
         self.assertEqual(next(b.text for b in self.buttons() if b.callback_data=="user:choose:"+added["code"]),"Три месяца · 900 ₽")
         await self.press("admin:setting:reminder_days")
         self.update.effective_message.text = "1"
@@ -1151,7 +1169,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(b.text for b in self.buttons() if b.callback_data=="user:choose:"+added["code"]),"Три месяца · 1100 ₽")
         await self.press("admin:tariff_toggle:"+added["code"])
         await self.press("user:product",user=NS(id=1,username="test",first_name="Test",last_name=None))
-        self.assertEqual([b.text for b in self.buttons()],["Я хочу"])
+        self.assertEqual([b.text for b in self.buttons()],["Я хочу","◀️ Назад"])
         self.http.post.assert_not_awaited()
 
     async def test_nonadmin_cannot_change_extended_settings(self):
@@ -1165,7 +1183,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_removed_goal_buttons_return_to_product_and_marketing_optout_works(self):
         await self.press("user:product")
         self.assertEqual(self.buttons()[0].callback_data, "user:buy")
-        self.assertEqual(len(self.buttons()), 1)
+        self.assertEqual(len(self.buttons()), 2)
         await self.press("user:goal:work")
         self.assertEqual(self.last()["text"], texts.PRODUCT)
         self.assertEqual(self.buttons()[0].callback_data, "user:buy")
@@ -1298,6 +1316,202 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.send_lead_magnet(99,99,self.ctx,track=False)
         self.assertLessEqual(bot.telegram_length(self.last()["text"]),4096)
         self.assertIn(url,self.last()["text"])
+
+
+    async def assert_legacy_followup_target(self, action):
+        await bot.render_screen(1,1,self.ctx,text='Предыдущее меню')
+        old_id=self.last_active_id
+        notice=await self.telegram.send_message(1,texts.FOLLOWUP)
+        sent=self.telegram.send_message.await_count
+        await self.press(action,message_id=notice.message_id)
+        self.assertEqual(self.telegram.edit_message_text.call_args.kwargs['message_id'],notice.message_id)
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],notice.message_id)
+        self.assertEqual(self.telegram.send_message.await_count,sent)
+        self.assertIn(old_id,self.deleted)
+
+    async def test_legacy_followup_program_button_edits_the_pressed_message(self):
+        await self.assert_legacy_followup_target('user:product')
+        self.assertEqual(self.last()['text'],texts.PRODUCT)
+
+    async def test_legacy_followup_quiet_button_edits_the_pressed_message(self):
+        await self.assert_legacy_followup_target('user:quiet')
+        self.assertIn('отключены',self.last()['text'])
+        self.assertEqual((await self.sql('SELECT marketing_opt_out FROM users WHERE tg_user_id=1'))[0][0],1)
+
+    async def test_followup_becomes_the_menu_and_preserves_the_video(self):
+        await bot.start(self.update,self.ctx)
+        lesson=await db.get_lesson_message(1)
+        snapshot=dict(self.messages[lesson['lesson_message_id']])
+        await self.age_lead()
+        await bot.followup_job(self.ctx)
+        notice_id=self.last_active_id
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],notice_id)
+        sent=self.telegram.send_message.await_count
+        await self.press('user:product',message_id=notice_id)
+        self.assertEqual(self.telegram.edit_message_text.call_args.kwargs['message_id'],notice_id)
+        self.assertEqual(self.telegram.send_message.await_count,sent)
+        self.assertEqual(self.messages[lesson['lesson_message_id']],snapshot)
+        self.assertNotIn(lesson['lesson_message_id'],self.deleted)
+        self.assertEqual(set(self.messages)-self.deleted,{lesson['lesson_message_id'],notice_id})
+
+    async def test_forward_back_and_repeated_start_reuse_one_menu_after_restart(self):
+        await bot.start(self.update,self.ctx)
+        lesson=await db.get_lesson_message(1)
+        lesson_id=lesson['lesson_message_id']
+        snapshot=dict(self.messages[lesson_id])
+        await self.press('user:product',message_id=lesson_id)
+        menu_id=self.last_active_id
+        self.assertGreater(menu_id,lesson_id)
+        for _ in range(3):
+            await self.press('user:lesson')
+            self.assertIn(URL,self.last()['text'])
+            self.assertEqual(self.last()['reply_markup'].inline_keyboard[-1][0].callback_data,'user:welcome')
+            await self.press('user:welcome')
+            self.assertEqual(self.last()['text'],texts.WELCOME)
+            await self.press('user:lead_magnet')
+            await self.press('user:product')
+            await self.press('user:buy')
+            await self.press('user:product')
+        self.http.post.assert_awaited_once()
+        sent=self.telegram.send_message.await_count
+        await db.close_db()
+        await db.init_db()
+        self.ctx.user_data={}
+        await bot.start(self.update,self.ctx)
+        await self.press('user:lead_magnet')
+        await self.press('user:product')
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],menu_id)
+        self.assertEqual(await db.get_lesson_message(1),lesson)
+        self.assertEqual(self.telegram.send_message.await_count,sent)
+        self.assertEqual(self.messages[lesson_id],snapshot)
+        self.assertEqual(set(self.messages)-self.deleted,{lesson_id,menu_id})
+
+    async def test_legacy_lesson_is_preserved_and_registered_on_first_navigation(self):
+        await bot.render_screen(1,1,self.ctx,text=texts.WELCOME)
+        lesson=await self.telegram.send_message(1,texts.LEAD_CAPTION+'\n\n'+URL)
+        snapshot=dict(self.messages[lesson.message_id])
+        await self.press('user:product',message_id=lesson.message_id)
+        self.assertEqual(self.messages[lesson.message_id],snapshot)
+        self.assertNotIn(lesson.message_id,self.deleted)
+        self.assertGreater(self.last_active_id,lesson.message_id)
+        self.assertEqual((await db.get_lesson_message(1))['lesson_message_id'],lesson.message_id)
+
+    async def test_native_video_callback_preserves_media_even_without_a_saved_url(self):
+        video=await self.telegram.send_message(1,'video fixture')
+        await db.set_current_message(1,1,video.message_id,'video')
+        query=NS(from_user=self.user,data='user:product',answer=AsyncMock(),
+                 message=NS(chat_id=1,chat=NS(type='private'),message_id=video.message_id,
+                            video=NS(file_id='video-file'),text=None,caption='Урок'))
+        await bot.router(NS(callback_query=query),self.ctx)
+        self.assertNotIn(video.message_id,self.deleted)
+        self.assertGreater(self.last_active_id,video.message_id)
+
+    async def test_repeated_start_before_continuing_places_menu_below_the_video(self):
+        await bot.start(self.update,self.ctx)
+        lesson=await db.get_lesson_message(1)
+        await bot.start(self.update,self.ctx)
+        self.assertGreater((await db.get_current_message(1))['current_message_id'],lesson['lesson_message_id'])
+        self.assertEqual(sum(URL in value['text'] for value in self.messages.values()),1)
+        self.assertNotIn(lesson['lesson_message_id'],self.deleted)
+
+    async def test_click_on_an_older_live_menu_adopts_it_and_retires_the_other_menu(self):
+        await bot.render_screen(1,1,self.ctx,text='Старое меню')
+        old_id=self.last_active_id
+        newer=await self.telegram.send_message(1,'Новое меню')
+        await db.set_current_message(1,1,newer.message_id,'text')
+        sent=self.telegram.send_message.await_count
+        await self.press('user:product',message_id=old_id)
+        self.assertEqual(self.messages[old_id]['text'],texts.PRODUCT)
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],old_id)
+        self.assertIn(newer.message_id,self.deleted)
+        self.assertEqual(self.telegram.send_message.await_count,sent)
+
+    async def test_deleted_callback_message_is_replaced_only_once(self):
+        await bot.render_screen(1,1,self.ctx,text='Старое меню')
+        old_id=self.last_active_id
+        await bot.render_screen(1,1,self.ctx,text='Новое меню',force_new=True)
+        previous_id=self.last_active_id
+        sent=self.telegram.send_message.await_count
+        await self.press('user:product',message_id=old_id)
+        self.assertEqual(self.telegram.send_message.await_count,sent+1)
+        self.assertIn(previous_id,self.deleted)
+        self.assertEqual(set(self.messages)-self.deleted,{self.last_active_id})
+
+    async def test_transport_failure_does_not_clone_the_menu_or_leak_callback_context(self):
+        await bot.render_screen(1,1,self.ctx,text='Меню')
+        current=await db.get_current_message(1)
+        sent=self.telegram.send_message.await_count
+        self.telegram.edit_message_text.side_effect=TimedOut()
+        with self.assertRaises(TimedOut):
+            await self.press('user:product')
+        self.assertEqual(self.telegram.send_message.await_count,sent)
+        self.assertEqual(await db.get_current_message(1),current)
+        self.assertIsNone(bot._callback_query.get())
+
+    async def test_unchanged_pressed_message_still_becomes_the_saved_menu(self):
+        await bot.render_screen(1,1,self.ctx,text='Прежнее меню')
+        old_id=self.last_active_id
+        notice=await self.telegram.send_message(1,texts.PRODUCT)
+        self.telegram.edit_message_text.side_effect=BadRequest('Message is not modified')
+        await self.press('user:product',message_id=notice.message_id)
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],notice.message_id)
+        self.assertIn(old_id,self.deleted)
+
+    async def test_undeletable_old_menu_loses_its_inline_buttons(self):
+        await bot.render_screen(1,1,self.ctx,text='Прежнее меню')
+        old_id=self.last_active_id
+        notice=await self.telegram.send_message(1,texts.FOLLOWUP)
+        self.telegram.delete_message.side_effect=Forbidden('message cannot be deleted')
+        await self.press('user:product',message_id=notice.message_id)
+        self.telegram.edit_message_reply_markup.assert_awaited_once_with(chat_id=1,message_id=old_id,reply_markup=None)
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],notice.message_id)
+
+    async def test_missing_lesson_has_back_navigation_without_duplicate_messages(self):
+        await db.clear_lead_magnet_url()
+        await bot.start(self.update,self.ctx)
+        menu_id=self.last_active_id
+        for action in ('user:product','user:lesson','user:welcome','user:lead_magnet'):
+            await self.press(action)
+            self.assertTrue(any('Назад' in b.text for b in self.buttons()))
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],menu_id)
+
+    async def test_concurrent_callbacks_keep_each_users_message_target(self):
+        other=NS(id=2,username='other',first_name='Other',last_name=None)
+        await db.upsert_user(2)
+        await bot.render_screen(1,1,self.ctx,text='Меню 1')
+        await bot.render_screen(2,2,self.ctx,text='Меню 2')
+        first=await self.telegram.send_message(1,texts.FOLLOWUP)
+        second=await self.telegram.send_message(2,texts.FOLLOWUP)
+        await asyncio.gather(self.press('user:product',message_id=first.message_id),
+                             self.press('user:quiet',user=other,message_id=second.message_id))
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],first.message_id)
+        self.assertEqual((await db.get_current_message(2))['current_message_id'],second.message_id)
+        self.assertEqual(self.messages[first.message_id]['text'],texts.PRODUCT)
+        self.assertIn('отключены',self.messages[second.message_id]['text'])
+
+    async def test_admin_menu_navigation_does_not_create_new_messages(self):
+        admin_user=NS(id=99,username='admin',first_name='Admin',last_name=None)
+        await self.press('admin:menu',user=admin_user)
+        menu_id=self.last_active_id
+        for action in ('admin:settings','admin:menu','admin:tariffs','admin:menu'):
+            await self.press(action,user=admin_user)
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertEqual((await db.get_current_message(99))['current_message_id'],menu_id)
+
+    async def test_long_admin_statistics_are_paginated_in_one_message(self):
+        await db.upsert_user(99)
+        stats=await db.funnel_stats()
+        stats['sources']=[{'source':'source_'+str(i)+'x'*50,'starts':1,'paid':0} for i in range(150)]
+        with patch.object(db,'funnel_stats',AsyncMock(return_value=stats)):
+            await bot.show_stats(99,99,self.ctx)
+            menu_id=self.last_active_id
+            first=self.last()['text']
+            next_page=next(b.callback_data for b in self.buttons() if b.text=='Страница →')
+            await self.press(next_page,user=NS(id=99,username='admin',first_name='Admin',last_name=None))
+            self.assertNotEqual(self.last()['text'],first)
+            self.assertEqual(self.last_active_id,menu_id)
+            self.assertEqual(self.telegram.send_message.await_count,1)
 
 
 class ApplicationTests(unittest.TestCase):

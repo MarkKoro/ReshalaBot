@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import wraps
 from types import SimpleNamespace
 from urllib.parse import urlsplit, parse_qs
 import os
@@ -50,6 +52,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 ScreenKind = Literal["text", "video", "photo"]
+_callback_query: ContextVar = ContextVar("callback_query", default=None)
 
 
 @dataclass(frozen=True)
@@ -147,18 +150,69 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def safe_delete_message(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+async def safe_delete_message(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> bool:
     if not chat_id or not message_id:
-        return
+        return True
     try:
         await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
     except TelegramError:
         logger.debug("message delete skipped chat_id=%s message_id=%s", chat_id, message_id, exc_info=True)
+        return False
 
 
 async def delete_incoming(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_message:
         await safe_delete_message(ctx, update.effective_chat.id, update.effective_message.message_id)
+
+
+def serialized_command(handler):
+    @wraps(handler)
+    async def wrapped(update, ctx):
+        if not update.effective_user:
+            return
+        async with user_lock(update.effective_user.id):
+            return await handler(update, ctx)
+    return wrapped
+
+
+def navigation_keyboard(reply_markup: Mk | None, back_callback: str) -> Mk:
+    rows = [list(row) for row in reply_markup.inline_keyboard] if reply_markup else []
+    if not any('назад' in button.text.lower() or 'админ-панель' in button.text.lower()
+               or button.text in {'Отмена', 'Все тарифы'} for row in rows for button in row):
+        rows.append([Btn('◀️ Назад', callback_data=back_callback)])
+    return Mk(rows)
+
+
+async def is_lesson_message(message, tg_user_id: int) -> bool:
+    lesson = await db.get_lesson_message(tg_user_id) or {}
+    if (lesson.get('lesson_chat_id'), lesson.get('lesson_message_id')) == (message.chat_id, message.message_id):
+        return True
+    if getattr(message, 'video', None) or getattr(message, 'photo', None):
+        return True
+    # Recognize lessons sent before lesson coordinates were stored, including old URLs.
+    text = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
+    caption = await content('LEAD_CAPTION')
+    url = text.rsplit('\n\n', 1)[-1]
+    markup = getattr(message, 'reply_markup', None)
+    if markup and any(button.url == url for row in markup.inline_keyboard for button in row):
+        # The lesson navigation screen links to the video; it is still an editable menu.
+        return False
+    preview = getattr(message, 'link_preview_options', None)
+    if preview and preview.is_disabled:
+        return False
+    return text.startswith((caption + '\n\n', texts.LEAD_CAPTION + '\n\n')) and valid_http_url(url)
+
+
+async def retire_menu(chat_id: int, message_id: int, tg_user_id: int, ctx) -> None:
+    lesson = await db.get_lesson_message(tg_user_id) or {}
+    if (chat_id, message_id) == (lesson.get('lesson_chat_id'), lesson.get('lesson_message_id')):
+        return
+    if not await safe_delete_message(ctx, chat_id, message_id):
+        try:
+            await ctx.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+        except TelegramError:
+            logger.debug('old menu retirement unavailable chat_id=%s message_id=%s', chat_id, message_id)
 
 
 async def render_screen(
@@ -171,50 +225,93 @@ async def render_screen(
     kind: ScreenKind = "text",
     file_id: str | None = None,
     include_admin_shortcut: bool = True,
+    back_callback: str | None = None,
+    force_new: bool = False,
 ) -> None:
-    """Render one actual bot screen and keep its coordinates in users.current_* fields."""
+    """Edit the pressed menu (or the saved menu for commands/jobs), preserving the lesson."""
+    if back_callback is None:
+        admin_screen = reply_markup and any((button.callback_data or '').startswith('admin:')
+                                           for row in reply_markup.inline_keyboard for button in row)
+        back_callback = 'admin:menu' if admin_screen else 'user:home'
+    reply_markup = navigation_keyboard(reply_markup, back_callback)
     if include_admin_shortcut:
         reply_markup = with_admin_menu(tg_user_id, reply_markup)
     current = await db.get_current_message(tg_user_id) or {}
     old_chat_id = int(current.get("current_chat_id") or 0)
     old_message_id = int(current.get("current_message_id") or 0)
     old_kind = str(current.get("current_message_kind") or "")
+    target_id, target_kind = (old_message_id, old_kind) if old_chat_id == chat_id else (0, '')
+    protected_source_id = 0
+    query = _callback_query.get()
+    message = query.message if query and query.from_user.id == tg_user_id else None
+    if message and message.chat_id == chat_id and getattr(message, 'message_id', None):
+        if await is_lesson_message(message, tg_user_id):
+            protected_source_id = message.message_id
+            lesson = await db.get_lesson_message(tg_user_id) or {}
+            legacy_text = getattr(message, 'text', None) or ''
+            legacy_url = legacy_text.rsplit('\n\n', 1)[-1]
+            if not lesson.get('lesson_message_id') and valid_http_url(legacy_url):
+                await db.set_lesson_message(tg_user_id, chat_id, message.message_id, legacy_url)
+            # The first menu belongs below the preserved video, never in the greeting above it.
+            if target_id <= message.message_id:
+                target_id = 0
+        else:
+            target_id = message.message_id
+            target_kind = 'text'
+    if force_new:
+        target_id = 0
+    lesson = await db.get_lesson_message(tg_user_id) or {}
+    if (chat_id, target_id) == (lesson.get('lesson_chat_id'), lesson.get('lesson_message_id')):
+        target_id = 0
+    if not message and lesson.get('lesson_chat_id') == chat_id and target_id < lesson.get('lesson_message_id', 0):
+        target_id = 0
 
-    if old_message_id and old_chat_id == chat_id and old_kind == kind:
+    async def remember_screen(message_id):
+        await db.set_current_message(tg_user_id, chat_id, message_id, kind)
+        obsolete = {(old_chat_id, old_message_id), (chat_id, target_id)}
+        obsolete.discard((chat_id, message_id))
+        obsolete.discard((chat_id, protected_source_id))
+        for previous_chat, previous_id in obsolete:
+            if previous_chat and previous_id:
+                await retire_menu(previous_chat, previous_id, tg_user_id, ctx)
+
+    if target_id and target_kind == kind:
         try:
             if kind == "text":
-                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=old_message_id, text=text, reply_markup=reply_markup)
+                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=target_id, text=text,
+                                                reply_markup=reply_markup, disable_web_page_preview=True)
             elif kind == "video":
                 await ctx.bot.edit_message_media(
                     chat_id=chat_id,
-                    message_id=old_message_id,
+                    message_id=target_id,
                     media=InputMediaVideo(media=file_id, caption=text),
                     reply_markup=reply_markup,
                 )
             else:
                 await ctx.bot.edit_message_media(
                     chat_id=chat_id,
-                    message_id=old_message_id,
+                    message_id=target_id,
                     media=InputMediaPhoto(media=file_id, caption=text),
                     reply_markup=reply_markup,
                 )
-            return
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
+                await remember_screen(target_id)
                 return
             logger.info("screen edit failed, recreating message: %s", exc)
-        except TelegramError:
-            logger.exception("screen edit failed, recreating message")
+        else:
+            await remember_screen(target_id)
+            return
+        # Transport failures have an unknown outcome. Do not clone the menu on a timeout.
 
     if kind == "video":
         msg = await ctx.bot.send_video(chat_id=chat_id, video=file_id, caption=text, reply_markup=reply_markup)
     elif kind == "photo":
         msg = await ctx.bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup)
     else:
-        msg = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-    await db.set_current_message(tg_user_id, chat_id, msg.message_id, kind)
-    if old_chat_id and old_message_id:
-        await safe_delete_message(ctx, old_chat_id, old_message_id)
+        msg = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup,
+                                         disable_web_page_preview=True)
+    await remember_screen(msg.message_id)
 
 
 def offer_keyboard(offer_url: str | None) -> Mk:
@@ -267,14 +364,16 @@ async def show_active_access(chat_id: int, tg_user_id: int, ctx: ContextTypes.DE
     if auto or await auto_available():
         rows.append([Btn('Отключить автопродление' if auto else 'Настроить автопродление',callback_data='user:auto_off' if auto else 'user:auto_setup')])
     rows.append([Btn('Моя активность',callback_data='user:activity')])
-    await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows))
+    await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows),back_callback='user:product')
 
 
+@serialized_command
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user, chat = update.effective_user, update.effective_chat
     if not user or not chat or chat.type != "private":
         return
     await remember_user(user)
+    await delete_incoming(update, ctx)
     await db.clear_admin_state(user.id)
     source = ctx.args[0] if ctx.args and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", ctx.args[0]) else "direct"
     await db.record_start(user.id, source)
@@ -304,14 +403,22 @@ async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEF
     if await auto_available() and tariff.days >= 3:
         text += f'\n\nМожно выбрать автопродление: {tariff.amount_rub} ₽ за каждые {tariff.days} дней, списание за сутки до окончания. Перед списанием предупредим. Отключить можно здесь в любой момент. Если способ оплаты не сохранится, останется разовая покупка.'
         rows.append([Btn('Принимаю · с автопродлением',callback_data='user:accept_offer_auto')])
-    await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows))
+    await render_screen(chat_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows),back_callback='user:product')
 
 
 async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user_id, chat_id = query.from_user.id, query.message.chat_id
     await remember_user(query.from_user)
     data = query.data or ''
-    if data in {'user:lead_magnet','user:start_intro'}:
+    if data == 'user:welcome':
+        await render_screen(chat_id,tg_user_id,ctx,text=await content('WELCOME'),
+                            reply_markup=next_keyboard('user:lead_magnet','▶️ Бесплатный урок'))
+    elif data == 'user:home':
+        if active_subscription_until(await db.get_subscription(tg_user_id)):
+            await show_active_access(chat_id,tg_user_id,ctx)
+        else:
+            await show_product(chat_id,tg_user_id,ctx)
+    elif data in {'user:lead_magnet','user:start_intro','user:lesson'}:
         await send_lead_magnet(chat_id,tg_user_id,ctx,welcome=False)
     elif data=='user:access':
         sub=await db.get_subscription(tg_user_id)
@@ -320,7 +427,7 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_user_activity(chat_id,tg_user_id,ctx)
     elif data=='user:quiet':
         await db.set_marketing_opt_out(tg_user_id,True)
-        await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Открыть программу'))
+        await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Открыть программу'),back_callback='user:lesson')
     elif data=='user:auto_off':
         await disable_auto_and_render(chat_id,tg_user_id,ctx)
     elif data=='user:status':
@@ -457,7 +564,7 @@ async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None, access_until: str | None,
-                           ctx: ContextTypes.DEFAULT_TYPE, already_finalized: bool = False) -> None:
+                           ctx: ContextTypes.DEFAULT_TYPE, already_finalized: bool = False, *, force_new: bool = False) -> None:
     existing = await db.get_invite_link_by_payment(payment_id) if payment_id else None
     try:
         if existing and existing.get('requires_approval') and not existing["used"] and parse_dt(existing["expire_at"]) and parse_dt(existing["expire_at"]) > datetime.now(timezone.utc):
@@ -481,9 +588,8 @@ async def send_access_link(chat_id: int, tg_user_id: int, payment_id: str | None
             message += '\n\nСпособ оплаты не сохранился: автопродление не включено. Перед окончанием пришлю напоминание.'
         await render_screen(chat_id, tg_user_id, ctx,
                             text=message,
-                            reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite_link)]]))
-        # Keep the entry button available in history even if /start is called before joining.
-        await db.clear_current_message(tg_user_id)
+                            reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite_link)]]),
+                            back_callback='user:status',force_new=force_new)
         if paid:
             await db.mark_access_notified(payment_id)
     except TelegramError as exc:
@@ -515,13 +621,14 @@ async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | 
     else:
         text=await content('RENEWAL_NOTICE',date=format_dt(access_until),activity=activity)
         rows=[[Btn('Продолжить с нами →',callback_data='user:buy')]]
-    await ctx.bot.send_message(tg_user_id,text,reply_markup=with_admin_menu(tg_user_id,Mk(rows)))
+    await render_screen(tg_user_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows),force_new=True)
     if contract and contract['enabled'] and await auto_available():
         await db.mark_auto_warning(tg_user_id,access_until)
 
 
 async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await ctx.bot.send_message(tg_user_id,await content('EXPIRED'),reply_markup=with_admin_menu(tg_user_id,next_keyboard('user:buy','Вернуться в канал →')))
+    await render_screen(tg_user_id,tg_user_id,ctx,text=await content('EXPIRED'),
+                        reply_markup=next_keyboard('user:buy','Вернуться в канал →'),force_new=True)
 
 
 async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -614,6 +721,7 @@ def admin_menu_keyboard() -> Mk:
     ])
 
 
+@serialized_command
 async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -631,11 +739,8 @@ async def show_admin_menu(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAU
     text = "Админ-панель\n\nВыберите действие кнопками ниже."
     if note:
         text = f"{note}\n\n{text}"
-    # An admin shortcut can belong to an old lesson or a newer standalone notice.
-    # Open the menu at the bottom of the chat instead of editing an unrelated screen.
-    await db.clear_current_message(tg_user_id)
     await render_screen(chat_id, tg_user_id, ctx, text=text, reply_markup=admin_menu_keyboard(),
-                        include_admin_shortcut=False)
+                        include_admin_shortcut=False,back_callback='user:home')
 
 
 async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -674,7 +779,7 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_admin_menu(chat_id, tg_user_id, ctx)
 
 
-async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, days=30) -> None:
+async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, days=30, page_index=0) -> None:
     if chat_id!=tg_user_id or not is_admin(tg_user_id):
         return
     s=await db.funnel_stats()
@@ -701,11 +806,17 @@ async def show_stats(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TY
             pages.append(page); page=''
         page+=line+'\n'
     pages.append(page)
-    for page in pages[:-1]:
-        await ctx.bot.send_message(chat_id,page)
+    page_index = max(0, min(page_index, len(pages)-1))
     rows=[[Btn('7 дней',callback_data='admin:stats:7'),Btn('30 дней',callback_data='admin:stats:30'),Btn('Всё время',callback_data='admin:stats:0')],
           [Btn('Назад',callback_data='admin:menu')]]
-    await render_screen(chat_id,tg_user_id,ctx,text=pages[-1],reply_markup=Mk(rows))
+    if len(pages)>1:
+        navigation=[]
+        if page_index:
+            navigation.append(Btn('← Страница',callback_data=f'admin:stats:{days}:{page_index-1}'))
+        if page_index<len(pages)-1:
+            navigation.append(Btn('Страница →',callback_data=f'admin:stats:{days}:{page_index+1}'))
+        rows.insert(0,navigation)
+    await render_screen(chat_id,tg_user_id,ctx,text=pages[page_index],reply_markup=Mk(rows))
 
 
 async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -775,8 +886,8 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     await ctx.bot.unban_chat_member(CHANNEL_ID, target, only_if_banned=True)
                     invite, expires = await create_invite_link(target, ctx)
                     await db.save_invite_link(target, invite, expire_at=expires)
-                    await ctx.bot.send_message(target, f"✅ Администратор выдал доступ к «Креативному мозгу» до {format_dt(sub['access_until'])}. Ссылка действует 1 час. Начни с закреплённого сообщения и Урока 1.",
-                                               reply_markup=with_admin_menu(target, Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite)]])))
+                    await render_screen(target,target,ctx,text=f"✅ Администратор выдал доступ к «Креативному мозгу» до {format_dt(sub['access_until'])}. Ссылка действует 1 час. Начни с закреплённого сообщения и Урока 1.",
+                                        reply_markup=Mk([[Btn("🧠 Войти в «Креативный мозг»", url=invite)]]),back_callback='user:status',force_new=True)
                 except TelegramError:
                     note += "\nНе удалось доставить ссылку. Проверьте права бота и доступность личного чата; срок уже записан."
                     logger.warning("admin grant delivery failed user_id=%s", target)
@@ -804,11 +915,15 @@ async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
     except TelegramError:
         logger.debug("callback answer unavailable")
-    if (query.data or "").startswith("admin:"):
-        await admin_router(query, ctx)
-    else:
+    token = _callback_query.set(query)
+    try:
         async with user_lock(query.from_user.id):
-            await user_router(query, ctx)
+            if (query.data or "").startswith("admin:"):
+                await admin_router(query, ctx)
+            else:
+                await user_router(query, ctx)
+    finally:
+        _callback_query.reset(token)
 
 
 async def fallback_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -817,16 +932,18 @@ async def fallback_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     if await handle_admin_input(update, ctx):
         return
-    await remember_user(user)
-    if active_subscription_until(await db.get_subscription(user.id)):
-        await show_active_access(chat.id, user.id, ctx)
-    else:
-        await render_screen(chat.id, user.id, ctx, text=texts.FALLBACK, reply_markup=Mk([
-            [Btn("▶️ Бесплатный урок", callback_data="user:lead_magnet")],
-            [Btn("🧠 Креативный мозг", callback_data="user:product")],
-        ]))
+    async with user_lock(user.id):
+        await remember_user(user)
+        if active_subscription_until(await db.get_subscription(user.id)):
+            await show_active_access(chat.id, user.id, ctx)
+        else:
+            await render_screen(chat.id, user.id, ctx, text=texts.FALLBACK, reply_markup=Mk([
+                [Btn("▶️ Бесплатный урок", callback_data="user:lead_magnet")],
+                [Btn("🧠 Креативный мозг", callback_data="user:product")],
+            ]))
 
 
+@serialized_command
 async def admin_shortcut(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user, chat = update.effective_user, update.effective_chat
     if not user or not chat or chat.type != "private" or not is_admin(user.id):
@@ -890,26 +1007,43 @@ def valid_youtube_url(url: str | None) -> bool:
 
 async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE,
                            welcome: bool = True, track: bool = True) -> None:
-    if welcome:
-        await ctx.bot.send_message(chat_id,await content('WELCOME'),disable_web_page_preview=True)
     url=await db.get_lead_magnet_url()
+    lesson=await db.get_lesson_message(tg_user_id) or {}
+    query=_callback_query.get()
+    if (query and query.from_user.id==tg_user_id and getattr(query.message,'message_id',None)
+            and await is_lesson_message(query.message,tg_user_id) and not lesson.get('lesson_message_id')):
+        text=getattr(query.message,'text',None) or ''
+        if url and text.endswith('\n\n'+url):
+            await db.set_lesson_message(tg_user_id,chat_id,query.message.message_id,url)
+            lesson=await db.get_lesson_message(tg_user_id)
+    if welcome:
+        await render_screen(chat_id,tg_user_id,ctx,text=await content('WELCOME'),
+                            reply_markup=next_keyboard('user:lead_magnet','▶️ Бесплатный урок'))
     if not valid_http_url(url):
-        await ctx.bot.send_message(chat_id,'Урок пока готовится. Когда ссылка появится, здесь можно будет открыть его бесплатно.',reply_markup=with_admin_menu(tg_user_id,next_keyboard('user:product','Что будет дальше? →')))
+        await render_screen(chat_id,tg_user_id,ctx,text='Урок пока готовится. Когда ссылка появится, здесь можно будет открыть его бесплатно.',
+                            reply_markup=next_keyboard('user:product','Что будет дальше? →'),back_callback='user:welcome')
+        return
+    if lesson.get('lesson_message_id') and lesson.get('lesson_chat_id')==chat_id and lesson.get('lesson_url')==url:
+        if not welcome:
+            await render_screen(chat_id,tg_user_id,ctx,text=await content('LEAD_CAPTION')+'\n\n'+url,
+                                reply_markup=Mk([[Btn('▶️ Открыть урок',url=url)],
+                                                 [Btn('Хочу продолжить →',callback_data='user:product')]]),
+                                back_callback='user:welcome')
         return
     kwargs={'chat_id':chat_id,'text':await content('LEAD_CAPTION')+'\n\n'+url,
-            'reply_markup':with_admin_menu(tg_user_id,next_keyboard('user:product','Хочу продолжить →'))}
+            'reply_markup':with_admin_menu(tg_user_id,navigation_keyboard(next_keyboard('user:product','Хочу продолжить →'),'user:welcome'))}
     if LinkPreviewOptions is not None:
         kwargs['link_preview_options']=LinkPreviewOptions(url=url,is_disabled=False,prefer_large_media=True,show_above_text=False)
     else:
         kwargs['disable_web_page_preview']=False
     try:
-        await ctx.bot.send_message(**kwargs)
+        message=await ctx.bot.send_message(**kwargs)
     except BadRequest:
         if 'link_preview_options' not in kwargs:
             raise
         kwargs.pop('link_preview_options')
-        await ctx.bot.send_message(**kwargs,disable_web_page_preview=False)
-    await db.clear_current_message(tg_user_id)
+        message=await ctx.bot.send_message(**kwargs,disable_web_page_preview=False)
+    await db.set_lesson_message(tg_user_id,chat_id,message.message_id,url)
     if track:
         await db.record_event(tg_user_id,'lead_magnet_sent')
 
@@ -918,7 +1052,7 @@ async def show_product(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_
     tariffs=await db.list_tariffs()
     markup=tariff_keyboard(tariffs) if len(tariffs)>1 else next_keyboard('user:buy','Я хочу')
     await render_screen(chat_id,tg_user_id,ctx,text=await content('PRODUCT'),
-                        reply_markup=markup)
+                        reply_markup=markup,back_callback='user:lesson')
     await db.record_event(tg_user_id,'product_opened')
     if len(tariffs)>1:
         await db.record_event(tg_user_id,'tariffs_opened')
@@ -961,9 +1095,10 @@ async def followup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if not await db.claim_followup(uid):
                 continue
             try:
-                await ctx.bot.send_message(uid,await content('FOLLOWUP'),reply_markup=with_admin_menu(uid,Mk([
+                await render_screen(uid,uid,ctx,text=await content('FOLLOWUP'),reply_markup=Mk([
                     [Btn('Посмотреть программу →',callback_data='user:product')],
-                    [Btn('Не напоминать об уроке',callback_data='user:quiet')]])))
+                    [Btn('Не напоминать об уроке',callback_data='user:quiet')]]),
+                    back_callback='user:lesson',force_new=True)
                 await db.mark_followup_sent(uid)
             except TelegramError:
                 logger.warning('followup delivery unconfirmed; no retry user_id=%s',uid)
@@ -998,8 +1133,11 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("handler failed error_type=%s", type(ctx.error).__name__)
     if isinstance(update, Update) and update.effective_chat and update.effective_chat.type == "private":
         try:
-            await ctx.bot.send_message(update.effective_chat.id, "Не удалось выполнить действие. Попробуй ещё раз чуть позже.",
-                                       reply_markup=with_admin_menu(update.effective_chat.id))
+            if update.callback_query:
+                await update.callback_query.answer('Не удалось выполнить действие. Попробуй ещё раз чуть позже.',show_alert=True)
+            else:
+                await render_screen(update.effective_chat.id,update.effective_user.id,ctx,
+                                    text='Не удалось выполнить действие. Попробуй ещё раз чуть позже.')
         except TelegramError:
             pass
 
@@ -1085,9 +1223,9 @@ async def extended_admin_route(data,chat_id,uid,ctx):
                 'onboarding_url':'Ссылка на первый урок или навигацию внутри канала. Для удаления отправьте «удалить».'}[key]
         await render_screen(chat_id,uid,ctx,text=SETTING_LABELS[key]+f"\nСейчас: {await db.get_setting(key,'не задано')}\n\n"+prompt,reply_markup=admin_cancel_keyboard())
     elif data.startswith('admin:stats:'):
-        value=data.rsplit(':',1)[-1]
-        if value in {'7','30','0'}:
-            await show_stats(chat_id,uid,ctx,days=int(value))
+        parts=data.split(':')
+        if len(parts) in {3,4} and parts[2] in {'7','30','0'} and (len(parts)==3 or parts[3].isdigit()):
+            await show_stats(chat_id,uid,ctx,days=int(parts[2]),page_index=int(parts[3]) if len(parts)==4 else 0)
     elif data=='admin:diagnostics':
         lines=['Проверка подключения',f'Канал: {CHANNEL_ID}']
         try:
@@ -1208,7 +1346,7 @@ async def show_tariffs(chat_id,user_id,ctx):
     text='Выбери удобный срок доступа. При продлении оставшиеся дни сохраняются.' if tariffs else 'Новые покупки пока приостановлены. Бесплатный урок остаётся доступным.'
     if tariffs:
         text+='\n\n'+'\n'.join(f"{t['title']}: {t['amount_rub']} ₽ / {t['days']} дней" for t in tariffs)
-    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=tariff_keyboard(tariffs))
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=tariff_keyboard(tariffs),back_callback='user:product')
     await db.record_event(user_id,'tariffs_opened')
 
 
@@ -1228,9 +1366,9 @@ def payment_payload(user_id,tariff,*,auto_opt_in=False,method_id=None):
     return payload
 
 
-async def render_payment(chat_id,user_id,row,ctx):
+async def render_payment(chat_id,user_id,row,ctx,*,force_new=False):
     if row['status']=='canceled':
-        await render_screen(chat_id,user_id,ctx,text='Счёт отменён. Выбери оплату заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
+        await render_screen(chat_id,user_id,ctx,text='Счёт отменён. Выбери оплату заново.',reply_markup=next_keyboard('user:buy','К оплате →'),force_new=force_new)
         return
     metadata=json.loads(row['metadata_json'])
     order=await db.get_checkout_by_payment(row['payment_id'])
@@ -1239,14 +1377,14 @@ async def render_payment(chat_id,user_id,row,ctx):
         text+=f"\n\n{order['title']}\n{row['amount_rub']} ₽ · {metadata['days']} дней.\nРазовая покупка, без автоматических списаний."
         await render_screen(chat_id,user_id,ctx,text=text,reply_markup=Mk([
             [Btn('📄 Условия',url=order['offer_url'])],
-            [Btn('Принимаю · оплатить разово',url=row['confirmation_url'])]]))
+            [Btn('Принимаю · оплатить разово',url=row['confirmation_url'])]]),back_callback='user:product',force_new=force_new)
         await db.mark_offer_presented(row['payment_id'])
         return
     auto=bool(order and (order['auto_opt_in'] or order['cycle_until']))
     text=await content('PAYMENT_CREATED')
     text+=f"\n\n{order['title'] if order else 'Доступ в канал'}: {row['amount_rub']} ₽ / {metadata['days']} дней."
     text+='\nВыбрано автопродление. Оно включится только после успешной оплаты и сохранения способа оплаты.' if auto else '\nРазовая покупка, без автоматических списаний.'
-    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=payment_keyboard(row['payment_id'],row['confirmation_url'],amount_rub=row['amount_rub']))
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=payment_keyboard(row['payment_id'],row['confirmation_url'],amount_rub=row['amount_rub']),force_new=force_new)
 
 
 async def handle_auto_failure(row,ctx):
@@ -1262,7 +1400,8 @@ async def handle_auto_failure(row,ctx):
         sub=await db.get_subscription(row['tg_user_id'])
         text=f"Автопродление не прошло. Новых автоматических попыток не будет.\n\nДоступ оплачен до {format_dt(sub['access_until'])}. Можно продлить вручную удобным способом."
         try:
-            await ctx.bot.send_message(row['tg_user_id'],text,reply_markup=next_keyboard('user:buy','Продлить вручную →'))
+            await render_screen(row['tg_user_id'],row['tg_user_id'],ctx,text=text,
+                                reply_markup=next_keyboard('user:buy','Продлить вручную →'),force_new=True)
             await db.mark_notification_sent(key)
         except TelegramError:
             logger.warning('auto failure notice unconfirmed user_id=%s',row['tg_user_id'])
@@ -1279,8 +1418,7 @@ async def reconcile_user(user_id,ctx):
                 key='checkout_ready:'+order['id']
                 if await db.claim_notification(key,user_id):
                     try:
-                        await db.clear_current_message(user_id)
-                        await render_payment(user_id,user_id,recovered,ctx)
+                        await render_payment(user_id,user_id,recovered,ctx,force_new=True)
                         await db.mark_notification_sent(key)
                     except TelegramError:
                         logger.warning('recovered checkout delivery unconfirmed user_id=%s',user_id)
@@ -1325,8 +1463,7 @@ async def payment_reconciliation_job(ctx):
                 continue
             try:
                 await db.touch_access_delivery(row['payment_id'])
-                await db.clear_current_message(row['tg_user_id'])
-                await send_access_link(row['tg_user_id'],row['tg_user_id'],row['payment_id'],sub['access_until'],ctx)
+                await send_access_link(row['tg_user_id'],row['tg_user_id'],row['payment_id'],sub['access_until'],ctx,force_new=True)
             except TelegramError:
                 logger.warning('automatic access delivery deferred user_id=%s',row['tg_user_id'])
 
@@ -1334,7 +1471,7 @@ async def payment_reconciliation_job(ctx):
 async def send_auto_problem(user_id,text,ctx,*,key):
     if await db.claim_notification(key,user_id):
         try:
-            await ctx.bot.send_message(user_id,text,reply_markup=next_keyboard('user:buy','Продлить вручную →'))
+            await render_screen(user_id,user_id,ctx,text=text,reply_markup=next_keyboard('user:buy','Продлить вручную →'),force_new=True)
             await db.mark_notification_sent(key)
         except TelegramError:
             logger.warning('renewal notification unconfirmed user_id=%s',user_id)
@@ -1413,8 +1550,8 @@ async def channel_join_request(update,ctx):
         onboarding=await db.get_setting('onboarding_url','')
         if valid_http_url(onboarding) and await db.claim_notification('onboarding:'+str(uid),uid):
             try:
-                await ctx.bot.send_message(uid,'Ты в «Креативном мозге». Начни с первого материала — дальше двигайся в удобном темпе.',
-                                           reply_markup=Mk([[Btn('Начать →',url=onboarding)]]))
+                await render_screen(uid,uid,ctx,text='Ты в «Креативном мозге». Начни с первого материала — дальше двигайся в удобном темпе.',
+                                    reply_markup=Mk([[Btn('Начать →',url=onboarding)]]),back_callback='user:status',force_new=True)
                 await db.mark_notification_sent('onboarding:'+str(uid))
             except TelegramError:
                 logger.warning('onboarding delivery unconfirmed user_id=%s',uid)
@@ -1453,10 +1590,13 @@ def activity_phrase(stats):
     return '\n'.join(parts) if parts else 'Можно продолжать в своём темпе — в том числе просто читать и пробовать идеи самостоятельно.'
 
 
+@serialized_command
 async def support(update,ctx):
     if not update.effective_user or update.effective_chat.type!='private':
         return
     uid=update.effective_user.id
+    await remember_user(update.effective_user)
+    await delete_incoming(update,ctx)
     url=await db.get_setting('support_url','')
     text='По вопросам доступа и оплаты можно обратиться в поддержку. Укажи свой номер пользователя: '+str(uid)+'. Данные карты присылать не нужно.'
     rows=[[Btn('Написать в поддержку',url=url)]] if valid_http_url(url) else []
@@ -1468,11 +1608,13 @@ async def support(update,ctx):
     await render_screen(uid,uid,ctx,text=text,reply_markup=Mk(rows))
 
 
+@serialized_command
 async def terms(update,ctx):
     if not update.effective_user or not update.effective_chat or update.effective_chat.type!='private':
         return
     uid=update.effective_user.id
     await remember_user(update.effective_user)
+    await delete_incoming(update,ctx)
     url=await db.get_offer_url()
     markup=Mk([[Btn('Открыть условия',url=url)]]) if valid_http_url(url) else None
     await render_screen(uid,uid,ctx,text='Условия доступа и оплаты:' if markup else 'Условия пока не опубликованы. Оформление доступа временно недоступно.',reply_markup=markup)
@@ -1489,6 +1631,7 @@ async def cancel_subscription(update,ctx):
     uid=update.effective_user.id
     async with user_lock(uid):
         await remember_user(update.effective_user)
+        await delete_incoming(update,ctx)
         await disable_auto_and_render(update.effective_chat.id,uid,ctx)
 
 

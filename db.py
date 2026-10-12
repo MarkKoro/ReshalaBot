@@ -250,6 +250,11 @@ async def create_tables() -> None:
         # Historical fulfilled purchases must not trigger a notification campaign.
         await db.execute("UPDATE payments SET access_notified_at=finalized_at WHERE finalized_at IS NOT NULL")
     await _add_missing_columns(db, "users", {"goal": "TEXT", "marketing_opt_out": "INTEGER NOT NULL DEFAULT 0"})
+    await _add_missing_columns(db, "users", {
+        "lesson_chat_id": "INTEGER NOT NULL DEFAULT 0",
+        "lesson_message_id": "INTEGER NOT NULL DEFAULT 0",
+        "lesson_url": "TEXT",
+    })
     await _add_missing_columns(db, "invite_links", {"requires_approval": "INTEGER NOT NULL DEFAULT 0"})
     await db.executescript("""
         CREATE TABLE IF NOT EXISTS tariffs (
@@ -363,6 +368,26 @@ async def get_current_message(tg_user_id: int) -> dict[str, Any] | None:
 @serialized
 async def clear_current_message(tg_user_id: int) -> None:
     await set_current_message(tg_user_id, 0, 0, "")
+
+
+@serialized
+async def set_lesson_message(tg_user_id: int, chat_id: int, message_id: int, url: str) -> None:
+    db = await connection()
+    await db.execute(
+        "UPDATE users SET lesson_chat_id=?, lesson_message_id=?, lesson_url=? WHERE tg_user_id=?",
+        (chat_id, message_id, url, tg_user_id),
+    )
+    await db.commit()
+
+
+@serialized
+async def get_lesson_message(tg_user_id: int) -> dict[str, Any] | None:
+    db = await connection()
+    async with db.execute(
+        "SELECT lesson_chat_id, lesson_message_id, lesson_url FROM users WHERE tg_user_id=?",
+        (tg_user_id,),
+    ) as cur:
+        return row_to_dict(await cur.fetchone())
 
 
 @serialized
