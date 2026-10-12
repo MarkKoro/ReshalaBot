@@ -53,6 +53,7 @@ YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
 ScreenKind = Literal["text", "video", "photo"]
 _callback_query: ContextVar = ContextVar("callback_query", default=None)
+_command_screen: ContextVar = ContextVar("command_screen", default=None)
 
 
 @dataclass(frozen=True)
@@ -171,8 +172,18 @@ def serialized_command(handler):
     async def wrapped(update, ctx):
         if not update.effective_user:
             return
-        async with user_lock(update.effective_user.id):
-            return await handler(update, ctx)
+        state = {'user_id': update.effective_user.id,
+                 'chat_id': update.effective_chat.id if update.effective_chat else None,
+                 'fresh': True}
+        token = _command_screen.set(state)
+        try:
+            async with user_lock(update.effective_user.id):
+                result = await handler(update, ctx)
+                if not state['fresh']:
+                    await delete_incoming(update, ctx)
+                return result
+        finally:
+            _command_screen.reset(token)
     return wrapped
 
 
@@ -244,6 +255,11 @@ async def render_screen(
     protected_source_id = 0
     query = _callback_query.get()
     message = query.message if query and query.from_user.id == tg_user_id else None
+    command = _command_screen.get()
+    own_command = command and command['user_id'] == tg_user_id and command['chat_id'] == chat_id
+    if own_command and command['fresh'] and not message:
+        # An edited old message can remain hidden after the user clears chat history.
+        force_new = True
     if message and message.chat_id == chat_id and getattr(message, 'message_id', None):
         if await is_lesson_message(message, tg_user_id):
             protected_source_id = message.message_id
@@ -268,6 +284,8 @@ async def render_screen(
 
     async def remember_screen(message_id):
         await db.set_current_message(tg_user_id, chat_id, message_id, kind)
+        if own_command:
+            command['fresh'] = False
         obsolete = {(old_chat_id, old_message_id), (chat_id, target_id)}
         obsolete.discard((chat_id, message_id))
         obsolete.discard((chat_id, protected_source_id))
@@ -373,14 +391,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not user or not chat or chat.type != "private":
         return
     await remember_user(user)
-    await delete_incoming(update, ctx)
     await db.clear_admin_state(user.id)
     source = ctx.args[0] if ctx.args and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", ctx.args[0]) else "direct"
     await db.record_start(user.id, source)
     if active_subscription_until(await db.get_subscription(user.id)):
         await show_active_access(chat.id, user.id, ctx)
     else:
-        await send_lead_magnet(chat.id, user.id, ctx)
+        await send_lead_magnet(chat.id, user.id, ctx, refresh_lesson=True)
 
 
 async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -728,7 +745,6 @@ async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not user or not chat or chat.type != "private" or not is_admin(user.id):
         return
     await remember_user(user)
-    await delete_incoming(update, ctx)
     await show_admin_menu(chat.id, user.id, ctx)
 
 
@@ -1006,7 +1022,7 @@ def valid_youtube_url(url: str | None) -> bool:
 
 
 async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE,
-                           welcome: bool = True, track: bool = True) -> None:
+                           welcome: bool = True, track: bool = True, refresh_lesson: bool = False) -> None:
     url=await db.get_lead_magnet_url()
     lesson=await db.get_lesson_message(tg_user_id) or {}
     query=_callback_query.get()
@@ -1023,7 +1039,7 @@ async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFA
         await render_screen(chat_id,tg_user_id,ctx,text='Урок пока готовится. Когда ссылка появится, здесь можно будет открыть его бесплатно.',
                             reply_markup=next_keyboard('user:product','Что будет дальше? →'),back_callback='user:welcome')
         return
-    if lesson.get('lesson_message_id') and lesson.get('lesson_chat_id')==chat_id and lesson.get('lesson_url')==url:
+    if not refresh_lesson and lesson.get('lesson_message_id') and lesson.get('lesson_chat_id')==chat_id and lesson.get('lesson_url')==url:
         if not welcome:
             await render_screen(chat_id,tg_user_id,ctx,text=await content('LEAD_CAPTION')+'\n\n'+url,
                                 reply_markup=Mk([[Btn('▶️ Открыть урок',url=url)],
@@ -1044,6 +1060,9 @@ async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFA
         kwargs.pop('link_preview_options')
         message=await ctx.bot.send_message(**kwargs,disable_web_page_preview=False)
     await db.set_lesson_message(tg_user_id,chat_id,message.message_id,url)
+    if refresh_lesson and lesson.get('lesson_chat_id') == chat_id and lesson.get('lesson_message_id'):
+        # Replace the old copy only after a new visible video/link has been delivered.
+        await retire_menu(chat_id, lesson['lesson_message_id'], tg_user_id, ctx)
     if track:
         await db.record_event(tg_user_id,'lead_magnet_sent')
 
@@ -1137,7 +1156,7 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.callback_query.answer('Не удалось выполнить действие. Попробуй ещё раз чуть позже.',show_alert=True)
             else:
                 await render_screen(update.effective_chat.id,update.effective_user.id,ctx,
-                                    text='Не удалось выполнить действие. Попробуй ещё раз чуть позже.')
+                                    text='Не удалось выполнить действие. Попробуй ещё раз чуть позже.',force_new=True)
         except TelegramError:
             pass
 
@@ -1596,7 +1615,6 @@ async def support(update,ctx):
         return
     uid=update.effective_user.id
     await remember_user(update.effective_user)
-    await delete_incoming(update,ctx)
     url=await db.get_setting('support_url','')
     text='По вопросам доступа и оплаты можно обратиться в поддержку. Укажи свой номер пользователя: '+str(uid)+'. Данные карты присылать не нужно.'
     rows=[[Btn('Написать в поддержку',url=url)]] if valid_http_url(url) else []
@@ -1614,7 +1632,6 @@ async def terms(update,ctx):
         return
     uid=update.effective_user.id
     await remember_user(update.effective_user)
-    await delete_incoming(update,ctx)
     url=await db.get_offer_url()
     markup=Mk([[Btn('Открыть условия',url=url)]]) if valid_http_url(url) else None
     await render_screen(uid,uid,ctx,text='Условия доступа и оплаты:' if markup else 'Условия пока не опубликованы. Оформление доступа временно недоступно.',reply_markup=markup)
@@ -1625,14 +1642,13 @@ async def disable_auto_and_render(chat_id,user_id,ctx):
     await render_screen(chat_id,user_id,ctx,text='Автопродление отключено. Оплаченный срок сохраняется. Если банк уже обрабатывает ранее отправленный платёж, дождёмся его результата; новых списаний не запустим.',reply_markup=next_keyboard('user:status','Мой доступ'))
 
 
+@serialized_command
 async def cancel_subscription(update,ctx):
     if not update.effective_user or not update.effective_chat or update.effective_chat.type!='private':
         return
     uid=update.effective_user.id
-    async with user_lock(uid):
-        await remember_user(update.effective_user)
-        await delete_incoming(update,ctx)
-        await disable_auto_and_render(update.effective_chat.id,uid,ctx)
+    await remember_user(update.effective_user)
+    await disable_auto_and_render(update.effective_chat.id,uid,ctx)
 
 
 def build_application() -> Application:

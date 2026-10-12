@@ -189,8 +189,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         success_id = max(self.messages)
         sent = self.telegram.send_message.await_count
         await bot.start(self.update, self.ctx)
-        self.assertIn('активен до',self.messages[success_id]['text'])
-        self.assertEqual(self.telegram.send_message.await_count,sent)
+        self.assertIn('активен до',self.last()['text'])
+        self.assertEqual(self.telegram.send_message.await_count,sent+1)
+        self.assertIn(success_id,self.deleted)
 
     async def test_repeat_start_preserves_first_source_without_duplicate_users(self):
         self.ctx.args = ["youtube_creative"]
@@ -1354,7 +1355,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(lesson['lesson_message_id'],self.deleted)
         self.assertEqual(set(self.messages)-self.deleted,{lesson['lesson_message_id'],notice_id})
 
-    async def test_forward_back_and_repeated_start_reuse_one_menu_after_restart(self):
+    async def test_forward_back_reuses_menu_and_restart_refreshes_without_clutter(self):
         await bot.start(self.update,self.ctx)
         lesson=await db.get_lesson_message(1)
         lesson_id=lesson['lesson_message_id']
@@ -1373,6 +1374,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.press('user:buy')
             await self.press('user:product')
         self.http.post.assert_awaited_once()
+        self.assertEqual(self.messages[lesson_id],snapshot)
+        self.assertNotIn(lesson_id,self.deleted)
         sent=self.telegram.send_message.await_count
         await db.close_db()
         await db.init_db()
@@ -1380,11 +1383,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.start(self.update,self.ctx)
         await self.press('user:lead_magnet')
         await self.press('user:product')
-        self.assertEqual((await db.get_current_message(1))['current_message_id'],menu_id)
-        self.assertEqual(await db.get_lesson_message(1),lesson)
-        self.assertEqual(self.telegram.send_message.await_count,sent)
-        self.assertEqual(self.messages[lesson_id],snapshot)
-        self.assertEqual(set(self.messages)-self.deleted,{lesson_id,menu_id})
+        new_menu=(await db.get_current_message(1))['current_message_id']
+        new_lesson=(await db.get_lesson_message(1))['lesson_message_id']
+        self.assertNotEqual(new_menu,menu_id)
+        self.assertEqual(self.telegram.send_message.await_count,sent+3)
+        self.assertEqual(self.messages[new_lesson],snapshot)
+        self.assertIn(lesson_id,self.deleted)
+        self.assertEqual(set(self.messages)-self.deleted,{new_lesson,new_menu})
 
     async def test_legacy_lesson_is_preserved_and_registered_on_first_navigation(self):
         await bot.render_screen(1,1,self.ctx,text=texts.WELCOME)
@@ -1406,13 +1411,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(video.message_id,self.deleted)
         self.assertGreater(self.last_active_id,video.message_id)
 
-    async def test_repeated_start_before_continuing_places_menu_below_the_video(self):
+    async def test_repeated_start_replaces_old_welcome_and_lesson(self):
         await bot.start(self.update,self.ctx)
         lesson=await db.get_lesson_message(1)
         await bot.start(self.update,self.ctx)
         self.assertGreater((await db.get_current_message(1))['current_message_id'],lesson['lesson_message_id'])
-        self.assertEqual(sum(URL in value['text'] for value in self.messages.values()),1)
-        self.assertNotIn(lesson['lesson_message_id'],self.deleted)
+        visible=set(self.messages)-self.deleted
+        self.assertEqual(sum(URL in self.messages[mid]['text'] for mid in visible),1)
+        self.assertEqual(len(visible),2)
+        self.assertIn(lesson['lesson_message_id'],self.deleted)
 
     async def test_click_on_an_older_live_menu_adopts_it_and_retires_the_other_menu(self):
         await bot.render_screen(1,1,self.ctx,text='Старое меню')
@@ -1512,6 +1519,70 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(self.last()['text'],first)
             self.assertEqual(self.last_active_id,menu_id)
             self.assertEqual(self.telegram.send_message.await_count,1)
+
+    async def test_start_recovers_when_client_hides_history_but_edits_still_succeed(self):
+        await bot.start(self.update,self.ctx)
+        await self.press('user:product')
+        hidden=set(self.messages)
+        await bot.start(self.update,self.ctx)
+        visible=set(self.messages)-self.deleted-hidden
+        self.assertEqual(len(visible),2)
+        self.assertTrue(any(self.messages[mid]['text']==texts.WELCOME for mid in visible))
+        self.assertTrue(any(URL in self.messages[mid]['text'] for mid in visible))
+
+    async def test_start_recovers_when_both_menu_and_lesson_are_deleted(self):
+        await bot.start(self.update,self.ctx)
+        await self.press('user:product')
+        self.deleted.update(self.messages)
+        await bot.start(self.update,self.ctx)
+        visible=set(self.messages)-self.deleted
+        self.assertEqual(len(visible),2)
+        self.assertTrue(any(URL in self.messages[mid]['text'] for mid in visible))
+
+    async def test_seven_starts_after_clear_keep_one_visible_menu_and_lesson(self):
+        await bot.start(self.update,self.ctx)
+        await self.press('user:product')
+        hidden=set(self.messages)
+        for _ in range(7):
+            await bot.start(self.update,self.ctx)
+            visible=set(self.messages)-self.deleted-hidden
+            self.assertEqual(len(visible),2)
+            self.assertEqual(sum(URL in self.messages[mid]['text'] for mid in visible),1)
+            self.assertTrue(any(self.messages[mid]['text']==texts.WELCOME for mid in visible))
+        await self.press('user:product')
+        menu_id=(await db.get_current_message(1))['current_message_id']
+        sent=self.telegram.send_message.await_count
+        for action in ('user:lesson','user:welcome','user:lead_magnet','user:product'):
+            await self.press(action)
+        self.assertEqual((await db.get_current_message(1))['current_message_id'],menu_id)
+        self.assertEqual(self.telegram.send_message.await_count,sent)
+
+    async def test_start_keeps_the_command_when_first_response_cannot_be_sent(self):
+        self.telegram.send_message.side_effect=TimedOut()
+        with self.assertRaises(TimedOut):
+            await bot.start(self.update,self.ctx)
+        self.assertNotIn(self.update.effective_message.message_id,self.deleted)
+        self.assertIsNone(bot._command_screen.get())
+
+    async def test_active_start_recovers_after_client_clear_without_changing_access(self):
+        await db.grant_access(1,30)
+        await bot.start(self.update,self.ctx)
+        subscription=await db.get_subscription(1)
+        hidden=set(self.messages)
+        await bot.start(self.update,self.ctx)
+        visible=set(self.messages)-self.deleted-hidden
+        self.assertEqual(len(visible),1)
+        self.assertIn('активен до',self.messages[next(iter(visible))]['text'])
+        self.assertEqual(await db.get_subscription(1),subscription)
+
+    async def test_other_entry_commands_recover_after_client_clear(self):
+        with patch.object(bot,'ADMIN_IDS',{1}):
+            for command,handler in (('/help',bot.support),('/terms',bot.terms),('/admin',bot.admin)):
+                self.update.effective_message.text=command
+                await handler(self.update,self.ctx)
+                hidden=set(self.messages)
+                await handler(self.update,self.ctx)
+                self.assertEqual(len(set(self.messages)-self.deleted-hidden),1)
 
 
 class ApplicationTests(unittest.TestCase):
