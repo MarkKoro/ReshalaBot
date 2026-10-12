@@ -24,7 +24,7 @@ import httpx
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Mk
-from telegram import InputMediaPhoto, InputMediaVideo, Update, User
+from telegram import InputMediaPhoto, InputMediaVideo, MessageEntity, Update, User
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, ChatJoinRequestHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -238,6 +238,7 @@ async def render_screen(
     include_admin_shortcut: bool = True,
     back_callback: str | None = None,
     force_new: bool = False,
+    entities: list[MessageEntity] | None = None,
 ) -> None:
     """Edit the pressed menu (or the saved menu for commands/jobs), preserving the lesson."""
     if back_callback is None:
@@ -297,7 +298,7 @@ async def render_screen(
         try:
             if kind == "text":
                 await ctx.bot.edit_message_text(chat_id=chat_id, message_id=target_id, text=text,
-                                                reply_markup=reply_markup, disable_web_page_preview=True)
+                                                reply_markup=reply_markup, disable_web_page_preview=True, entities=entities)
             elif kind == "video":
                 await ctx.bot.edit_message_media(
                     chat_id=chat_id,
@@ -328,7 +329,7 @@ async def render_screen(
         msg = await ctx.bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup)
     else:
         msg = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup,
-                                         disable_web_page_preview=True)
+                                         disable_web_page_preview=True, entities=entities)
     await remember_screen(msg.message_id)
 
 
@@ -562,10 +563,10 @@ async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str
             await handle_auto_failure(row,ctx)
             await render_screen(chat_id,tg_user_id,ctx,text='Этот платёж отменён. Можно выбрать способ оплаты заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
         else:
-            await render_screen(chat_id,tg_user_id,ctx,text=texts.PAYMENT_PENDING,reply_markup=payment_keyboard(payment_id,row['confirmation_url'],retry=True,amount_rub=row['amount_rub']))
+            await render_checkout_screen(chat_id,tg_user_id,ctx,row=row,text=texts.PAYMENT_PENDING,reply_markup=payment_keyboard(payment_id,row['confirmation_url'],retry=True,amount_rub=row['amount_rub']))
     except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
         logger.warning('payment check deferred payment_id=%s',payment_id)
-        await render_screen(chat_id,tg_user_id,ctx,text='Подтверждение пока недоступно. Я продолжу проверку; повторно оплачивать не нужно.',reply_markup=payment_keyboard(payment_id,row['confirmation_url'],retry=True,amount_rub=row['amount_rub']))
+        await render_checkout_screen(chat_id,tg_user_id,ctx,row=row,text='Подтверждение пока недоступно. Я продолжу проверку; повторно оплачивать не нужно.',reply_markup=payment_keyboard(payment_id,row['confirmation_url'],retry=True,amount_rub=row['amount_rub']))
 
 
 async def create_invite_link(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[str, str]:
@@ -1379,10 +1380,30 @@ def payment_payload(user_id,tariff,*,auto_opt_in=False,method_id=None):
     if method_id:
         payload['payment_method_id']=method_id
     else:
+        payload['payment_method_data']={'type':'sbp'}
         payload['confirmation']={'type':'redirect','return_url':YOOKASSA_RETURN_URL or (f'https://t.me/{BOT_USERNAME}' if BOT_USERNAME else 'https://t.me/')}
         if auto_opt_in:
             payload['save_payment_method']=True
     return payload
+
+
+SBP_LEGACY_HINT = '(Для оплаты через СБП (QR-код) на странице Юкассы нажмите Ещё)'
+
+
+async def render_checkout_screen(chat_id,user_id,ctx,*,row,text,reply_markup,back_callback=None,force_new=False):
+    order=await db.get_checkout_by_payment(row['payment_id'])
+    request=json.loads(order['request_json']) if order else {}
+    current=await db.get_payment(row['payment_id']) or row
+    payment=json.loads(current['raw_json'])
+    direct_sbp=((request.get('payment_method_data') or {}).get('type')=='sbp'
+                or (payment.get('payment_method') or {}).get('type')=='sbp')
+    entities=None
+    if valid_http_url(row.get('confirmation_url')) and not direct_sbp:
+        offset=telegram_length(text+'\n\n')
+        text+='\n\n'+SBP_LEGACY_HINT
+        entities=[MessageEntity(MessageEntity.BOLD,offset,telegram_length(SBP_LEGACY_HINT))]
+    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=reply_markup,back_callback=back_callback,
+                        force_new=force_new,entities=entities)
 
 
 async def render_payment(chat_id,user_id,row,ctx,*,force_new=False):
@@ -1394,7 +1415,7 @@ async def render_payment(chat_id,user_id,row,ctx,*,force_new=False):
     if order and order['offer_url'] and row['status']=='pending' and valid_http_url(row['confirmation_url']):
         text=await content('OFFER')
         text+=f"\n\n{order['title']}\n{row['amount_rub']} ₽ · {metadata['days']} дней.\nРазовая покупка, без автоматических списаний."
-        await render_screen(chat_id,user_id,ctx,text=text,reply_markup=Mk([
+        await render_checkout_screen(chat_id,user_id,ctx,row=row,text=text,reply_markup=Mk([
             [Btn('📄 Условия',url=order['offer_url'])],
             [Btn('Принимаю · оплатить разово',url=row['confirmation_url'])]]),back_callback='user:product',force_new=force_new)
         await db.mark_offer_presented(row['payment_id'])
@@ -1403,7 +1424,7 @@ async def render_payment(chat_id,user_id,row,ctx,*,force_new=False):
     text=await content('PAYMENT_CREATED')
     text+=f"\n\n{order['title'] if order else 'Доступ в канал'}: {row['amount_rub']} ₽ / {metadata['days']} дней."
     text+='\nВыбрано автопродление. Оно включится только после успешной оплаты и сохранения способа оплаты.' if auto else '\nРазовая покупка, без автоматических списаний.'
-    await render_screen(chat_id,user_id,ctx,text=text,reply_markup=payment_keyboard(row['payment_id'],row['confirmation_url'],amount_rub=row['amount_rub']),force_new=force_new)
+    await render_checkout_screen(chat_id,user_id,ctx,row=row,text=text,reply_markup=payment_keyboard(row['payment_id'],row['confirmation_url'],amount_rub=row['amount_rub']),force_new=force_new)
 
 
 async def handle_auto_failure(row,ctx):

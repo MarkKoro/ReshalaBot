@@ -245,7 +245,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.http.get.return_value = self.response(value)
             await self.press("user:check_payment:p1")
             self.assertIsNone(await db.get_subscription(1))
-            self.assertEqual(self.last()["text"], texts.PAYMENT_PENDING)
+            self.assertTrue(self.last()["text"].startswith(texts.PAYMENT_PENDING))
+            self.assertIn(bot.SBP_LEGACY_HINT,self.last()["text"])
+            self.assertEqual(self.last()['entities'][0].type,'bold')
             self.assertEqual(self.buttons()[0].text, "✅ Проверить ещё раз")
         result = await db.finalize_payment_once("p1", 1, "creative_brain", "channel_access", "creative_30", 30)
         self.assertFalse(result["ok"])
@@ -761,7 +763,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await db.get_subscription(1))["access_until"], until)
         self.assertEqual((await db.stats())["revenue_rub"], 400)
 
-    async def test_default_checkout_preserves_existing_one_time_yookassa_flow(self):
+    async def test_default_checkout_uses_sbp_in_existing_one_time_yookassa_flow(self):
         await bot.init_storage(NS())
         self.assertFalse(await bot.auto_available())
         await self.press("user:buy")
@@ -772,7 +774,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         request=self.http.post.call_args
         self.assertEqual(request.args[0],"https://api.yookassa.ru/v3/payments")
         payload=request.kwargs["json"]
-        self.assertEqual(set(payload),{"amount","capture","description","confirmation","metadata"})
+        self.assertEqual(set(payload),{"amount","capture","description","confirmation","metadata","payment_method_data"})
+        self.assertEqual(payload['payment_method_data'],{'type':'sbp'})
         self.assertEqual(payload["amount"],{"value":"400.00","currency":"RUB"})
         self.assertIs(payload["capture"],True)
         self.assertEqual(payload["confirmation"]["type"],"redirect")
@@ -984,6 +987,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         payload = self.http.post.call_args.kwargs["json"]
         self.assertEqual(payload["payment_method_id"], "saved-test-method")
         self.assertNotIn("confirmation", payload)
+        self.assertNotIn("payment_method_data", payload)
         self.assertEqual(db.parse_dt((await db.get_subscription(1))["access_until"]), db.parse_dt(until)+timedelta(days=30))
         self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests WHERE cycle_until IS NOT NULL")), 1)
         await bot.payment_reconciliation_job(self.ctx)
@@ -1583,6 +1587,82 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 hidden=set(self.messages)
                 await handler(self.update,self.ctx)
                 self.assertEqual(len(set(self.messages)-self.deleted-hidden),1)
+
+    async def test_new_checkout_opens_sbp_without_legacy_instructions(self):
+        payment=self.payment()
+        payment['payment_method']={'type':'sbp'}
+        payment['confirmation']['confirmation_url']='https://yoomoney.ru/checkout/payments/sbp?orderId=sbp-fixture'
+        self.http.post.return_value=self.response(payment)
+        await self.press('user:buy')
+        self.assertEqual(self.http.post.call_args.kwargs['json']['payment_method_data'],{'type':'sbp'})
+        self.assertEqual(self.buttons()[1].url,payment['confirmation']['confirmation_url'])
+        self.assertNotIn(bot.SBP_LEGACY_HINT,self.last()['text'])
+        self.assertIsNone(self.last()['entities'])
+        self.assertIsNone(await db.get_subscription(1))
+
+    async def test_sbp_initial_auto_setup_requires_explicit_opt_in(self):
+        await db.set_setting('auto_renew_enabled','1')
+        await self.press('user:buy')
+        self.http.post.assert_not_awaited()
+        await self.press('user:accept_offer_auto')
+        request=self.http.post.call_args.kwargs['json']
+        self.assertEqual(request['payment_method_data'],{'type':'sbp'})
+        self.assertTrue(request['save_payment_method'])
+        self.assertNotIn('payment_method_id',request)
+
+    async def test_legacy_smart_checkout_reuses_its_quote_and_shows_bold_sbp_hint(self):
+        payload=bot.payment_payload(1,bot.CURRENT_TARIFF)
+        payload.pop('payment_method_data')
+        order=await db.prepare_checkout(1,bot.CURRENT_TARIFF,payload,direct_offer=(OFFER,bot.OFFER_VERSION))
+        await billing.submit_checkout(order,'shop','key')
+        original=(await db.get_checkout(order['id']))['request_json']
+        await self.press('user:buy')
+        self.assertIn(bot.SBP_LEGACY_HINT,self.last()['text'])
+        self.assertEqual(self.last()['entities'][0].type,'bold')
+        self.assertEqual(self.buttons()[1].url,'https://example.com/pay')
+        await db.close_db()
+        await db.init_db()
+        await self.press('user:buy')
+        self.assertEqual((await db.get_checkout(order['id']))['request_json'],original)
+        self.http.post.assert_awaited_once()
+
+    async def test_legacy_bold_hint_preserves_custom_text_and_utf16_offsets(self):
+        await self.store_payment()
+        row=await db.get_payment('p1')
+        original='🧠 Условия <оферты> & цена 400 ₽'
+        await bot.render_checkout_screen(1,1,self.ctx,row=row,text=original,
+                                          reply_markup=bot.payment_keyboard('p1',row['confirmation_url']))
+        message=self.last()
+        self.assertEqual(message['text'],original+'\n\n'+bot.SBP_LEGACY_HINT)
+        entity=message['entities'][0]
+        bold=message['text'].encode('utf-16-le')[entity.offset*2:(entity.offset+entity.length)*2].decode('utf-16-le')
+        self.assertEqual(bold,bot.SBP_LEGACY_HINT)
+        self.assertEqual(entity.type,'bold')
+
+    async def test_legacy_hint_is_removed_when_refreshed_payment_is_already_sbp(self):
+        await self.store_payment()
+        payment=self.payment()
+        payment['payment_method']={'type':'sbp'}
+        self.http.get.return_value=self.response(payment)
+        await self.press('user:check_payment:p1')
+        self.assertNotIn(bot.SBP_LEGACY_HINT,self.last()['text'])
+        self.assertIsNone(self.last()['entities'])
+
+    async def test_unknown_legacy_request_keeps_original_method_and_idempotence_key(self):
+        payload=bot.payment_payload(1,bot.CURRENT_TARIFF)
+        payload.pop('payment_method_data')
+        order=await db.prepare_checkout(1,bot.CURRENT_TARIFF,payload,direct_offer=(OFFER,bot.OFFER_VERSION))
+        self.http.post.side_effect=httpx.ReadTimeout('unknown outcome')
+        await self.press('user:buy')
+        await db.close_db()
+        await db.init_db()
+        self.http.post.side_effect=None
+        await self.press('user:buy')
+        for call in self.http.post.call_args_list:
+            self.assertEqual(call.kwargs['json'],payload)
+            self.assertEqual(call.kwargs['headers']['Idempotence-Key'],order['id'])
+        self.assertEqual(len(await self.sql('SELECT 1 FROM checkout_requests')),1)
+        self.assertIn(bot.SBP_LEGACY_HINT,self.last()['text'])
 
 
 class ApplicationTests(unittest.TestCase):
