@@ -295,6 +295,23 @@ async def create_tables() -> None:
     """)
     await _add_missing_columns(db,"renewal_contracts",{"warned_until":"TEXT","warned_at":"TEXT"})
     await _add_missing_columns(db,"checkout_requests",{"offer_url":"TEXT","offer_version":"TEXT","offer_presented_at":"TEXT"})
+    await _add_missing_columns(db,"checkout_requests",{
+        "checkout_group_id":"TEXT", "payment_route":"TEXT NOT NULL DEFAULT 'legacy'",
+    })
+    # Existing payloads and idempotence keys remain unchanged. A manual purchase
+    # can offer one SBP invoice and one Smart Payment invoice for the same quote.
+    async with db.execute("SELECT id,request_json FROM checkout_requests WHERE payment_route='legacy'") as cur:
+        previous = await cur.fetchall()
+    for row in previous:
+        payload = json.loads(row['request_json'])
+        await db.execute("UPDATE checkout_requests SET checkout_group_id=COALESCE(checkout_group_id,id),payment_route=? WHERE id=?",
+                         (checkout_route(payload),row['id']))
+    async with db.execute("SELECT sql FROM sqlite_master WHERE name='checkout_open_user'") as cur:
+        index = await cur.fetchone()
+    if index and 'payment_route' not in index['sql']:
+        await db.execute("DROP INDEX checkout_open_user")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS checkout_open_user ON checkout_requests(tg_user_id,payment_route) WHERE status IN ('creating','created')")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS checkout_creating_user ON checkout_requests(tg_user_id) WHERE status='creating'")
     await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('creative_30','Креативный мозг — 30 дней',400,30,1,?)", (iso_now(),))
     await db.commit()
 
@@ -1028,8 +1045,14 @@ async def set_admin_setting(key, value, admin_id):
 @serialized
 async def pending_checkout(tg_user_id):
     con = await connection()
-    async with con.execute("SELECT * FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') ORDER BY created_at LIMIT 1",(tg_user_id,)) as cur:
+    async with con.execute("SELECT * FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') ORDER BY (status='creating') DESC,created_at LIMIT 1",(tg_user_id,)) as cur:
         return row_to_dict(await cur.fetchone())
+
+
+def checkout_route(payload):
+    if payload.get('payment_method_id'):
+        return 'saved'
+    return 'sbp' if (payload.get('payment_method_data') or {}).get('type')=='sbp' else 'all'
 
 
 @serialized
@@ -1061,10 +1084,10 @@ async def prepare_checkout(tg_user_id, tariff, payload, *, auto_opt_in=False, cy
             # A deliberate manual checkout cancels future scheduled attempts.
             await con.execute("UPDATE renewal_contracts SET enabled=0,disabled_at=?,disabled_reason='manual_checkout' WHERE tg_user_id=?",(now,tg_user_id))
         await con.execute("""INSERT INTO checkout_requests(id,tg_user_id,plan_id,title,amount_rub,days,
-            request_json,created_at,auto_opt_in,cycle_until,consent_key,offer_url,offer_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            request_json,created_at,auto_opt_in,cycle_until,consent_key,offer_url,offer_version,checkout_group_id,payment_route) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (order_id,tg_user_id,tariff.code,tariff.title,tariff.amount_rub,tariff.days,
              json.dumps(payload,ensure_ascii=False),now,int(auto_opt_in),cycle_until,consent_key,
-             direct_offer[0] if direct_offer else None,direct_offer[1] if direct_offer else None))
+             direct_offer[0] if direct_offer else None,direct_offer[1] if direct_offer else None,order_id,checkout_route(payload)))
         await con.commit()
         return await get_checkout(order_id)
     except BaseException:
@@ -1087,6 +1110,72 @@ async def get_checkout_by_payment(payment_id):
 
 
 @serialized
+async def checkout_choices(payment_id):
+    con = await connection()
+    source = await get_checkout_by_payment(payment_id)
+    if not source:
+        return []
+    group = source['checkout_group_id'] or source['id']
+    async with con.execute("SELECT * FROM checkout_requests WHERE COALESCE(checkout_group_id,id)=? AND status IN ('creating','created','paid') ORDER BY created_at",(group,)) as cur:
+        return [dict(row) for row in await cur.fetchall()]
+
+
+@serialized
+async def prepare_alternative_checkout(payment_id):
+    """Prepare only the other manual route, using the original frozen quote."""
+    con = await connection()
+    await con.execute("BEGIN IMMEDIATE")
+    try:
+        source = await get_checkout_by_payment(payment_id)
+        payment = await get_payment(payment_id)
+        if (not source or source['status']!='created' or not payment or payment['status']!='pending'
+                or payment['finalized_at'] or source['auto_opt_in'] or source['cycle_until']):
+            await con.commit()
+            return None
+        payload = json.loads(source['request_json'])
+        if payload.get('payment_method_id') or payload.get('payment_token') or payload.get('save_payment_method') or (payload.get('confirmation') or {}).get('type')!='redirect':
+            await con.commit()
+            return None
+        route = 'all' if checkout_route(payload)=='sbp' else 'sbp'
+        group = source['checkout_group_id'] or source['id']
+        # An unrelated or legacy invoice must still settle before another quote.
+        async with con.execute("""SELECT 1 FROM payments p LEFT JOIN checkout_requests c ON c.payment_id=p.payment_id
+            WHERE p.tg_user_id=? AND p.finalized_at IS NULL AND p.status!='canceled'
+            AND (c.id IS NULL OR COALESCE(c.checkout_group_id,c.id)!=?) LIMIT 1""",(source['tg_user_id'],group)) as cur:
+            blocked = await cur.fetchone()
+        async with con.execute("SELECT 1 FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') AND COALESCE(checkout_group_id,id)!=? LIMIT 1",(source['tg_user_id'],group)) as cur:
+            blocked = blocked or await cur.fetchone()
+        if blocked:
+            await con.commit()
+            return None
+        choices = await checkout_choices(payment_id)
+        if any(row['status']=='paid' for row in choices):
+            await con.commit()
+            return None
+        existing = next((row for row in choices if row['payment_route']==route),None)
+        if existing:
+            await con.commit()
+            return existing
+        if any(row['status']=='creating' for row in choices):
+            await con.commit()
+            return None
+        if route=='sbp':
+            payload['payment_method_data']={'type':'sbp'}
+        else:
+            payload.pop('payment_method_data',None)
+        order_id = uuid.uuid4().hex
+        await con.execute("""INSERT INTO checkout_requests(id,tg_user_id,plan_id,title,amount_rub,days,
+            request_json,created_at,offer_url,offer_version,checkout_group_id,payment_route) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (order_id,source['tg_user_id'],source['plan_id'],source['title'],source['amount_rub'],source['days'],
+             json.dumps(payload,ensure_ascii=False),iso_now(),source['offer_url'],source['offer_version'],group,route))
+        await con.commit()
+        return await get_checkout(order_id)
+    except BaseException:
+        await con.rollback()
+        raise
+
+
+@serialized
 async def mark_offer_presented(payment_id):
     con=await connection()
     await con.execute("UPDATE checkout_requests SET offer_presented_at=COALESCE(offer_presented_at,?) WHERE payment_id=? AND offer_url IS NOT NULL",
@@ -1102,6 +1191,9 @@ async def attach_checkout(order, payment):
         payment_id = payment['id']
         async with con.execute("SELECT * FROM payments WHERE payment_id=?",(payment_id,)) as cur:
             old = await cur.fetchone()
+        old_order = await get_checkout_by_payment(payment_id)
+        if old_order and old_order['id'] != order['id']:
+            raise ValueError("Payment already belongs to another checkout")
         if old and (old['tg_user_id'] != order['tg_user_id'] or old['plan_id'] != order['plan_id'] or old['amount_rub'] != order['amount_rub']):
             raise ValueError("Payment already belongs to another order")
         payload = json.loads(order['request_json'])

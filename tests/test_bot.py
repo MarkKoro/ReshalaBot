@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 import sqlite3
@@ -82,6 +83,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.http.__aexit__ = AsyncMock(return_value=False)
         self.http.post = AsyncMock(return_value=self.response(self.payment()))
         self.http.get = AsyncMock(return_value=self.response(self.payment()))
+        self.provider_payments = {}
+        self.http.post.side_effect = self.provider_post
+        self.http.get.side_effect = self.provider_get
         self.client_patch = patch.object(bot.httpx, "AsyncClient", return_value=self.http)
         self.client_patch.start()
 
@@ -94,6 +98,27 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     def response(self, value):
         return NS(raise_for_status=lambda: None, json=lambda: value)
+
+    async def provider_post(self, url, **kwargs):
+        value=copy.deepcopy(self.http.post.return_value.json())
+        order=await db.get_checkout(kwargs['headers']['Idempotence-Key'])
+        if order and order['checkout_group_id']!=order['id']:
+            route=order['payment_route']
+            value.update(id='alt-'+order['id'],metadata=kwargs['json']['metadata'],amount=kwargs['json']['amount'])
+            value['confirmation']={'confirmation_url':'https://example.com/pay-'+route}
+            if route=='sbp':
+                value['payment_method']={'type':'sbp'}
+            else:
+                value.pop('payment_method',None)
+        self.provider_payments[value['id']]=value
+        return self.response(value)
+
+    async def provider_get(self, url, **kwargs):
+        pid=url.rsplit('/',1)[1]
+        configured=self.http.get.return_value.json()
+        if pid.startswith('alt-') and configured['id']!=pid:
+            return self.response(self.provider_payments[pid])
+        return self.http.get.return_value
 
     def payment(self, pid="p1", status="pending", plan=None, project="creative_brain"):
         plan = plan or bot.CURRENT_TARIFF
@@ -158,11 +183,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.press("user:buy")
         self.assertIn(texts.OFFER, self.last()["text"])
         self.assertEqual(self.buttons()[0].url, OFFER)
-        self.assertEqual(self.buttons()[1].text, "Принимаю · оплатить разово")
+        self.assertEqual(self.buttons()[1].text, "Через СБП")
         self.assertEqual(self.buttons()[1].url, "https://example.com/pay")
         self.assertIsNone(self.buttons()[1].callback_data)
         self.assertFalse(await db.has_accepted_offer(1))
-        payload = self.http.post.call_args.kwargs["json"]
+        payload = self.http.post.call_args_list[0].kwargs["json"]
         self.assertEqual(payload["amount"], {"value": "400.00", "currency": "RUB"})
         self.assertEqual(payload["metadata"]["days"], "30")
         self.assertEqual(payload["confirmation"]["return_url"], "https://example.com/return")
@@ -185,7 +210,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(2,self.deleted)
         events = [row["event_name"] for row in await db.get_user_path(1)]
         self.assertEqual(events, ["start", "lead_magnet_sent", "product_opened", "buy_clicked",
-                                  "payment_created", "offer_accepted", "payment_succeeded", "access_granted"])
+                                  "payment_created", "payment_created", "offer_accepted", "payment_succeeded", "access_granted"])
         success_id = max(self.messages)
         sent = self.telegram.send_message.await_count
         await bot.start(self.update, self.ctx)
@@ -215,7 +240,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.http.post.return_value = self.response(self.payment())
         await self.press("user:buy")
         await self.press("user:accept_offer_and_pay")
-        self.assertEqual(self.http.post.await_count, 1)
+        self.assertEqual(self.http.post.await_count, 2)
         self.http.get.return_value = self.response(self.payment(status="succeeded"))
         await self.press("user:check_payment:p1")
         self.assertEqual(db.parse_dt((await db.get_subscription(1))["access_until"]),
@@ -246,8 +271,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.press("user:check_payment:p1")
             self.assertIsNone(await db.get_subscription(1))
             self.assertTrue(self.last()["text"].startswith(texts.PAYMENT_PENDING))
-            self.assertIn(bot.SBP_LEGACY_HINT,self.last()["text"])
-            self.assertEqual(self.last()['entities'][0].type,'bold')
+            self.assertNotIn('нажмите Ещё',self.last()["text"])
+            self.assertIsNone(self.last().get('entities'))
             self.assertEqual(self.buttons()[0].text, "✅ Проверить ещё раз")
         result = await db.finalize_payment_once("p1", 1, "creative_brain", "channel_access", "creative_30", 30)
         self.assertFalse(result["ok"])
@@ -303,11 +328,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.http.get.return_value = self.response(self.payment())
         await self.press("user:buy")
         await self.press("user:accept_offer_and_pay")
-        self.assertEqual(self.http.post.await_count, 1)
+        self.assertEqual(self.http.post.await_count, 2)
         for route in ("user:tariff:m1_first", "user:tariff:m1", "user:tariff:m3", "user:review:0"):
             await self.press(route)
             self.assertEqual(self.last()["text"], texts.PRODUCT)
-        self.assertEqual(self.http.post.await_count, 1)
+        self.assertEqual(self.http.post.await_count, 2)
 
     async def test_offer_missing_stale_or_changed_blocks_payment(self):
         await db.set_setting("auto_renew_enabled","1")
@@ -432,7 +457,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.http.get.side_effect = httpx.ConnectError("offline")
         await bot.followup_job(self.ctx)
         self.telegram.send_message.assert_not_awaited()
-        self.http.get.side_effect = None
+        self.http.get.side_effect = self.provider_get
         self.http.get.return_value = self.response(self.payment(status="canceled"))
         self.telegram.send_message.side_effect = TimedOut()
         await bot.followup_job(self.ctx)
@@ -632,9 +657,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("400", self.last()["text"])
         self.assertIn("30", self.last()["text"])
         self.assertEqual(sum("400" in b.text for b in self.buttons()), 0)
-        self.assertEqual(self.buttons()[1].text, "Принимаю · оплатить разово")
+        self.assertEqual(self.buttons()[1].text, "Через СБП")
         self.assertEqual(self.buttons()[1].url, "https://example.com/pay")
-        self.assertEqual(len(self.buttons()), 3)
+        self.assertEqual(self.buttons()[2].text, "Другие способы")
+        self.assertEqual(self.buttons()[2].url, "https://example.com/pay-all")
+        self.assertEqual(len(self.buttons()), 4)
         for message in self.messages.values():
             markup = message.get("reply_markup")
             if markup:
@@ -771,7 +798,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.buttons()[1].url,"https://example.com/pay")
         self.assertIsNone(self.buttons()[1].callback_data)
         self.assertFalse(await db.has_accepted_offer(1))
-        request=self.http.post.call_args
+        request=self.http.post.call_args_list[0]
         self.assertEqual(request.args[0],"https://api.yookassa.ru/v3/payments")
         payload=request.kwargs["json"]
         self.assertEqual(set(payload),{"amount","capture","description","confirmation","metadata","payment_method_data"})
@@ -783,10 +810,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_offer_repeated_click_and_restart_reuse_invoice_without_consent(self):
         await asyncio.gather(self.press("user:buy"),self.press("user:buy"))
-        self.assertEqual(self.http.post.await_count,1)
+        self.assertEqual(self.http.post.await_count,2)
         self.assertFalse(await db.has_accepted_offer(1))
         self.assertIsNone(await db.get_subscription(1))
-        self.assertEqual([b.text for b in self.buttons()],["📄 Условия","Принимаю · оплатить разово","◀️ Назад"])
+        self.assertEqual([b.text for b in self.buttons()],["📄 Условия","Через СБП","Другие способы","◀️ Назад"])
         order=await db.get_checkout_by_payment("p1")
         self.assertEqual(order["offer_url"],OFFER)
         self.assertIsNotNone(order["offer_presented_at"])
@@ -794,8 +821,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await db.init_db()
         self.ctx.user_data={}
         await self.press("user:buy")
-        self.assertEqual(self.http.post.await_count,1)
-        self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests")),1)
+        self.assertEqual(self.http.post.await_count,2)
+        self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests")),2)
         self.assertFalse(any(r["event_name"]=="offer_accepted" for r in await db.get_user_path(1)))
         self.assertEqual(self.buttons()[1].url,"https://example.com/pay")
 
@@ -805,7 +832,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot,"OFFER_VERSION","2"):
             await self.press("user:buy")
             self.assertEqual(self.buttons()[0].url,OFFER)
-            self.assertEqual(self.http.post.await_count,1)
+            self.assertEqual(self.http.post.await_count,2)
             self.assertFalse(await db.has_accepted_offer(1))
             self.http.get.return_value=self.response(self.payment(status="succeeded"))
             await bot.payment_reconciliation_job(self.ctx)
@@ -862,15 +889,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(order["payment_id"])
         await db.close_db()
         await db.init_db()
-        self.http.post.side_effect = None
+        self.http.post.side_effect = self.provider_post
         self.http.post.return_value = self.response(self.payment())
         self.http.get.return_value = self.response(self.payment())
         await bot.payment_reconciliation_job(self.ctx)
-        second = self.http.post.call_args.kwargs
+        second = self.http.post.call_args_list[1].kwargs
         self.assertEqual(first["headers"], second["headers"])
         self.assertEqual(first["json"], second["json"])
-        self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests")), 1)
-        self.assertEqual(len(await self.sql("SELECT * FROM payments")), 1)
+        self.assertEqual(len(await self.sql("SELECT * FROM checkout_requests")), 2)
+        self.assertEqual(len(await self.sql("SELECT * FROM payments")), 2)
         self.assertTrue(any(b.url == "https://example.com/pay" for b in self.buttons()))
 
     async def test_old_unknown_request_never_reissued_outside_idempotence_window(self):
@@ -1017,7 +1044,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.automatic_renewals_job(self.ctx)
         self.assertEqual(self.http.post.await_count, 1)
         self.assertEqual(self.telegram.send_message.await_count, before)
-        self.http.post.side_effect = None
+        self.http.post.side_effect = self.provider_post
         self.http.post.return_value = self.response(self.payment("recovered", "succeeded"))
         await bot.payment_reconciliation_job(self.ctx)
         self.assertEqual(first["headers"], self.http.post.call_args.kwargs["headers"])
@@ -1248,7 +1275,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await db.pending_checkout(1))
         self.assertEqual((await db.get_renewal(1))["enabled"],0)
         self.assertEqual(self.buttons()[0].callback_data,"user:accept_offer_and_pay")
-        self.http.post.side_effect=None
+        self.http.post.side_effect=self.provider_post
         self.http.post.return_value=self.response(self.payment())
         await self.press("user:accept_offer_and_pay")
         self.assertNotIn("save_payment_method",self.http.post.call_args.kwargs["json"])
@@ -1377,7 +1404,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.press('user:product')
             await self.press('user:buy')
             await self.press('user:product')
-        self.http.post.assert_awaited_once()
+        self.assertEqual(self.http.post.await_count,2)
         self.assertEqual(self.messages[lesson_id],snapshot)
         self.assertNotIn(lesson_id,self.deleted)
         sent=self.telegram.send_message.await_count
@@ -1588,15 +1615,29 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 await handler(self.update,self.ctx)
                 self.assertEqual(len(set(self.messages)-self.deleted-hidden),1)
 
-    async def test_new_checkout_opens_sbp_without_legacy_instructions(self):
+    async def test_checkout_has_two_distinct_direct_urls_with_only_sbp_restricted(self):
         payment=self.payment()
         payment['payment_method']={'type':'sbp'}
         payment['confirmation']['confirmation_url']='https://yoomoney.ru/checkout/payments/sbp?orderId=sbp-fixture'
         self.http.post.return_value=self.response(payment)
         await self.press('user:buy')
-        self.assertEqual(self.http.post.call_args.kwargs['json']['payment_method_data'],{'type':'sbp'})
+        sbp,other=[call.kwargs for call in self.http.post.call_args_list]
+        self.assertEqual(sbp['json']['payment_method_data'],{'type':'sbp'})
+        self.assertNotIn('payment_method_data',other['json'])
+        self.assertNotIn('payment_method_id',other['json'])
+        self.assertNotIn('payment_token',other['json'])
+        self.assertNotIn('save_payment_method',other['json'])
+        self.assertNotEqual(sbp['headers'],other['headers'])
+        for payload in (sbp['json'],other['json']):
+            self.assertEqual(payload['amount'],{'value':'400.00','currency':'RUB'})
+            self.assertTrue(payload['capture'])
+            self.assertEqual(payload['confirmation'],{'type':'redirect','return_url':'https://example.com/return'})
         self.assertEqual(self.buttons()[1].url,payment['confirmation']['confirmation_url'])
-        self.assertNotIn(bot.SBP_LEGACY_HINT,self.last()['text'])
+        self.assertEqual(self.buttons()[1].text,'Через СБП')
+        self.assertEqual(self.buttons()[2].text,'Другие способы')
+        self.assertEqual(self.buttons()[2].url,'https://example.com/pay-all')
+        self.assertIsNone(self.buttons()[2].callback_data)
+        self.assertNotIn('нажмите Ещё',self.last()['text'])
         self.assertIsNone(self.last()['entities'])
         self.assertIsNone(await db.get_subscription(1))
 
@@ -1610,42 +1651,40 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(request['save_payment_method'])
         self.assertNotIn('payment_method_id',request)
 
-    async def test_legacy_smart_checkout_reuses_its_quote_and_shows_bold_sbp_hint(self):
+    async def test_legacy_smart_checkout_keeps_original_quote_and_adds_sbp_without_hint(self):
         payload=bot.payment_payload(1,bot.CURRENT_TARIFF)
         payload.pop('payment_method_data')
         order=await db.prepare_checkout(1,bot.CURRENT_TARIFF,payload,direct_offer=(OFFER,bot.OFFER_VERSION))
         await billing.submit_checkout(order,'shop','key')
         original=(await db.get_checkout(order['id']))['request_json']
         await self.press('user:buy')
-        self.assertIn(bot.SBP_LEGACY_HINT,self.last()['text'])
-        self.assertEqual(self.last()['entities'][0].type,'bold')
-        self.assertEqual(self.buttons()[1].url,'https://example.com/pay')
+        self.assertNotIn('нажмите Ещё',self.last()['text'])
+        self.assertIsNone(self.last()['entities'])
+        self.assertEqual(self.buttons()[1].url,'https://example.com/pay-sbp')
+        self.assertEqual(self.buttons()[2].url,'https://example.com/pay')
         await db.close_db()
         await db.init_db()
         await self.press('user:buy')
         self.assertEqual((await db.get_checkout(order['id']))['request_json'],original)
-        self.http.post.assert_awaited_once()
+        self.assertEqual(self.http.post.await_count,2)
 
-    async def test_legacy_bold_hint_preserves_custom_text_and_utf16_offsets(self):
+    async def test_checkout_preserves_custom_text_and_does_not_add_sbp_hint(self):
         await self.store_payment()
         row=await db.get_payment('p1')
         original='🧠 Условия <оферты> & цена 400 ₽'
-        await bot.render_checkout_screen(1,1,self.ctx,row=row,text=original,
-                                          reply_markup=bot.payment_keyboard('p1',row['confirmation_url']))
+        await bot.render_checkout_screen(1,1,self.ctx,row=row,text=original)
         message=self.last()
-        self.assertEqual(message['text'],original+'\n\n'+bot.SBP_LEGACY_HINT)
-        entity=message['entities'][0]
-        bold=message['text'].encode('utf-16-le')[entity.offset*2:(entity.offset+entity.length)*2].decode('utf-16-le')
-        self.assertEqual(bold,bot.SBP_LEGACY_HINT)
-        self.assertEqual(entity.type,'bold')
+        self.assertEqual(message['text'],original)
+        self.assertIsNone(message['entities'])
+        self.assertEqual(next(b.url for b in self.buttons() if b.text=='Другие способы'),'https://example.com/pay')
 
-    async def test_legacy_hint_is_removed_when_refreshed_payment_is_already_sbp(self):
+    async def test_legacy_payment_check_has_no_sbp_hint(self):
         await self.store_payment()
         payment=self.payment()
         payment['payment_method']={'type':'sbp'}
         self.http.get.return_value=self.response(payment)
         await self.press('user:check_payment:p1')
-        self.assertNotIn(bot.SBP_LEGACY_HINT,self.last()['text'])
+        self.assertNotIn('нажмите Ещё',self.last()['text'])
         self.assertIsNone(self.last()['entities'])
 
     async def test_unknown_legacy_request_keeps_original_method_and_idempotence_key(self):
@@ -1656,13 +1695,132 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.press('user:buy')
         await db.close_db()
         await db.init_db()
-        self.http.post.side_effect=None
+        self.http.post.side_effect=self.provider_post
         await self.press('user:buy')
-        for call in self.http.post.call_args_list:
+        for call in self.http.post.call_args_list[:2]:
             self.assertEqual(call.kwargs['json'],payload)
             self.assertEqual(call.kwargs['headers']['Idempotence-Key'],order['id'])
-        self.assertEqual(len(await self.sql('SELECT 1 FROM checkout_requests')),1)
-        self.assertIn(bot.SBP_LEGACY_HINT,self.last()['text'])
+        self.assertEqual(len(await self.sql('SELECT 1 FROM checkout_requests')),2)
+        alternative=self.http.post.call_args_list[2].kwargs
+        self.assertEqual(alternative['json']['payment_method_data'],{'type':'sbp'})
+        self.assertNotEqual(alternative['headers']['Idempotence-Key'],order['id'])
+        self.assertNotIn('нажмите Ещё',self.last()['text'])
+
+    async def test_smart_payment_success_grants_once_and_retires_both_payment_buttons(self):
+        await self.press('user:buy')
+        choices=await db.checkout_choices('p1')
+        other=next(row for row in choices if row['payment_route']=='all')
+        pid=other['payment_id']
+        value=copy.deepcopy(self.provider_payments[pid])
+        value.update(status='succeeded',paid=True)
+        self.provider_payments[pid]=value
+        # Checking the SBP invoice also discovers a completed Smart Payment.
+        await self.press('user:check_payment:p1')
+        until=(await db.get_subscription(1))['access_until']
+        self.assertAlmostEqual((db.parse_dt(until)-db.utcnow()).total_seconds(),30*86400,delta=5)
+        self.assertFalse(any(b.text in {'Через СБП','Другие способы'} for b in self.buttons()))
+        self.assertEqual((await db.stats())['revenue_rub'],400)
+        self.assertEqual((await db.get_payment(pid))['status'],'succeeded')
+        await self.press('user:check_payment:'+pid)
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['access_until'],until)
+        self.assertEqual(self.telegram.create_chat_invite_link.await_count,1)
+
+    async def test_canceled_sbp_invoice_does_not_hide_successful_other_payment(self):
+        await self.press('user:buy')
+        self.http.get.return_value=self.response(self.payment(status='canceled'))
+        for pid,value in self.provider_payments.items():
+            if pid.startswith('alt-'):
+                value.update(status='succeeded',paid=True)
+        await self.press('user:check_payment:p1')
+        self.assertIn('Оплата подтверждена',self.last()['text'])
+        self.assertAlmostEqual((db.parse_dt((await db.get_subscription(1))['access_until'])-db.utcnow()).total_seconds(),30*86400,delta=5)
+        self.assertEqual((await db.stats())['revenue_rub'],400)
+
+    async def test_unknown_alternative_request_recovers_same_key_and_body_after_restart(self):
+        async def post(url,**kwargs):
+            if 'payment_method_data' not in kwargs['json']:
+                raise httpx.ReadTimeout('alternative creation unknown')
+            return await self.provider_post(url,**kwargs)
+        self.http.post.side_effect=post
+        await self.press('user:buy')
+        original=self.http.post.call_args_list[1].kwargs
+        self.assertEqual(self.buttons()[1].text,'Через СБП')
+        self.assertIsNotNone(self.buttons()[1].url)
+        callback=self.buttons()[2].callback_data
+        self.assertTrue(callback.startswith('user:pay_options:'))
+        self.assertLessEqual(len(callback.encode()),64)
+        await db.close_db()
+        await db.init_db()
+        self.ctx.user_data={}
+        self.http.post.side_effect=self.provider_post
+        await self.press(callback)
+        recovered=self.http.post.call_args_list[2].kwargs
+        self.assertEqual(original['headers'],recovered['headers'])
+        self.assertEqual(original['json'],recovered['json'])
+        self.assertEqual(next(b.url for b in self.buttons() if b.text=='Другие способы'),'https://example.com/pay-all')
+        self.assertEqual(len(await self.sql('SELECT * FROM checkout_requests')),2)
+        await self.press('user:buy')
+        self.assertEqual(self.http.post.await_count,3)
+
+    async def test_known_payment_is_finalized_even_if_alternative_post_is_unknown(self):
+        async def post(url,**kwargs):
+            if 'payment_method_data' not in kwargs['json']:
+                raise httpx.ReadTimeout('alternative creation unknown')
+            return await self.provider_post(url,**kwargs)
+        self.http.post.side_effect=post
+        await self.press('user:buy')
+        self.http.get.return_value=self.response(self.payment(status='succeeded'))
+        await bot.payment_reconciliation_job(self.ctx)
+        until=(await db.get_subscription(1))['access_until']
+        self.assertIn('Оплата подтверждена',self.last()['text'])
+        self.assertEqual((await db.stats())['revenue_rub'],400)
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['access_until'],until)
+        self.assertEqual(self.telegram.create_chat_invite_link.await_count,1)
+
+    async def test_pair_uses_frozen_quote_and_terms_when_admin_changes_both(self):
+        await self.press('user:buy')
+        snapshot=[(row['id'],row['request_json'],row['offer_url']) for row in await db.checkout_choices('p1')]
+        await db.save_tariff('creative_30','Новая цена',700,60,True,99)
+        await db.set_offer_url(OFFER+'/new')
+        with patch.object(bot,'OFFER_VERSION','2'):
+            await self.press('user:buy')
+        self.assertIn('400',self.last()['text'])
+        self.assertIn('30',self.last()['text'])
+        self.assertEqual(self.buttons()[0].url,OFFER)
+        self.assertEqual([(row['id'],row['request_json'],row['offer_url']) for row in await db.checkout_choices('p1')],snapshot)
+        self.assertEqual(self.http.post.await_count,2)
+        self.assertFalse(await db.has_accepted_offer(1))
+
+    async def test_option_retry_cannot_read_or_change_another_users_quote(self):
+        await self.press('user:buy')
+        order=await db.get_checkout_by_payment('p1')
+        await db.upsert_user(2,'other','Other')
+        before=self.http.post.await_count
+        await self.press('user:pay_options:'+order['id'],user=NS(id=2,username='other',first_name='Other',last_name=None))
+        self.assertEqual(self.http.post.await_count,before)
+        self.assertEqual(self.last()['text'],texts.PRODUCT)
+        self.assertFalse(any(b.url=='https://example.com/pay' for b in self.buttons()))
+
+    async def test_two_confirmed_payments_are_accounted_without_losing_paid_days(self):
+        await self.press('user:buy')
+        self.http.get.return_value=self.response(self.payment(status='succeeded'))
+        for pid,value in self.provider_payments.items():
+            if pid.startswith('alt-'):
+                value.update(status='succeeded',paid=True)
+        await bot.payment_reconciliation_job(self.ctx)
+        until=(await db.get_subscription(1))['access_until']
+        self.assertAlmostEqual((db.parse_dt(until)-db.utcnow()).total_seconds(),60*86400,delta=5)
+        self.assertEqual((await db.stats())['revenue_rub'],800)
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['access_until'],until)
+
+    async def test_alternative_is_not_created_for_saved_or_opted_in_auto_payment(self):
+        await self.buy(auto=True)
+        self.assertIsNone(await db.prepare_alternative_checkout('p1'))
+        self.assertEqual(self.http.post.await_count,1)
+        self.assertEqual([b.text for b in self.buttons() if b.url],['Через СБП'])
 
 
 class ApplicationTests(unittest.TestCase):
