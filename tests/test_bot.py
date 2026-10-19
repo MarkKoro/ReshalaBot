@@ -171,6 +171,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.start(self.update, self.ctx)
         self.assertEqual(self.messages[1]["text"], texts.WELCOME)
         self.assertNotIn("link_preview_options", self.messages[1])
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertEqual((await db.get_lesson_message(1))['lesson_message_id'],0)
+        lesson_button=next(b for b in self.buttons() if b.text=='▶️ Бесплатный урок')
+        await self.press(lesson_button.callback_data)
         lesson = dict(self.messages[2])
         self.assertIn(URL, lesson["text"])
         preview = lesson["link_preview_options"]
@@ -478,6 +482,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle_admin_input(self.update, self.ctx)
         self.assertEqual(await db.get_lead_magnet_url(), self.update.effective_message.text)
         await self.press("admin:lead_test")
+        self.assertIn(await db.get_lead_magnet_url(),self.last()['text'])
+        self.assertFalse(self.last()['link_preview_options'].is_disabled)
         self.assertEqual(await db.get_user_path(99), [])
         await self.press("admin:lead_clear")
         self.assertIsNone(await db.get_lead_magnet_url())
@@ -512,10 +518,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_preview_fallback_and_missing_lesson(self):
         with patch.object(bot, "LinkPreviewOptions", None):
-            await bot.send_lead_magnet(1, 1, self.ctx)
+            await bot.send_lead_magnet(1, 1, self.ctx,welcome=False)
         self.assertFalse(self.last()["disable_web_page_preview"])
         await db.clear_lead_magnet_url()
-        await bot.send_lead_magnet(1, 1, self.ctx)
+        await bot.send_lead_magnet(1, 1, self.ctx,welcome=False)
         events = [r for r in await db.get_user_path(1) if r["event_name"] == "lead_magnet_sent"]
         self.assertEqual(len(events), 1)
 
@@ -529,7 +535,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 raise BadRequest("unsupported link_preview_options")
             return await original_send(*args, **kwargs)
         self.telegram.send_message.side_effect = reject_first
-        await bot.send_lead_magnet(1, 1, self.ctx)
+        await bot.send_lead_magnet(1, 1, self.ctx,welcome=False)
         self.assertFalse(self.last()["disable_web_page_preview"])
 
     async def test_url_validation(self):
@@ -1345,7 +1351,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle_admin_input(self.update,self.ctx)
         url="https://example.com/"+"a"*2020
         await db.set_lead_magnet_url(url)
-        await bot.send_lead_magnet(99,99,self.ctx,track=False)
+        await bot.send_lead_magnet(99,99,self.ctx,welcome=False,track=False)
         self.assertLessEqual(bot.telegram_length(self.last()["text"]),4096)
         self.assertIn(url,self.last()["text"])
 
@@ -1372,6 +1378,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_followup_becomes_the_menu_and_preserves_the_video(self):
         await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
         lesson=await db.get_lesson_message(1)
         snapshot=dict(self.messages[lesson['lesson_message_id']])
         await self.age_lead()
@@ -1388,6 +1395,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forward_back_reuses_menu_and_restart_refreshes_without_clutter(self):
         await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
         lesson=await db.get_lesson_message(1)
         lesson_id=lesson['lesson_message_id']
         snapshot=dict(self.messages[lesson_id])
@@ -1412,7 +1420,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await db.init_db()
         self.ctx.user_data={}
         await bot.start(self.update,self.ctx)
-        await self.press('user:lead_magnet')
+        await self.press('user:open_lesson')
         await self.press('user:product')
         new_menu=(await db.get_current_message(1))['current_message_id']
         new_lesson=(await db.get_lesson_message(1))['lesson_message_id']
@@ -1442,10 +1450,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(video.message_id,self.deleted)
         self.assertGreater(self.last_active_id,video.message_id)
 
-    async def test_repeated_start_replaces_old_welcome_and_lesson(self):
+    async def test_repeated_start_refreshes_lesson_only_after_its_button(self):
         await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
         lesson=await db.get_lesson_message(1)
+        sent=self.telegram.send_message.await_count
         await bot.start(self.update,self.ctx)
+        self.assertEqual(self.telegram.send_message.await_count,sent+1)
+        self.assertEqual(await db.get_lesson_message(1),lesson)
+        self.assertNotIn(lesson['lesson_message_id'],self.deleted)
+        await self.press('user:open_lesson')
         self.assertGreater((await db.get_current_message(1))['current_message_id'],lesson['lesson_message_id'])
         visible=set(self.messages)-self.deleted
         self.assertEqual(sum(URL in self.messages[mid]['text'] for mid in visible),1)
@@ -1553,33 +1567,43 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_recovers_when_client_hides_history_but_edits_still_succeed(self):
         await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
         await self.press('user:product')
         hidden=set(self.messages)
         await bot.start(self.update,self.ctx)
         visible=set(self.messages)-self.deleted-hidden
-        self.assertEqual(len(visible),2)
+        self.assertEqual(len(visible),1)
         self.assertTrue(any(self.messages[mid]['text']==texts.WELCOME for mid in visible))
+        self.assertFalse(any(URL in self.messages[mid]['text'] for mid in visible))
+        await self.press('user:open_lesson')
+        visible=set(self.messages)-self.deleted-hidden
         self.assertTrue(any(URL in self.messages[mid]['text'] for mid in visible))
 
     async def test_start_recovers_when_both_menu_and_lesson_are_deleted(self):
         await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
         await self.press('user:product')
         self.deleted.update(self.messages)
         await bot.start(self.update,self.ctx)
         visible=set(self.messages)-self.deleted
-        self.assertEqual(len(visible),2)
+        self.assertEqual(len(visible),1)
+        self.assertEqual(self.last()['text'],texts.WELCOME)
+        await self.press('user:open_lesson')
+        visible=set(self.messages)-self.deleted
         self.assertTrue(any(URL in self.messages[mid]['text'] for mid in visible))
 
-    async def test_seven_starts_after_clear_keep_one_visible_menu_and_lesson(self):
+    async def test_seven_starts_after_clear_keep_one_greeting_until_lesson_button(self):
         await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
         await self.press('user:product')
         hidden=set(self.messages)
         for _ in range(7):
             await bot.start(self.update,self.ctx)
             visible=set(self.messages)-self.deleted-hidden
-            self.assertEqual(len(visible),2)
-            self.assertEqual(sum(URL in self.messages[mid]['text'] for mid in visible),1)
+            self.assertEqual(len(visible),1)
+            self.assertEqual(sum(URL in self.messages[mid]['text'] for mid in visible),0)
             self.assertTrue(any(self.messages[mid]['text']==texts.WELCOME for mid in visible))
+        await self.press('user:open_lesson')
         await self.press('user:product')
         menu_id=(await db.get_current_message(1))['current_message_id']
         sent=self.telegram.send_message.await_count
@@ -1587,6 +1611,57 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await self.press(action)
         self.assertEqual((await db.get_current_message(1))['current_message_id'],menu_id)
         self.assertEqual(self.telegram.send_message.await_count,sent)
+
+    async def test_lesson_delivery_and_followup_start_only_after_welcome_button(self):
+        await bot.start(self.update,self.ctx)
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertEqual(self.last()['text'],texts.WELCOME)
+        self.assertNotIn(URL,self.last()['text'])
+        self.assertEqual([row['event_name'] for row in await db.get_user_path(1)],['start'])
+        self.assertEqual(await db.followup_candidates(db.utcnow()+timedelta(hours=23)),[])
+        button=next(b for b in self.buttons() if b.text=='▶️ Бесплатный урок')
+        self.assertIsNone(button.url)
+        await self.press(button.callback_data)
+        self.assertEqual(self.telegram.send_message.await_count,2)
+        self.assertIn(URL,self.last()['text'])
+        self.assertTrue(self.last()['link_preview_options'].prefer_large_media)
+        self.assertEqual([row['event_name'] for row in await db.get_user_path(1)],['start','lead_magnet_sent'])
+        self.assertEqual(await db.followup_candidates(db.utcnow()+timedelta(hours=23)),[1])
+
+    async def test_fresh_welcome_button_recovers_preview_after_server_restart(self):
+        await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
+        old_lesson=await db.get_lesson_message(1)
+        hidden=set(self.messages)
+        await bot.start(self.update,self.ctx)
+        button=next(b for b in self.buttons() if b.text=='▶️ Бесплатный урок')
+        await db.close_db()
+        await db.init_db()
+        self.ctx.user_data={}
+        await self.press(button.callback_data)
+        lesson=await db.get_lesson_message(1)
+        self.assertNotEqual(lesson['lesson_message_id'],old_lesson['lesson_message_id'])
+        self.assertNotIn(lesson['lesson_message_id'],hidden)
+        preview=self.messages[lesson['lesson_message_id']]['link_preview_options']
+        self.assertEqual(preview.url,URL)
+        self.assertFalse(preview.is_disabled)
+        self.assertTrue(preview.prefer_large_media)
+        self.assertIn(old_lesson['lesson_message_id'],self.deleted)
+
+    async def test_failed_lesson_delivery_keeps_greeting_available_for_retry(self):
+        await bot.start(self.update,self.ctx)
+        greeting=self.last_active_id
+        button=next(b for b in self.buttons() if b.text=='▶️ Бесплатный урок')
+        send=self.telegram.send_message.side_effect
+        self.telegram.send_message.side_effect=TimedOut()
+        with self.assertRaises(TimedOut):
+            await self.press(button.callback_data)
+        self.assertNotIn(greeting,self.deleted)
+        self.assertEqual((await db.get_lesson_message(1))['lesson_message_id'],0)
+        self.assertEqual([row['event_name'] for row in await db.get_user_path(1)],['start'])
+        self.telegram.send_message.side_effect=send
+        await self.press(button.callback_data)
+        self.assertIn(URL,self.last()['text'])
 
     async def test_start_keeps_the_command_when_first_response_cannot_be_sent(self):
         self.telegram.send_message.side_effect=TimedOut()

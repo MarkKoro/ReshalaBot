@@ -398,7 +398,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if active_subscription_until(await db.get_subscription(user.id)):
         await show_active_access(chat.id, user.id, ctx)
     else:
-        await send_lead_magnet(chat.id, user.id, ctx, refresh_lesson=True)
+        await send_lead_magnet(chat.id, user.id, ctx)
 
 
 async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -436,6 +436,9 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await show_active_access(chat_id,tg_user_id,ctx)
         else:
             await show_product(chat_id,tg_user_id,ctx)
+    elif data=='user:open_lesson':
+        # A new /start must work even when the client has hidden the saved lesson.
+        await send_lead_magnet(chat_id,tg_user_id,ctx,welcome=False,refresh_lesson=True)
     elif data in {'user:lead_magnet','user:start_intro','user:lesson'}:
         await send_lead_magnet(chat_id,tg_user_id,ctx,welcome=False)
     elif data=='user:access':
@@ -808,7 +811,7 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await db.clear_lead_magnet_url()
         await show_admin_lead_magnet(chat_id, tg_user_id, ctx)
     elif data in {"admin:lead_test", "admin:user_start"}:
-        await send_lead_magnet(chat_id, tg_user_id, ctx, track=False)
+        await send_lead_magnet(chat_id, tg_user_id, ctx, welcome=False, track=False, refresh_lesson=True)
     elif data in {"admin:grant", "admin:revoke", "admin:user_path"}:
         state = data.split(":")[1]
         await db.set_admin_state(tg_user_id, state)
@@ -1048,6 +1051,11 @@ def valid_youtube_url(url: str | None) -> bool:
 
 async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE,
                            welcome: bool = True, track: bool = True, refresh_lesson: bool = False) -> None:
+    if welcome:
+        # Greeting and lesson are separate steps; only its button sends the video.
+        await render_screen(chat_id,tg_user_id,ctx,text=await content('WELCOME'),
+                            reply_markup=next_keyboard('user:open_lesson','▶️ Бесплатный урок'))
+        return
     url=await db.get_lead_magnet_url()
     lesson=await db.get_lesson_message(tg_user_id) or {}
     query=_callback_query.get()
@@ -1057,19 +1065,15 @@ async def send_lead_magnet(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFA
         if url and text.endswith('\n\n'+url):
             await db.set_lesson_message(tg_user_id,chat_id,query.message.message_id,url)
             lesson=await db.get_lesson_message(tg_user_id)
-    if welcome:
-        await render_screen(chat_id,tg_user_id,ctx,text=await content('WELCOME'),
-                            reply_markup=next_keyboard('user:lead_magnet','▶️ Бесплатный урок'))
     if not valid_http_url(url):
         await render_screen(chat_id,tg_user_id,ctx,text='Урок пока готовится. Когда ссылка появится, здесь можно будет открыть его бесплатно.',
                             reply_markup=next_keyboard('user:product','Что будет дальше? →'),back_callback='user:welcome')
         return
     if not refresh_lesson and lesson.get('lesson_message_id') and lesson.get('lesson_chat_id')==chat_id and lesson.get('lesson_url')==url:
-        if not welcome:
-            await render_screen(chat_id,tg_user_id,ctx,text=await content('LEAD_CAPTION')+'\n\n'+url,
-                                reply_markup=Mk([[Btn('▶️ Открыть урок',url=url)],
-                                                 [Btn('Хочу продолжить →',callback_data='user:product')]]),
-                                back_callback='user:welcome')
+        await render_screen(chat_id,tg_user_id,ctx,text=await content('LEAD_CAPTION')+'\n\n'+url,
+                            reply_markup=Mk([[Btn('▶️ Открыть урок',url=url)],
+                                             [Btn('Хочу продолжить →',callback_data='user:product')]]),
+                            back_callback='user:welcome')
         return
     kwargs={'chat_id':chat_id,'text':await content('LEAD_CAPTION')+'\n\n'+url,
             'reply_markup':with_admin_menu(tg_user_id,navigation_keyboard(next_keyboard('user:product','Хочу продолжить →'),'user:welcome'))}
