@@ -788,8 +788,89 @@ async def mark_renewal_notice_sent(tg_user_id: int) -> None:
 async def mark_subscription_expired(tg_user_id: int) -> None:
     db = await connection()
     now = iso_now()
-    await db.execute("UPDATE subscriptions SET status = 'expired', expiration_notice_sent_at = ?, updated_at = ? WHERE tg_user_id = ?", (now, now, tg_user_id))
+    await db.execute("UPDATE subscriptions SET status = 'expired', updated_at = ? WHERE tg_user_id = ?", (now, tg_user_id))
     await db.commit()
+
+
+@serialized
+async def pending_expiration_notices():
+    con = await connection()
+    async with con.execute("SELECT * FROM subscriptions WHERE status='expired' AND expiration_notice_sent_at IS NULL") as cur:
+        return [dict(row) for row in await cur.fetchall()]
+
+
+@serialized
+async def mark_expiration_notice_sent(tg_user_id, access_until):
+    con = await connection()
+    await con.execute("UPDATE subscriptions SET expiration_notice_sent_at=?,updated_at=? WHERE tg_user_id=? AND status='expired' AND access_until=?",
+                      (iso_now(),iso_now(),tg_user_id,access_until))
+    await con.commit()
+
+
+@serialized
+async def supersede_used_discount_checkouts(tg_user_id):
+    """Retire unused promo options after a purchase; retain their provider history."""
+    con = await connection()
+    if not await has_successful_payment(tg_user_id):
+        return
+    async with con.execute("SELECT c.* FROM checkout_requests c JOIN payments p ON p.payment_id=c.payment_id WHERE c.tg_user_id=? AND c.status='created' AND p.status='pending' AND p.finalized_at IS NULL",(tg_user_id,)) as cur:
+        rows = await cur.fetchall()
+    for row in rows:
+        if (json.loads(row['request_json']).get('metadata') or {}).get('quiz_token'):
+            await con.execute("UPDATE checkout_requests SET status='superseded' WHERE id=?",(row['id'],))
+    await con.commit()
+
+
+@serialized
+async def prepare_subscription_checkout(tg_user_id, access_until, tariff, payload, direct_offer):
+    """Freeze a full-price manual renewal without reusing a discounted quote."""
+    con = await connection()
+    await con.execute('BEGIN IMMEDIATE')
+    try:
+        sub = await get_subscription(tg_user_id)
+        published = next((row for row in await list_tariffs() if row['code']==tariff.code),None)
+        if not sub or sub['access_until']!=access_until or sub['status'] not in {'active','expired'}:
+            await con.commit()
+            return None
+        meta = payload.get('metadata') or {}
+        if (not published or (tariff.amount_rub,tariff.days)!=(published['amount_rub'],published['days'])
+                or Decimal(payload['amount']['value'])!=Decimal(str(tariff.amount_rub))
+                or meta.get('purpose')!='subscription_renewal' or meta.get('subscription_until')!=access_until
+                or meta.get('quiz_token') or meta.get('discount_percent') or payload.get('save_payment_method')
+                or payload.get('payment_method_id') or payload.get('payment_token')):
+            raise ValueError('Renewal must use the current full-price manual tariff')
+        async with con.execute("SELECT * FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') ORDER BY created_at",(tg_user_id,)) as cur:
+            orders = [dict(row) for row in await cur.fetchall()]
+        for order in orders:
+            request = json.loads(order['request_json'])
+            if (request.get('metadata') or {}).get('purpose')=='subscription_renewal' and (request.get('metadata') or {}).get('subscription_until')==access_until:
+                if ((order['plan_id'],order['amount_rub'],order['days'],order['offer_url'],order['offer_version'])
+                        ==(tariff.code,tariff.amount_rub,tariff.days,*direct_offer)):
+                    await con.commit()
+                    return order
+            if (not order['payment_id'] or order['auto_opt_in'] or order['cycle_until']
+                    or request.get('save_payment_method') or request.get('payment_method_id') or request.get('payment_token')):
+                await con.commit()
+                return None
+        # The caller has refreshed all invoices. Known unpaid manual alternatives
+        # can be superseded, but unknown requests or money in capture cannot.
+        async with con.execute("""SELECT 1 FROM payments p LEFT JOIN checkout_requests c ON c.payment_id=p.payment_id
+            WHERE p.tg_user_id=? AND p.finalized_at IS NULL AND p.status!='canceled'
+            AND (c.id IS NULL OR p.status!='pending') LIMIT 1""",(tg_user_id,)) as cur:
+            if await cur.fetchone():
+                await con.commit()
+                return None
+        await con.execute("UPDATE checkout_requests SET status='superseded' WHERE tg_user_id=? AND status='created'",(tg_user_id,))
+        order_id = uuid.uuid4().hex
+        await con.execute("""INSERT INTO checkout_requests(id,tg_user_id,plan_id,title,amount_rub,days,
+            request_json,created_at,offer_url,offer_version,checkout_group_id,payment_route) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (order_id,tg_user_id,tariff.code,tariff.title,tariff.amount_rub,tariff.days,
+             json.dumps(payload,ensure_ascii=False),iso_now(),*direct_offer,order_id,checkout_route(payload)))
+        await con.commit()
+        return await get_checkout(order_id)
+    except BaseException:
+        await con.rollback()
+        raise
 
 
 @serialized
@@ -1257,11 +1338,12 @@ async def prepare_alternative_checkout(payment_id):
         quiz=await get_lesson_quiz(source['tg_user_id'])
         discounted=bool(quiz and quiz['token']==(payload.get('metadata') or {}).get('quiz_token')
                         and quiz['checkout_group_id']==group)
+        replacement=discounted or (payload.get('metadata') or {}).get('purpose')=='subscription_renewal' or await has_successful_payment(source['tg_user_id'])
         # An unrelated or legacy invoice must still settle before another quote.
         async with con.execute("""SELECT 1 FROM payments p LEFT JOIN checkout_requests c ON c.payment_id=p.payment_id
             WHERE p.tg_user_id=? AND p.finalized_at IS NULL AND p.status!='canceled'
             AND (c.id IS NULL OR COALESCE(c.checkout_group_id,c.id)!=?)
-            AND NOT (? AND COALESCE(c.status,'')='superseded') LIMIT 1""",(source['tg_user_id'],group,int(discounted))) as cur:
+            AND NOT (? AND COALESCE(c.status,'')='superseded') LIMIT 1""",(source['tg_user_id'],group,int(replacement))) as cur:
             blocked = await cur.fetchone()
         async with con.execute("SELECT 1 FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') AND COALESCE(checkout_group_id,id)!=? LIMIT 1",(source['tg_user_id'],group)) as cur:
             blocked = blocked or await cur.fetchone()
@@ -1430,6 +1512,13 @@ async def due_renewals():
         AND julianday(s.access_until)<=julianday(?) ORDER BY s.access_until""",
         ((utcnow()+timedelta(days=1)).isoformat(),)) as cur:
         return [dict(r) for r in await cur.fetchall()]
+
+
+@serialized
+async def notification_claimed(key):
+    con = await connection()
+    async with con.execute('SELECT 1 FROM notification_attempts WHERE key=?',(key,)) as cur:
+        return bool(await cur.fetchone())
 
 
 @serialized

@@ -149,7 +149,7 @@ def format_dt(value: str | None) -> str:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return db.iso_now()
 
 
 async def safe_delete_message(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> bool:
@@ -377,7 +377,7 @@ def active_subscription_until(sub: dict | None) -> str | None:
         return None
     access_until = sub.get("access_until")
     parsed_until = db.parse_dt(access_until)
-    if not parsed_until or parsed_until <= datetime.now(timezone.utc):
+    if not parsed_until or parsed_until <= db.utcnow():
         return None
     return access_until
 
@@ -538,10 +538,12 @@ async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tarif
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         await render_screen(chat_id,tg_user_id,ctx,text='Оплата временно недоступна. Попробуй позже или открой помощь через /paysupport.',reply_markup=back)
         return
+    await db.supersede_used_discount_checkouts(tg_user_id)
     order=await db.pending_checkout(tg_user_id)
     # Check every invoice before offering links: either route may have been paid.
     unsettled=[]
     uncertain=False
+    retired_uncertain=False
     for pending in await db.list_unfinalized_payments(tg_user_id):
         try:
             remote=await refresh_payment(pending)
@@ -551,11 +553,23 @@ async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tarif
                     await send_access_link(chat_id,tg_user_id,pending['payment_id'],result['access_until'],ctx)
                     return
             elif remote['status']!='canceled':
-                unsettled.append(await db.get_payment(pending['payment_id']))
+                old_quote=await db.get_checkout_by_payment(pending['payment_id'])
+                used_discount=bool(old_quote and old_quote['status']=='superseded'
+                                   and (json.loads(old_quote['request_json']).get('metadata') or {}).get('quiz_token')
+                                   and await db.has_successful_payment(tg_user_id))
+                if not used_discount:
+                    unsettled.append(await db.get_payment(pending['payment_id']))
             order=await db.pending_checkout(tg_user_id)
         except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
             uncertain=True
-            unsettled.append(pending)
+            old_quote=await db.get_checkout_by_payment(pending['payment_id'])
+            if old_quote and old_quote['status']=='superseded' and await db.has_successful_payment(tg_user_id):
+                retired_uncertain=True
+            else:
+                unsettled.append(pending)
+    if retired_uncertain:
+        await render_screen(chat_id,tg_user_id,ctx,text='Проверяю прошлую оплату. Новый счёт появится после проверки; скидка на первую покупку уже использована.',reply_markup=back)
+        return
     if unsettled:
         await render_payment(chat_id,tg_user_id,unsettled[0],ctx,prepare_choices=not uncertain)
         return
@@ -686,27 +700,93 @@ async def send_existing_access(chat_id: int, tg_user_id: int, payment_id: str | 
                         reply_markup=next_keyboard("user:buy", "Вернуться в канал →"))
 
 
-async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def subscription_payment_options(tg_user_id, access_until, ctx):
+    """Prepare both direct URLs for a current full-price subscription quote."""
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        raise ValueError('Renewal payment is unavailable')
+    if not await reconcile_user(tg_user_id,ctx,pending_is_known=True,notify_checkout_ready=False):
+        raise billing.PaymentUncertain('Earlier payment must be reconciled')
+    sub=await db.get_subscription(tg_user_id)
+    if not sub or sub['access_until']!=access_until:
+        return None  # A confirmed payment extended access before this notice.
+    tariffs=await db.list_tariffs()
+    last=await db.get_payment(sub['last_payment_id']) if sub['last_payment_id'] else None
+    plan=next((row for row in tariffs if last and row['code']==last['plan_id']),tariffs[0] if tariffs else None)
+    offer=await db.get_offer_url()
+    if not plan or not valid_http_url(offer):
+        raise ValueError('Renewal tariff or terms are unavailable')
+    tariff=Tariff(plan['code'],plan['title'],plan['amount_rub'],plan['days'])
+    payload=payment_payload(tg_user_id,tariff)
+    payload['metadata'].update(purpose='subscription_renewal',subscription_until=access_until)
+    order=await db.prepare_subscription_checkout(tg_user_id,access_until,tariff,payload,(offer,OFFER_VERSION))
+    if not order:
+        raise billing.PaymentUncertain('Renewal quote is blocked by an unresolved request')
+    first=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+    if first['status']=='succeeded':
+        await billing.finalize(first)
+        return None
+    alternative=await db.prepare_alternative_checkout(first['payment_id'])
+    if not alternative:
+        raise billing.PaymentUncertain('Second payment route is not ready')
+    second=await billing.submit_checkout(alternative,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+    if second['status']=='succeeded':
+        await billing.finalize(second)
+        return None
+    choices={order['payment_route']:first,alternative['payment_route']:second}
+    if any(row['status']!='pending' or not valid_http_url(row['confirmation_url']) for row in choices.values()):
+        raise billing.PaymentUncertain('Payment URLs are not ready')
+    return order,choices
+
+
+async def render_subscription_notice(tg_user_id, access_until, ctx, text, *, notification_key=None):
+    prepared=await subscription_payment_options(tg_user_id,access_until,ctx)
+    if not prepared:
+        return False
+    order,choices=prepared
+    text+=f"\n\nПродление: {order['amount_rub']:g} ₽ за {order['days']} дней — полная стоимость, без скидки."
+    text+='\nРазовая оплата, без автоматических списаний. Выбери один способ оплаты.'
+    text+=f"\nОплачивая, ты принимаешь условия: {order['offer_url']}"
+    if notification_key and not await db.claim_notification(notification_key,tg_user_id):
+        return False
+    rows=[[Btn('Через СБП',url=choices['sbp']['confirmation_url'])],
+          [Btn('Другие способы',url=choices['all']['confirmation_url'])]]
+    await render_screen(tg_user_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows),force_new=True,with_navigation=False)
+    for row in choices.values():
+        await db.mark_offer_presented(row['payment_id'])
+    if notification_key:
+        await db.mark_notification_sent(notification_key)
+    return True
+
+
+async def send_subscription_renewal_notice(tg_user_id: int, access_until: str | None, ctx: ContextTypes.DEFAULT_TYPE, *, notification_key=None) -> bool:
     stats=await db.activity_summary(tg_user_id)
     activity=activity_phrase(stats)
     if stats['messages']:
         activity='За последние 30 дней в нашей группе:\n'+activity+'\nСпасибо, что участвуешь!'
     contract=await db.get_renewal(tg_user_id)
     if contract and contract['enabled'] and await auto_available():
+        # Explicitly consented automatic renewals retain their cancellation window;
+        # a second manual invoice must not race a saved-method charge.
         due=parse_dt(access_until)-timedelta(days=1)
         text=f"Доступ к «Креативному мозгу» действует до {format_dt(access_until)}.\n\n{activity}\n\nАвтопродление: {contract['amount_rub']} ₽ за {contract['days']} дней. Списание запланировано на {format_dt(due.isoformat())}, но не раньше чем через 12 часов после этого предупреждения. При отказе пришлю кнопку ручной оплаты."
         rows=[[Btn('Отключить автопродление',callback_data='user:auto_off')],[Btn('Мой доступ',callback_data='user:status')]]
+        if notification_key and not await db.claim_notification(notification_key,tg_user_id):
+            return False
+        await render_screen(tg_user_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows),force_new=True)
+        await db.mark_auto_warning(tg_user_id,access_until)
+        if notification_key:
+            await db.mark_notification_sent(notification_key)
+        return True
     else:
         text=await content('RENEWAL_NOTICE',date=format_dt(access_until),activity=activity)
-        rows=[[Btn('Продолжить с нами →',callback_data='user:buy')]]
-    await render_screen(tg_user_id,tg_user_id,ctx,text=text,reply_markup=Mk(rows),force_new=True)
-    if contract and contract['enabled'] and await auto_available():
-        await db.mark_auto_warning(tg_user_id,access_until)
+        return await render_subscription_notice(tg_user_id,access_until,ctx,text,notification_key=notification_key)
 
 
-async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await render_screen(tg_user_id,tg_user_id,ctx,text=await content('EXPIRED'),
-                        reply_markup=next_keyboard('user:buy','Вернуться в канал →'),force_new=True)
+async def send_subscription_expired_notice(tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE, *, notification_key=None) -> bool:
+    sub=await db.get_subscription(tg_user_id)
+    if not sub:
+        return False
+    return await render_subscription_notice(tg_user_id,sub['access_until'],ctx,await content('EXPIRED'),notification_key=notification_key)
 
 
 async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -719,15 +799,18 @@ async def renewal_notices_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if not until or current['renewal_notice_sent_at'] or parse_dt(until)>db.utcnow()+timedelta(days=days):
                 continue
             key='renewal:'+str(uid)+':'+until
-            if not await db.claim_notification(key,uid):
+            if await db.notification_claimed(key):
                 continue
             try:
-                await send_subscription_renewal_notice(uid,until,ctx)
-                await db.mark_renewal_notice_sent(uid)
-                await db.mark_notification_sent(key)
+                if await send_subscription_renewal_notice(uid,until,ctx,notification_key=key):
+                    await db.mark_renewal_notice_sent(uid)
             except TelegramError:
                 # An uncertain warning must not authorize an unseen automatic charge.
                 logger.warning('renewal warning unconfirmed user_id=%s',uid)
+            except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+                # No delivery claimed until both URLs are ready; retry the same
+                # durable requests on the next scheduled pass.
+                logger.warning('renewal payment preparation deferred user_id=%s',uid)
 
 
 async def expire_subscriptions_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -738,21 +821,35 @@ async def expire_subscriptions_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if not current or current['status']!='active' or active_subscription_until(current):
                 continue
             if await db.list_unfinalized_payments(uid) or await db.pending_checkout(uid):
-                known=await reconcile_user(uid,ctx)
+                known=await reconcile_user(uid,ctx,pending_is_known=True,notify_checkout_ready=False)
                 current=await db.get_subscription(uid)
                 if active_subscription_until(current):
                     continue
                 if not known and parse_dt(current['access_until'])>db.utcnow()-timedelta(hours=24):
-                    continue  # Bounded grace while the already initiated payment is unresolved.
+                    continue  # Grace only for an unknown/processing payment, never an unpaid pending invoice.
             if not await remove_user_from_channel(ctx,uid,reason='expired'):
                 continue
             await db.mark_subscription_expired(uid)
             await db.disable_renewal(uid,'expired')
             await db.record_event(uid,'expired',{'access_until':current['access_until']},event_key=f"expired:{uid}:{current['access_until']}")
+    # If invoice preparation failed after removal, retry delivery without banning
+    # the same member again. Historical expired rows already have a sent marker.
+    for sub in await db.pending_expiration_notices():
+        uid=sub['tg_user_id']
+        async with user_lock(uid):
+            current=await db.get_subscription(uid)
+            if not current or current['status']!='expired' or current['access_until']!=sub['access_until']:
+                continue
             try:
-                await send_subscription_expired_notice(uid,ctx)
+                key=f"expiration:{uid}:{current['access_until']}"
+                if await db.notification_claimed(key):
+                    continue
+                if await send_subscription_expired_notice(uid,ctx,notification_key=key):
+                    await db.mark_expiration_notice_sent(uid,current['access_until'])
             except TelegramError:
-                logger.warning('expiration notification failed user_id=%s',uid)
+                logger.warning('expiration notification unconfirmed user_id=%s',uid)
+            except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+                logger.warning('expiration payment preparation deferred user_id=%s',uid)
 
 
 async def remove_user_from_channel(ctx: ContextTypes.DEFAULT_TYPE, tg_user_id: int, reason: str) -> bool:
@@ -772,7 +869,11 @@ async def remove_user_from_channel(ctx: ContextTypes.DEFAULT_TYPE, tg_user_id: i
     try:
         await ctx.bot.ban_chat_member(CHANNEL_ID,tg_user_id)
         # Keep the ban until a verified new purchase/grant; otherwise old links allow re-entry.
-        return links_ok
+        member=await ctx.bot.get_chat_member(CHANNEL_ID,tg_user_id)
+        removed=member.status in {'kicked','left'}
+        if not removed:
+            logger.warning('channel removal not confirmed user_id=%s reason=%s',tg_user_id,reason)
+        return links_ok and removed
     except TelegramError:
         logger.warning('channel removal deferred user_id=%s reason=%s',tg_user_id,reason)
         return False
@@ -1658,7 +1759,7 @@ async def handle_auto_failure(row,ctx):
             logger.warning('auto failure notice unconfirmed user_id=%s',row['tg_user_id'])
 
 
-async def reconcile_user(user_id,ctx):
+async def reconcile_user(user_id,ctx,*,pending_is_known=False,notify_checkout_ready=True):
     """Returns False when an unsettled payment still has an unknown outcome."""
     ok=True
     order=await db.pending_checkout(user_id)
@@ -1666,7 +1767,8 @@ async def reconcile_user(user_id,ctx):
         try:
             recovered=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
             quiz=await db.get_lesson_quiz(user_id)
-            if (not (quiz and quiz['answer']) and not order['cycle_until']
+            renewal_notice=(json.loads(order['request_json']).get('metadata') or {}).get('purpose')=='subscription_renewal'
+            if (notify_checkout_ready and not renewal_notice and not (quiz and quiz['answer']) and not order['cycle_until']
                     and recovered['status']=='pending' and valid_http_url(recovered['confirmation_url'])):
                 key='checkout_ready:'+order['id']
                 if await db.claim_notification(key,user_id):
@@ -1690,7 +1792,7 @@ async def reconcile_user(user_id,ctx):
                 ok=ok and bool(result.get('ok'))
             elif remote['status']=='canceled':
                 await handle_auto_failure(row,ctx)
-            else:
+            elif remote['status']!='pending' or not pending_is_known:
                 ok=False
         except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
             ok=False

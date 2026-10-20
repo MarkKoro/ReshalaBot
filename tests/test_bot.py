@@ -69,6 +69,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             create_chat_invite_link=AsyncMock(return_value=NS(invite_link="https://t.me/+test-invite")),
             revoke_chat_invite_link=AsyncMock(),
             ban_chat_member=AsyncMock(),
+            get_chat_member=AsyncMock(return_value=NS(status='kicked')),
             unban_chat_member=AsyncMock(),
             approve_chat_join_request=AsyncMock(),
             decline_chat_join_request=AsyncMock(),
@@ -114,13 +115,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             value.update(id='quiz-'+order['id'],metadata=kwargs['json']['metadata'],amount=kwargs['json']['amount'])
             value['confirmation']={'confirmation_url':'https://example.com/pay-quiz-sbp'}
             value['payment_method']={'type':'sbp'}
+        elif order and kwargs['json']['metadata'].get('purpose')=='subscription_renewal':
+            value.update(id='renewal-'+order['id'],metadata=kwargs['json']['metadata'],amount=kwargs['json']['amount'])
+            value['confirmation']={'confirmation_url':'https://example.com/pay-renewal-sbp'}
+            value['payment_method']={'type':'sbp'}
         self.provider_payments[value['id']]=value
         return self.response(value)
 
     async def provider_get(self, url, **kwargs):
         pid=url.rsplit('/',1)[1]
         configured=self.http.get.return_value.json()
-        if pid.startswith(('alt-','quiz-')) and configured['id']!=pid:
+        if pid.startswith(('alt-','quiz-','renewal-')) and configured['id']!=pid:
             return self.response(self.provider_payments[pid])
         return self.http.get.return_value
 
@@ -384,15 +389,19 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.expire_subscriptions_job(self.ctx)
         self.telegram.ban_chat_member.assert_awaited_once_with(bot.CHANNEL_ID, 1)
         self.assertEqual((await db.get_subscription(1))["status"], "expired")
-        self.assertEqual(self.last()["text"], texts.EXPIRED)
+        self.assertTrue(self.last()["text"].startswith(texts.EXPIRED))
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        quote=await db.pending_checkout(1)
         await bot.expire_subscriptions_job(self.ctx)
         self.assertEqual(self.telegram.ban_chat_member.await_count, 1)
         await db.accept_offer(1)
         self.http.post.return_value = self.response(self.payment())
         await self.press("user:buy")
         await self.press("user:accept_offer_and_pay")
-        self.http.get.return_value = self.response(self.payment(status="succeeded"))
-        await self.press("user:check_payment:p1")
+        paid=copy.deepcopy(self.provider_payments[quote['payment_id']])
+        paid.update(status='succeeded',paid=True)
+        self.provider_payments[paid['id']]=paid
+        await self.press('user:check_payment:'+paid['id'])
         self.assertTrue(bot.active_subscription_until(await db.get_subscription(1)))
 
     async def test_expiration_permission_failure_is_retried(self):
@@ -410,7 +419,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.renewal_notices_job(self.ctx)
         await bot.renewal_notices_job(self.ctx)
         self.assertEqual(self.telegram.send_message.await_count, 1)
-        self.assertEqual(self.buttons()[0].callback_data, "user:buy")
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        self.assertTrue(all(b.url and not b.callback_data for b in self.buttons()))
         await db.grant_access(1, 30)
         self.assertIsNone((await db.get_subscription(1))["renewal_notice_sent_at"])
         await bot.renewal_notices_job(self.ctx)
@@ -2158,6 +2168,235 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.telegram.send_message.await_count,sends)
         self.assertEqual(len(await self.sql('SELECT * FROM followup_deliveries')),1)
         self.assertEqual(len(await self.sql('SELECT * FROM lesson_quizzes')),1)
+
+
+    async def paid_quiz(self, answer='rule', route='sbp'):
+        quiz,notice=await self.offer_quiz()
+        await self.press('user:quiz:'+quiz['token']+':'+answer,message_id=notice)
+        quiz=await db.get_lesson_quiz(1)
+        choices=await db.checkout_choices((await db.pending_checkout(1))['payment_id'])
+        order=next(row for row in choices if row['payment_route']==route)
+        value=self.provider_payments[order['payment_id']]
+        value.update(status='succeeded',paid=True)
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertTrue(bot.active_subscription_until(await db.get_subscription(1)))
+        self.assertEqual((await db.get_lesson_quiz(1))['redeemed_payment_id'],order['payment_id'])
+        return quiz,choices
+
+    async def assert_full_price_quiz_renewal(self,answer,paid_route):
+        quiz,originals=await self.paid_quiz(answer,paid_route)
+        until=(db.utcnow()+timedelta(days=3)-timedelta(seconds=1)).isoformat()
+        await self.sql('UPDATE subscriptions SET access_until=? WHERE tg_user_id=1',(until,))
+        before_posts=self.http.post.await_count
+        sends=self.telegram.send_message.await_count
+        # Background jobs have no per-user callback state.
+        context=NS(bot=self.telegram)
+        await bot.renewal_notices_job(context)
+        self.assertEqual(self.telegram.send_message.await_count,sends+1)
+        self.assertIn('400 ₽ за 30 дней',self.last()['text'])
+        self.assertIn('полная стоимость, без скидки',self.last()['text'])
+        self.assertNotIn('Твоя скидка',self.last()['text'])
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        self.assertTrue(all(b.url and not b.callback_data for b in self.buttons()))
+        posts=self.http.post.call_args_list[before_posts:]
+        self.assertEqual(len(posts),2)
+        self.assertEqual(posts[0].kwargs['json']['payment_method_data'],{'type':'sbp'})
+        self.assertNotIn('payment_method_data',posts[1].kwargs['json'])
+        for call in posts:
+            self.assertEqual(call.kwargs['json']['amount'],{'value':'400.00','currency':'RUB'})
+            self.assertNotIn('quiz_token',call.kwargs['json']['metadata'])
+            self.assertNotIn('discount_percent',call.kwargs['json']['metadata'])
+            self.assertEqual(call.kwargs['json']['metadata']['subscription_until'],until)
+        for original in originals:
+            current=await db.get_checkout(original['id'])
+            self.assertEqual(current['request_json'],original['request_json'])
+            if original['payment_route']!=paid_route:
+                self.assertEqual(current['status'],'superseded')
+        await db.close_db()
+        await db.init_db()
+        await bot.renewal_notices_job(context)
+        await bot.followup_job(context)
+        self.assertEqual(self.telegram.send_message.await_count,sends+1)
+        self.assertEqual(self.http.post.await_count,before_posts+2)
+        root=await db.pending_checkout(1)
+        choices=await db.checkout_choices(root['payment_id'])
+        other=next(row for row in choices if row['payment_route']=='all')
+        self.provider_payments[other['payment_id']].update(status='succeeded',paid=True)
+        await bot.payment_reconciliation_job(context)
+        self.assertAlmostEqual((db.parse_dt((await db.get_subscription(1))['access_until'])-db.parse_dt(until)).total_seconds(),30*86400,delta=1)
+        self.assertEqual((await db.get_payment(other['payment_id']))['amount_rub'],400)
+
+    async def test_renewal_after_thirty_percent_quiz_purchase_uses_full_price(self):
+        await self.assert_full_price_quiz_renewal('rule','sbp')
+
+    async def test_renewal_after_fifteen_percent_quiz_purchase_uses_full_price(self):
+        await self.assert_full_price_quiz_renewal('form','all')
+
+    async def test_manual_renewal_does_not_reoffer_unused_discounted_alternative(self):
+        await self.paid_quiz()
+        count=self.http.post.await_count
+        await self.press('user:buy')
+        self.assertEqual(self.http.post.await_count,count+2)
+        self.assertNotIn('Твоя скидка',self.last()['text'])
+        self.assertIn('400 ₽',self.last()['text'])
+        for call in self.http.post.call_args_list[count:]:
+            self.assertEqual(call.kwargs['json']['amount']['value'],'400.00')
+            self.assertNotIn('quiz_token',call.kwargs['json']['metadata'])
+
+    async def test_reminder_threshold_is_three_days_and_pending_invoices_do_not_delay_expiry(self):
+        await db.grant_access(1,4)
+        await bot.renewal_notices_job(self.ctx)
+        self.telegram.send_message.assert_not_awaited()
+        self.http.post.assert_not_awaited()
+        until=(await db.get_subscription(1))['access_until']
+        with patch.object(db,'utcnow',return_value=db.parse_dt(until)-timedelta(days=3)+timedelta(seconds=1)):
+            await bot.renewal_notices_job(self.ctx)
+            await bot.renewal_notices_job(self.ctx)
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertEqual(self.http.post.await_count,2)
+        events=[]
+        original_send=self.telegram.send_message.side_effect
+        async def verified(*args,**kwargs):
+            events.append('removal_confirmed')
+            return NS(status='kicked')
+        async def notified(*args,**kwargs):
+            events.append('message_sent')
+            return await original_send(*args,**kwargs)
+        self.telegram.get_chat_member.side_effect=verified
+        self.telegram.send_message.side_effect=notified
+        with patch.object(db,'utcnow',return_value=db.parse_dt(until)+timedelta(seconds=1)):
+            await bot.expire_subscriptions_job(self.ctx)
+            self.assertEqual((await db.get_subscription(1))['status'],'expired')
+            self.assertIsNotNone((await db.get_subscription(1))['expiration_notice_sent_at'])
+            await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual(events,['removal_confirmed','message_sent'])
+        self.telegram.ban_chat_member.assert_awaited_once_with(bot.CHANNEL_ID,1)
+        self.telegram.unban_chat_member.assert_not_awaited()
+        self.assertEqual(self.telegram.send_message.await_count,2)
+        self.assertEqual(self.http.post.await_count,2)
+        self.assertIn('400 ₽ за 30 дней',self.last()['text'])
+        self.assertTrue(self.last()['text'].startswith(texts.EXPIRED))
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        self.assertTrue(all(b.url and not b.callback_data for b in self.buttons()))
+
+    async def test_expiration_notice_also_uses_full_price_after_discount(self):
+        await self.paid_quiz('rule','all')
+        until=(await db.get_subscription(1))['access_until']
+        count=self.http.post.await_count
+        with patch.object(db,'utcnow',return_value=db.parse_dt(until)+timedelta(seconds=1)):
+            await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['status'],'expired')
+        self.assertIn('400 ₽ за 30 дней',self.last()['text'])
+        self.assertNotIn('Твоя скидка',self.last()['text'])
+        self.assertEqual(self.http.post.await_count,count+2)
+        for call in self.http.post.call_args_list[count:]:
+            self.assertEqual(call.kwargs['json']['amount']['value'],'400.00')
+            self.assertNotIn('quiz_token',call.kwargs['json']['metadata'])
+
+    async def test_expiration_is_not_announced_until_membership_removal_is_confirmed(self):
+        await db.grant_access(1,1)
+        await self.sql('UPDATE subscriptions SET access_until=?',((db.utcnow()-timedelta(seconds=1)).isoformat(),))
+        self.telegram.get_chat_member.return_value=NS(status='member')
+        await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['status'],'active')
+        self.telegram.send_message.assert_not_awaited()
+        self.http.post.assert_not_awaited()
+        self.telegram.get_chat_member.return_value=NS(status='kicked')
+        await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['status'],'expired')
+        self.assertEqual(self.telegram.send_message.await_count,1)
+
+    async def test_expiration_confirmation_timeout_is_retried_without_false_notice(self):
+        await db.grant_access(1,1)
+        await self.sql('UPDATE subscriptions SET access_until=?',((db.utcnow()-timedelta(seconds=1)).isoformat(),))
+        self.telegram.get_chat_member.side_effect=TimedOut()
+        await bot.expire_subscriptions_job(self.ctx)
+        self.telegram.send_message.assert_not_awaited()
+        self.assertEqual((await db.get_subscription(1))['status'],'active')
+        self.telegram.get_chat_member.side_effect=None
+        await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['status'],'expired')
+
+    async def test_expiration_invoice_failure_retries_after_restart_without_repeated_removal(self):
+        await db.grant_access(1,1)
+        await self.sql('UPDATE subscriptions SET access_until=?',((db.utcnow()-timedelta(seconds=1)).isoformat(),))
+        self.http.post.side_effect=httpx.ReadTimeout('temporary')
+        await bot.expire_subscriptions_job(self.ctx)
+        first=self.http.post.call_args.kwargs
+        self.assertEqual((await db.get_subscription(1))['status'],'expired')
+        self.assertIsNone((await db.get_subscription(1))['expiration_notice_sent_at'])
+        self.telegram.send_message.assert_not_awaited()
+        await db.close_db()
+        await db.init_db()
+        self.http.post.side_effect=self.provider_post
+        await bot.payment_reconciliation_job(self.ctx)
+        self.telegram.send_message.assert_not_awaited()
+        await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual(self.http.post.call_args_list[1].kwargs['headers'],first['headers'])
+        self.assertEqual(self.http.post.call_args_list[1].kwargs['json'],first['json'])
+        self.telegram.ban_chat_member.assert_awaited_once()
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        self.assertIsNotNone((await db.get_subscription(1))['expiration_notice_sent_at'])
+
+    async def test_renewal_alternative_timeout_waits_for_both_direct_urls_and_reuses_request(self):
+        await db.grant_access(1,2)
+        async def post(url,**kwargs):
+            if self.http.post.await_count==2:
+                raise httpx.ReadTimeout('alternative')
+            return await self.provider_post(url,**kwargs)
+        self.http.post.side_effect=post
+        await bot.renewal_notices_job(self.ctx)
+        self.telegram.send_message.assert_not_awaited()
+        self.assertIsNone((await db.get_subscription(1))['renewal_notice_sent_at'])
+        await db.close_db()
+        await db.init_db()
+        await bot.renewal_notices_job(self.ctx)
+        self.assertEqual(self.http.post.await_count,3)
+        self.assertEqual(self.http.post.call_args_list[1].kwargs['headers'],self.http.post.call_args_list[2].kwargs['headers'])
+        self.assertEqual(self.http.post.call_args_list[1].kwargs['json'],self.http.post.call_args_list[2].kwargs['json'])
+        self.assertEqual(self.telegram.send_message.await_count,1)
+        self.assertTrue(all(b.url and not b.callback_data for b in self.buttons()))
+
+    async def test_expired_provider_invoices_are_recreated_at_full_price_for_final_notice(self):
+        await db.grant_access(1,3)
+        until=(await db.get_subscription(1))['access_until']
+        await bot.renewal_notices_job(self.ctx)
+        old_keys=[call.kwargs['headers']['Idempotence-Key'] for call in self.http.post.call_args_list]
+        for value in self.provider_payments.values():
+            value.update(status='canceled',paid=False)
+        with patch.object(db,'utcnow',return_value=db.parse_dt(until)+timedelta(seconds=1)):
+            await bot.expire_subscriptions_job(self.ctx)
+        self.assertEqual(self.telegram.send_message.await_count,2)
+        self.assertEqual(self.http.post.await_count,4)
+        new_keys=[call.kwargs['headers']['Idempotence-Key'] for call in self.http.post.call_args_list[2:]]
+        self.assertFalse(set(old_keys)&set(new_keys))
+        self.assertIn('400 ₽ за 30 дней',self.last()['text'])
+
+    async def test_payment_through_reminder_other_methods_prevents_expiration_removal(self):
+        await db.grant_access(1,3)
+        until=(await db.get_subscription(1))['access_until']
+        await bot.renewal_notices_job(self.ctx)
+        root=await db.pending_checkout(1)
+        other=next(row for row in await db.checkout_choices(root['payment_id']) if row['payment_route']=='all')
+        self.provider_payments[other['payment_id']].update(status='succeeded',paid=True)
+        with patch.object(db,'utcnow',return_value=db.parse_dt(until)+timedelta(seconds=1)):
+            await bot.expire_subscriptions_job(self.ctx)
+        self.telegram.ban_chat_member.assert_not_awaited()
+        self.assertTrue(bot.active_subscription_until(await db.get_subscription(1)))
+        self.assertIsNone((await db.get_subscription(1))['expiration_notice_sent_at'])
+
+    async def test_expiry_unknown_payment_retains_bounded_grace_without_expired_notice(self):
+        await db.grant_access(1,1)
+        await self.sql('UPDATE subscriptions SET access_until=?',((db.utcnow()-timedelta(seconds=1)).isoformat(),))
+        await self.store_payment()
+        self.http.get.side_effect=httpx.ReadTimeout('unknown')
+        await bot.expire_subscriptions_job(self.ctx)
+        self.telegram.ban_chat_member.assert_not_awaited()
+        self.telegram.send_message.assert_not_awaited()
+        self.http.get.side_effect=self.provider_get
+        await bot.expire_subscriptions_job(self.ctx)
+        self.telegram.ban_chat_member.assert_awaited_once()
 
 
 class ApplicationTests(unittest.TestCase):
