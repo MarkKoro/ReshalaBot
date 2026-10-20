@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from decimal import Decimal
 from functools import wraps
 import os
 import uuid
@@ -228,6 +229,12 @@ async def create_tables() -> None:
             tg_user_id INTEGER PRIMARY KEY,
             claimed_at TEXT NOT NULL,
             sent_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS lesson_quizzes (
+            tg_user_id INTEGER PRIMARY KEY, token TEXT NOT NULL UNIQUE,
+            lesson_url TEXT NOT NULL, created_at TEXT NOT NULL,
+            answer TEXT, discount_percent INTEGER, answered_at TEXT,
+            quote_json TEXT, checkout_group_id TEXT, redeemed_payment_id TEXT
         );
         """
     )
@@ -666,6 +673,10 @@ async def finalize_payment_once(
                                    {"payment_id": payment_id, "access_until": access_until},
                                    event_key=f"access:{payment_id}")
         await db.execute("UPDATE checkout_requests SET status='paid' WHERE payment_id=?", (payment_id,))
+        if checkout and metadata.get('quiz_token'):
+            await db.execute("""UPDATE lesson_quizzes SET redeemed_payment_id=COALESCE(redeemed_payment_id,?)
+                WHERE tg_user_id=? AND token=? AND checkout_group_id=?""",
+                (payment_id,tg_user_id,metadata['quiz_token'],checkout['checkout_group_id']))
         await _activate_saved_method(db, payment_dict)
         await db.commit()
         return {"ok": True, "already_finalized": False, "access_until": access_until, "payment": payment_dict}
@@ -816,6 +827,7 @@ async def stats() -> dict[str, Any]:
         params = (iso_now(),) if "access_until" in sql else ()
         async with db.execute(sql, params) as cur:
             result[key] = (await cur.fetchone())["value"]
+    result['revenue_rub']=round(result['revenue_rub'],2)
     return result
 
 
@@ -861,6 +873,7 @@ EVENT_NAMES = {
     "payment_created", "payment_succeeded", "access_granted", "followup_sent",
     "renewal_started", "expired", "tariffs_opened", "tariff_selected", "goal_selected",
     "channel_joined", "auto_enabled", "auto_disabled", "auto_failed", "marketing_opt_out",
+    "quiz_answered",
 }
 
 
@@ -952,6 +965,109 @@ async def mark_followup_sent(tg_user_id: int) -> None:
     await db.execute("UPDATE followup_deliveries SET sent_at = ? WHERE tg_user_id = ?", (iso_now(), tg_user_id))
     await _insert_funnel_event(tg_user_id, "followup_sent", event_key=f"followup:{tg_user_id}")
     await db.commit()
+
+
+@serialized
+async def get_lesson_quiz(tg_user_id):
+    con=await connection()
+    async with con.execute('SELECT * FROM lesson_quizzes WHERE tg_user_id=?',(tg_user_id,)) as cur:
+        return row_to_dict(await cur.fetchone())
+
+
+@serialized
+async def prepare_lesson_quiz(tg_user_id,lesson_url):
+    con=await connection()
+    async with con.execute('SELECT 1 FROM followup_deliveries WHERE tg_user_id=?',(tg_user_id,)) as cur:
+        if not await cur.fetchone():
+            return None
+    await con.execute('INSERT OR IGNORE INTO lesson_quizzes(tg_user_id,token,lesson_url,created_at) VALUES(?,?,?,?)',
+                      (tg_user_id,uuid.uuid4().hex,lesson_url,iso_now()))
+    await con.commit()
+    return await get_lesson_quiz(tg_user_id)
+
+
+@serialized
+async def answer_lesson_quiz(tg_user_id,token,answer,offer_version,preferred_plan=None):
+    """The first answer and the first available quote are durable and immutable."""
+    con=await connection()
+    await con.execute('BEGIN IMMEDIATE')
+    try:
+        quiz=await get_lesson_quiz(tg_user_id)
+        if not quiz or quiz['token']!=token or (not quiz['answer'] and answer not in {'form','function','rule'}):
+            await con.commit()
+            return None
+        if not quiz['answer']:
+            percent=30 if answer=='rule' else 15
+            await con.execute('UPDATE lesson_quizzes SET answer=?,discount_percent=?,answered_at=? WHERE tg_user_id=?',
+                              (answer,percent,iso_now(),tg_user_id))
+            await _insert_funnel_event(tg_user_id,'quiz_answered',{'answer':answer,'discount_percent':percent},event_key='quiz:'+token)
+            quiz=await get_lesson_quiz(tg_user_id)
+        if not quiz['quote_json']:
+            plans=[row for row in await list_tariffs() if row['amount_rub']>=2]
+            plan=next((row for row in plans if row['code']==preferred_plan),plans[0] if plans else None)
+            offer=await get_offer_url()
+            if plan and offer:
+                quote=dict(plan,base_amount_rub=plan['amount_rub'],
+                           amount_kopecks=plan['amount_rub']*(100-quiz['discount_percent']),
+                           offer_url=offer,offer_version=offer_version)
+                await con.execute('UPDATE lesson_quizzes SET quote_json=? WHERE tg_user_id=? AND quote_json IS NULL',
+                                  (json.dumps(quote,ensure_ascii=False),tg_user_id))
+        await con.commit()
+        return await get_lesson_quiz(tg_user_id)
+    except BaseException:
+        await con.rollback()
+        raise
+
+
+@serialized
+async def prepare_quiz_checkout(tg_user_id,token,payload):
+    """Create a new discounted request; never rewrite a previous provider POST."""
+    con=await connection()
+    await con.execute('BEGIN IMMEDIATE')
+    try:
+        quiz=await get_lesson_quiz(tg_user_id)
+        if (not quiz or quiz['token']!=token or not quiz['answer'] or not quiz['quote_json']
+                or quiz['redeemed_payment_id'] or await has_successful_payment(tg_user_id)):
+            await con.commit()
+            return None
+        quote=json.loads(quiz['quote_json'])
+        if (Decimal(payload['amount']['value'])*100!=quote['amount_kopecks']
+                or payload['metadata'].get('quiz_token')!=token or payload.get('save_payment_method')
+                or payload.get('payment_method_id') or payload.get('payment_token')
+                or checkout_route(payload)!='sbp'):
+            raise ValueError('Discounted quote mismatch')
+        async with con.execute("SELECT * FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') ORDER BY (status='creating') DESC,created_at",(tg_user_id,)) as cur:
+            orders=[dict(row) for row in await cur.fetchall()]
+        own=[row for row in orders if (json.loads(row['request_json']).get('metadata') or {}).get('quiz_token')==token]
+        if own:
+            await con.commit()
+            return own[0]
+        # Known unpaid manual quotes can be replaced locally. They remain in
+        # payments for provider reconciliation; no provider cancellation is faked.
+        for order in orders:
+            request=json.loads(order['request_json'])
+            if (not order['payment_id'] or order['auto_opt_in'] or order['cycle_until']
+                    or request.get('save_payment_method') or request.get('payment_method_id')):
+                await con.commit()
+                return None
+        async with con.execute("""SELECT p.* FROM payments p LEFT JOIN checkout_requests c ON c.payment_id=p.payment_id
+            WHERE p.tg_user_id=? AND p.finalized_at IS NULL AND p.status!='canceled'
+            AND (c.id IS NULL OR p.status!='pending') LIMIT 1""",(tg_user_id,)) as cur:
+            if await cur.fetchone():
+                await con.commit()
+                return None
+        await con.execute("UPDATE checkout_requests SET status='superseded' WHERE tg_user_id=? AND status='created'",(tg_user_id,))
+        order_id=uuid.uuid4().hex
+        await con.execute("""INSERT INTO checkout_requests(id,tg_user_id,plan_id,title,amount_rub,days,
+            request_json,created_at,offer_url,offer_version,checkout_group_id,payment_route) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (order_id,tg_user_id,quote['code'],quote['title'],quote['amount_kopecks']/100,quote['days'],
+             json.dumps(payload,ensure_ascii=False),iso_now(),quote['offer_url'],quote['offer_version'],order_id,'sbp'))
+        await con.execute('UPDATE lesson_quizzes SET checkout_group_id=? WHERE tg_user_id=?',(order_id,tg_user_id))
+        await con.commit()
+        return await get_checkout(order_id)
+    except BaseException:
+        await con.rollback()
+        raise
 
 
 @serialized
@@ -1138,10 +1254,14 @@ async def prepare_alternative_checkout(payment_id):
             return None
         route = 'all' if checkout_route(payload)=='sbp' else 'sbp'
         group = source['checkout_group_id'] or source['id']
+        quiz=await get_lesson_quiz(source['tg_user_id'])
+        discounted=bool(quiz and quiz['token']==(payload.get('metadata') or {}).get('quiz_token')
+                        and quiz['checkout_group_id']==group)
         # An unrelated or legacy invoice must still settle before another quote.
         async with con.execute("""SELECT 1 FROM payments p LEFT JOIN checkout_requests c ON c.payment_id=p.payment_id
             WHERE p.tg_user_id=? AND p.finalized_at IS NULL AND p.status!='canceled'
-            AND (c.id IS NULL OR COALESCE(c.checkout_group_id,c.id)!=?) LIMIT 1""",(source['tg_user_id'],group)) as cur:
+            AND (c.id IS NULL OR COALESCE(c.checkout_group_id,c.id)!=?)
+            AND NOT (? AND COALESCE(c.status,'')='superseded') LIMIT 1""",(source['tg_user_id'],group,int(discounted))) as cur:
             blocked = await cur.fetchone()
         async with con.execute("SELECT 1 FROM checkout_requests WHERE tg_user_id=? AND status IN ('creating','created') AND COALESCE(checkout_group_id,id)!=? LIMIT 1",(source['tg_user_id'],group)) as cur:
             blocked = blocked or await cur.fetchone()

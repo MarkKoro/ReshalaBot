@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass
 from string import Formatter
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Literal
 
 import httpx
@@ -60,7 +61,7 @@ _command_screen: ContextVar = ContextVar("command_screen", default=None)
 class Tariff:
     code: str
     title: str
-    amount_rub: int
+    amount_rub: int | float
     days: int
 
 
@@ -239,13 +240,16 @@ async def render_screen(
     back_callback: str | None = None,
     force_new: bool = False,
     entities: list[MessageEntity] | None = None,
+    with_navigation: bool = True,
+    preview_url: str | None = None,
 ) -> None:
     """Edit the pressed menu (or the saved menu for commands/jobs), preserving the lesson."""
     if back_callback is None:
         admin_screen = reply_markup and any((button.callback_data or '').startswith('admin:')
                                            for row in reply_markup.inline_keyboard for button in row)
         back_callback = 'admin:menu' if admin_screen else 'user:home'
-    reply_markup = navigation_keyboard(reply_markup, back_callback)
+    if with_navigation:
+        reply_markup = navigation_keyboard(reply_markup, back_callback)
     if include_admin_shortcut:
         reply_markup = with_admin_menu(tg_user_id, reply_markup)
     current = await db.get_current_message(tg_user_id) or {}
@@ -294,11 +298,22 @@ async def render_screen(
             if previous_chat and previous_id:
                 await retire_menu(previous_chat, previous_id, tg_user_id, ctx)
 
+    async def render_text(operation,**kwargs):
+        options={'disable_web_page_preview':not bool(preview_url)}
+        if preview_url and LinkPreviewOptions is not None:
+            options={'link_preview_options':LinkPreviewOptions(url=preview_url,is_disabled=False,prefer_large_media=True,show_above_text=False)}
+        try:
+            return await operation(**kwargs,**options)
+        except BadRequest:
+            if 'link_preview_options' not in options:
+                raise
+            return await operation(**kwargs,disable_web_page_preview=False)
+
     if target_id and target_kind == kind:
         try:
             if kind == "text":
-                await ctx.bot.edit_message_text(chat_id=chat_id, message_id=target_id, text=text,
-                                                reply_markup=reply_markup, disable_web_page_preview=True, entities=entities)
+                await render_text(ctx.bot.edit_message_text,chat_id=chat_id,message_id=target_id,text=text,
+                                  reply_markup=reply_markup,entities=entities)
             elif kind == "video":
                 await ctx.bot.edit_message_media(
                     chat_id=chat_id,
@@ -328,8 +343,7 @@ async def render_screen(
     elif kind == "photo":
         msg = await ctx.bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup)
     else:
-        msg = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup,
-                                         disable_web_page_preview=True, entities=entities)
+        msg = await render_text(ctx.bot.send_message,chat_id=chat_id,text=text,reply_markup=reply_markup,entities=entities)
     await remember_screen(msg.message_id)
 
 
@@ -402,6 +416,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def start_offer_again(chat_id: int, tg_user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    quiz=await db.get_lesson_quiz(tg_user_id)
+    if quiz and quiz['answer'] and not quiz['redeemed_payment_id'] and not await db.has_successful_payment(tg_user_id):
+        await show_quiz_checkout(chat_id,tg_user_id,ctx,quiz['token'])
+        return
     offer_url = await db.get_offer_url()
     tariff = await selected_tariff(ctx)
     if not tariff:
@@ -449,6 +467,12 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data=='user:quiet':
         await db.set_marketing_opt_out(tg_user_id,True)
         await render_screen(chat_id,tg_user_id,ctx,text='Напоминания о бесплатном уроке отключены. Сообщения об оплате и сроке доступа останутся.',reply_markup=next_keyboard('user:product','Посмотреть, что внутри'),back_callback='user:lesson')
+    elif data.startswith('user:quiz:'):
+        parts=data.split(':')
+        if len(parts)==4 and parts[3] in {'form','function','rule'}:
+            await show_quiz_checkout(chat_id,tg_user_id,ctx,parts[2],answer=parts[3])
+    elif data.startswith('user:quiz_pay:'):
+        await show_quiz_checkout(chat_id,tg_user_id,ctx,data.split(':',2)[2])
     elif data=='user:auto_off':
         await disable_auto_and_render(chat_id,tg_user_id,ctx)
     elif data=='user:status':
@@ -498,6 +522,10 @@ async def user_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def create_payment_and_render(chat_id: int, tg_user_id: int, tariff: Tariff, ctx: ContextTypes.DEFAULT_TYPE, *, auto_opt_in=False, direct_offer=None) -> None:
+    quiz=await db.get_lesson_quiz(tg_user_id)
+    if quiz and quiz['answer'] and not quiz['redeemed_payment_id'] and not await db.has_successful_payment(tg_user_id):
+        await show_quiz_checkout(chat_id,tg_user_id,ctx,quiz['token'])
+        return
     published={r['code']:r for r in await db.list_tariffs()}
     current=published.get(tariff.code)
     if not current or (current['amount_rub'],current['days'])!=(tariff.amount_rub,tariff.days):
@@ -588,7 +616,12 @@ async def check_payment_and_grant(chat_id: int, tg_user_id: int, payment_id: str
                     return
             if payment['status']=='canceled':
                 await handle_auto_failure(row,ctx)
-                await render_screen(chat_id,tg_user_id,ctx,text='Этот платёж отменён. Можно выбрать способ оплаты заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
+                quiz=await db.get_lesson_quiz(tg_user_id)
+                quote=await db.get_checkout_by_payment(payment_id)
+                if quiz and quiz['answer'] and quote and (quote['status']=='superseded' or json.loads(quote['request_json'])['metadata'].get('quiz_token')):
+                    await show_quiz_checkout(chat_id,tg_user_id,ctx,quiz['token'])
+                else:
+                    await render_screen(chat_id,tg_user_id,ctx,text='Этот платёж отменён. Можно выбрать способ оплаты заново.',reply_markup=next_keyboard('user:buy','К оплате →'))
             else:
                 await render_checkout_screen(chat_id,tg_user_id,ctx,row=await db.get_payment(payment_id),text=texts.PAYMENT_PENDING,retry=True)
     except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
@@ -1140,16 +1173,113 @@ async def followup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         async with user_lock(uid):
             if not await reconcile_user(uid,ctx):
                 continue
+            lesson=await db.get_lesson_message(uid) or {}
+            url=lesson.get('lesson_url') or await db.get_lead_magnet_url()
+            if (not valid_http_url(url) or not valid_http_url(await db.get_offer_url())
+                    or not any(row['amount_rub']>=2 for row in await db.list_tariffs())):
+                continue
             if not await db.claim_followup(uid):
                 continue
+            quiz=await db.prepare_lesson_quiz(uid,url)
             try:
-                await render_screen(uid,uid,ctx,text=await content('FOLLOWUP'),reply_markup=Mk([
-                    [Btn('Посмотреть, что внутри',callback_data='user:product')],
-                    [Btn('Не напоминать об уроке',callback_data='user:quiet')]]),
-                    back_callback='user:lesson',force_new=True)
+                await render_quiz_question(uid,uid,ctx,quiz,force_new=True)
                 await db.mark_followup_sent(uid)
             except TelegramError:
                 logger.warning('followup delivery unconfirmed; no retry user_id=%s',uid)
+
+
+async def render_quiz_question(chat_id,user_id,ctx,quiz,*,force_new=False):
+    rows=[[Btn(label,callback_data='user:quiz:'+quiz['token']+':'+answer)]
+          for label,answer in (('Форма','form'),('Функция','function'),('Правило','rule'))]
+    await render_screen(chat_id,user_id,ctx,text=await content('FOLLOWUP')+'\n\n'+texts.LESSON_QUIZ,
+                        reply_markup=Mk(rows),force_new=force_new,with_navigation=False,include_admin_shortcut=False)
+
+
+def rubles(value):
+    amount=Decimal(str(value)).quantize(Decimal('0.01'))
+    return format(amount,'.0f' if amount==amount.to_integral_value() else '.2f').replace('.',',')
+
+
+def quiz_checkout_text(quiz):
+    correct=quiz['answer']=='rule'
+    text=texts.QUIZ_CORRECT if correct else texts.QUIZ_WRONG.format(video_url=quiz['lesson_url'])
+    if quiz['quote_json']:
+        quote=json.loads(quiz['quote_json'])
+        amount=Decimal(quote['amount_kopecks'])/100
+        text+=f"\n\n{quote['title']} · {quote['days']} дней.\nОбычная цена: {rubles(quote['base_amount_rub'])} ₽.\nСкидка: {quiz['discount_percent']}%. К оплате: {rubles(amount)} ₽."
+        text+=f"\n\nРазовая покупка, без автоматических списаний. Выбери один способ оплаты.\nОплачивая, ты принимаешь условия: {quote['offer_url']}"
+    return text,None if correct else quiz['lesson_url']
+
+
+async def render_quiz_unavailable(chat_id,user_id,ctx,quiz):
+    text,preview=quiz_checkout_text(quiz)
+    text+='\n\nСкидка сохранена. Сейчас готовим счёт или проверяем предыдущий платёж. Попробуй нажать нужный способ оплаты ещё раз; повторно оплачивать не нужно.'
+    callback='user:quiz_pay:'+quiz['token']
+    await render_screen(chat_id,user_id,ctx,text=text,preview_url=preview,
+                        reply_markup=Mk([[Btn('Через СБП',callback_data=callback)],[Btn('Другие способы',callback_data=callback)]]),
+                        with_navigation=False,include_admin_shortcut=False)
+
+
+async def show_quiz_checkout(chat_id,user_id,ctx,token,*,answer=None):
+    quiz=await db.get_lesson_quiz(user_id)
+    if not quiz or quiz['token']!=token:
+        await show_product(chat_id,user_id,ctx)
+        return
+    if not quiz['answer'] and answer is None:
+        await render_quiz_question(chat_id,user_id,ctx,quiz)
+        return
+    quiz=await db.answer_lesson_quiz(user_id,token,answer,OFFER_VERSION,
+                                    ctx.user_data.get('selected_tariff') or CURRENT_TARIFF.code)
+    if not quiz:
+        return
+    if await db.has_successful_payment(user_id) or active_subscription_until(await db.get_subscription(user_id)):
+        sub=await db.get_subscription(user_id)
+        await send_existing_access(chat_id,user_id,(sub or {}).get('last_payment_id'),ctx)
+        return
+    if (not quiz['quote_json'] or not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY
+            or not valid_http_url(json.loads(quiz['quote_json'])['offer_url'])):
+        await render_quiz_unavailable(chat_id,user_id,ctx,quiz)
+        return
+    try:
+        previous=await db.pending_checkout(user_id)
+        if previous and not previous['payment_id']:
+            try:
+                await billing.submit_checkout(previous,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+            except billing.PaymentRejected:
+                pass
+        # Settle every known invoice, including an older full-price quote, before
+        # issuing new links. An uncertain POST/GET never permits a replacement.
+        for payment in await db.list_unfinalized_payments(user_id):
+            remote=await refresh_payment(payment)
+            if remote['status']=='succeeded':
+                result=await billing.finalize(payment)
+                if not result.get('ok'):
+                    raise ValueError('Finalization failed')
+                await send_access_link(chat_id,user_id,payment['payment_id'],result['access_until'],ctx)
+                return
+            if remote['status']=='waiting_for_capture':
+                await render_quiz_unavailable(chat_id,user_id,ctx,quiz)
+                return
+        quote=json.loads(quiz['quote_json'])
+        plan=Tariff(quote['code'],quote['title'],quote['amount_kopecks']/100,quote['days'])
+        payload=payment_payload(user_id,plan)
+        payload['metadata'].update(quiz_token=token,discount_percent=str(quiz['discount_percent']),
+                                   base_amount_rub=str(quote['base_amount_rub']))
+        order=await db.prepare_quiz_checkout(user_id,token,payload)
+        if not order:
+            await render_quiz_unavailable(chat_id,user_id,ctx,quiz)
+            return
+        row=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
+        if row['status']=='succeeded':
+            result=await billing.finalize(row)
+            if not result.get('ok'):
+                raise ValueError('Finalization failed')
+            await send_access_link(chat_id,user_id,row['payment_id'],result['access_until'],ctx)
+            return
+        await render_payment(chat_id,user_id,row,ctx)
+    except (httpx.HTTPError,ValueError,TypeError,AttributeError,ArithmeticError):
+        logger.warning('quiz checkout deferred user_id=%s',user_id)
+        await render_quiz_unavailable(chat_id,user_id,ctx,quiz)
 
 
 async def channel_member_updated(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1421,6 +1551,14 @@ def payment_payload(user_id,tariff,*,auto_opt_in=False,method_id=None,payment_ro
 async def render_checkout_screen(chat_id,user_id,ctx,*,row,text,back_callback=None,force_new=False,retry=False,prepare_choices=True):
     order=await db.get_checkout_by_payment(row['payment_id'])
     request=json.loads(order['request_json']) if order else {}
+    quiz=await db.get_lesson_quiz(user_id)
+    if order and order['status']=='superseded' and quiz and quiz['answer'] and not quiz['redeemed_payment_id']:
+        await show_quiz_checkout(chat_id,user_id,ctx,quiz['token'])
+        return
+    terminal=bool(quiz and quiz['token']==(request.get('metadata') or {}).get('quiz_token'))
+    preview=None
+    if terminal:
+        text,preview=quiz_checkout_text(quiz)
     current=await db.get_payment(row['payment_id']) or row
     paired=bool(order and not order['auto_opt_in'] and not order['cycle_until']
                 and not request.get('save_payment_method') and not request.get('payment_method_id') and not request.get('payment_token')
@@ -1452,21 +1590,23 @@ async def render_checkout_screen(chat_id,user_id,ctx,*,row,text,back_callback=No
     route=order['payment_route'] if order else ('sbp' if (json.loads(current['raw_json']).get('payment_method') or {}).get('type')=='sbp' else 'all')
     choices.setdefault(route,current)
     rows=[]
-    if retry:
+    if retry and not terminal:
         rows.append([Btn('✅ Проверить ещё раз',callback_data='user:check_payment:'+row['payment_id'])])
-    elif order and order['offer_url']:
+    elif order and order['offer_url'] and not terminal:
         rows.append([Btn('📄 Условия',url=order['offer_url'])])
-    for option in ('sbp','all') if paired else (route,):
+    for option in ('sbp','all') if paired or terminal else (route,):
         candidate=choices.get(option)
         label='Через СБП' if option=='sbp' else 'Другие способы'
         if candidate and candidate['status']=='pending' and valid_http_url(candidate.get('confirmation_url')):
             rows.append([Btn(label,url=candidate['confirmation_url'])])
         elif paired:
             rows.append([Btn(label,callback_data='user:pay_options:'+order['id'])])
-    if not retry and not (order and order['offer_url']):
+        elif terminal:
+            rows.append([Btn(label,callback_data='user:quiz_pay:'+quiz['token'])])
+    if not terminal and not retry and not (order and order['offer_url']):
         rows.append([Btn('✅ Проверить оплату',callback_data='user:check_payment:'+row['payment_id'])])
     await render_screen(chat_id,user_id,ctx,text=text,reply_markup=Mk(rows),back_callback=back_callback,
-                        force_new=force_new)
+                        force_new=force_new,with_navigation=not terminal,include_admin_shortcut=not terminal,preview_url=preview)
     if order and order['offer_url']:
         for candidate in choices.values():
             if candidate['status']=='pending' and valid_http_url(candidate.get('confirmation_url')):
@@ -1474,6 +1614,12 @@ async def render_checkout_screen(chat_id,user_id,ctx,*,row,text,back_callback=No
 
 
 async def render_payment(chat_id,user_id,row,ctx,*,force_new=False,prepare_choices=True):
+    quiz=await db.get_lesson_quiz(user_id)
+    if quiz and quiz['answer'] and quiz['checkout_group_id']:
+        quote=await db.get_checkout_by_payment(row['payment_id'])
+        if quote and quote['checkout_group_id']==quiz['checkout_group_id'] and row['status']=='canceled':
+            await render_quiz_unavailable(chat_id,user_id,ctx,quiz)
+            return
     if row['status']=='canceled':
         await render_screen(chat_id,user_id,ctx,text='Счёт отменён. Выбери оплату заново.',reply_markup=next_keyboard('user:buy','К оплате →'),force_new=force_new)
         return
@@ -1519,7 +1665,9 @@ async def reconcile_user(user_id,ctx):
     if order and not order['payment_id']:
         try:
             recovered=await billing.submit_checkout(order,YOOKASSA_SHOP_ID,YOOKASSA_SECRET_KEY)
-            if not order['cycle_until'] and recovered['status']=='pending' and valid_http_url(recovered['confirmation_url']):
+            quiz=await db.get_lesson_quiz(user_id)
+            if (not (quiz and quiz['answer']) and not order['cycle_until']
+                    and recovered['status']=='pending' and valid_http_url(recovered['confirmation_url'])):
                 key='checkout_ready:'+order['id']
                 if await db.claim_notification(key,user_id):
                     try:

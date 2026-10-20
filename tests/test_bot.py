@@ -110,13 +110,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 value['payment_method']={'type':'sbp'}
             else:
                 value.pop('payment_method',None)
+        elif order and kwargs['json']['metadata'].get('quiz_token'):
+            value.update(id='quiz-'+order['id'],metadata=kwargs['json']['metadata'],amount=kwargs['json']['amount'])
+            value['confirmation']={'confirmation_url':'https://example.com/pay-quiz-sbp'}
+            value['payment_method']={'type':'sbp'}
         self.provider_payments[value['id']]=value
         return self.response(value)
 
     async def provider_get(self, url, **kwargs):
         pid=url.rsplit('/',1)[1]
         configured=self.http.get.return_value.json()
-        if pid.startswith('alt-') and configured['id']!=pid:
+        if pid.startswith(('alt-','quiz-')) and configured['id']!=pid:
             return self.response(self.provider_payments[pid])
         return self.http.get.return_value
 
@@ -1896,6 +1900,264 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await db.prepare_alternative_checkout('p1'))
         self.assertEqual(self.http.post.await_count,1)
         self.assertEqual([b.text for b in self.buttons() if b.url],['Через СБП'])
+
+
+    async def offer_quiz(self):
+        await bot.start(self.update,self.ctx)
+        await self.press('user:open_lesson')
+        await self.age_lead()
+        await bot.followup_job(self.ctx)
+        quiz=await db.get_lesson_quiz(1)
+        self.assertIsNotNone(quiz)
+        return quiz,self.last_active_id
+
+    async def assert_quiz_result(self,answer,percent,amount):
+        quiz,notice=await self.offer_quiz()
+        lesson=await db.get_lesson_message(1)
+        original=dict(self.messages[lesson['lesson_message_id']])
+        sends=self.telegram.send_message.await_count
+        await self.press('user:quiz:'+quiz['token']+':'+answer,message_id=notice)
+        self.assertEqual(self.last_active_id,notice)
+        self.assertEqual(self.telegram.send_message.await_count,sends)
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        self.assertTrue(all(b.url and b.callback_data is None for b in self.buttons()))
+        self.assertIn(str(percent)+'%',self.last()['text'])
+        self.assertIn('400 ₽',self.last()['text'])
+        self.assertIn('К оплате: '+str(amount)+' ₽',self.last()['text'])
+        self.assertIn(OFFER,self.last()['text'])
+        self.assertEqual(self.messages[lesson['lesson_message_id']],original)
+        posts=[call.kwargs for call in self.http.post.call_args_list]
+        self.assertEqual(len(posts),2)
+        self.assertEqual(posts[0]['json']['payment_method_data'],{'type':'sbp'})
+        self.assertNotIn('payment_method_data',posts[1]['json'])
+        self.assertNotEqual(posts[0]['headers'],posts[1]['headers'])
+        for call in posts:
+            self.assertEqual(call['json']['amount'],{'value':f'{amount:.2f}','currency':'RUB'})
+            self.assertEqual(call['json']['metadata']['discount_percent'],str(percent))
+            self.assertEqual(call['json']['metadata']['quiz_token'],quiz['token'])
+            self.assertEqual(call['json']['metadata']['days'],'30')
+            self.assertNotIn('save_payment_method',call['json'])
+        self.assertIsNone(await db.get_subscription(1))
+        return await db.get_lesson_quiz(1)
+
+    async def test_quiz_question_has_exactly_three_answers_and_never_creates_payment(self):
+        quiz,_=await self.offer_quiz()
+        self.assertIn('Как тебе бесплатный урок',self.last()['text'])
+        self.assertIn('фундаментальным',self.last()['text'])
+        self.assertIn('30%',self.last()['text'])
+        self.assertEqual([b.text for b in self.buttons()],['Форма','Функция','Правило'])
+        self.assertTrue(all(len(b.callback_data.encode())<=64 for b in self.buttons()))
+        self.assertIsNone(quiz['answer'])
+        self.http.post.assert_not_awaited()
+
+    async def test_quiz_rule_awards_thirty_percent_and_two_direct_payment_buttons(self):
+        quiz=await self.assert_quiz_result('rule',30,280)
+        self.assertEqual(quiz['discount_percent'],30)
+        self.assertIn('Верно!',self.last()['text'])
+        self.assertNotIn(URL,self.last()['text'])
+        self.assertNotIn('link_preview_options',self.last())
+
+    async def test_quiz_form_awards_fifteen_percent_and_replays_the_video(self):
+        quiz=await self.assert_quiz_result('form',15,340)
+        self.assertEqual(quiz['discount_percent'],15)
+        text=self.last()['text']
+        self.assertIn('Отнюдь нет, дружок',text)
+        self.assertIn('«Правило»',text)
+        self.assertLess(text.index(URL),text.index('утешительного приза'))
+        self.assertEqual(self.last()['link_preview_options'].url,URL)
+        self.assertFalse(self.last()['link_preview_options'].is_disabled)
+
+    async def test_quiz_function_also_awards_fifteen_percent(self):
+        await self.assert_quiz_result('function',15,340)
+
+    async def test_quiz_first_wrong_answer_cannot_be_changed_to_rule_after_restart(self):
+        quiz=await self.assert_quiz_result('form',15,340)
+        original=[copy.deepcopy(call.kwargs) for call in self.http.post.call_args_list]
+        await db.close_db()
+        await db.init_db()
+        self.ctx.user_data={}
+        await self.press('user:quiz:'+quiz['token']+':rule')
+        self.assertEqual((await db.get_lesson_quiz(1))['answer'],'form')
+        self.assertIn('15%',self.last()['text'])
+        self.assertEqual([call.kwargs for call in self.http.post.call_args_list],original)
+        self.assertEqual(len(await self.sql("SELECT * FROM funnel_events WHERE event_name='quiz_answered'")),1)
+
+    async def test_concurrent_quiz_answers_create_only_one_discounted_pair(self):
+        quiz,notice=await self.offer_quiz()
+        await asyncio.gather(self.press('user:quiz:'+quiz['token']+':form',message_id=notice),
+                             self.press('user:quiz:'+quiz['token']+':rule',message_id=notice))
+        saved=await db.get_lesson_quiz(1)
+        self.assertIn(saved['answer'],{'form','rule'})
+        self.assertEqual(self.http.post.await_count,2)
+        expected='280.00' if saved['answer']=='rule' else '340.00'
+        self.assertEqual({call.kwargs['json']['amount']['value'] for call in self.http.post.call_args_list},{expected})
+
+    async def test_quiz_token_cannot_be_used_by_another_user_or_before_invitation(self):
+        quiz,_=await self.offer_quiz()
+        other=NS(id=2,username='other',first_name='Other',last_name=None)
+        await db.upsert_user(2)
+        await self.press('user:quiz:'+quiz['token']+':rule',user=other)
+        self.assertIsNone(await db.get_lesson_quiz(2))
+        self.assertIsNone((await db.get_lesson_quiz(1))['answer'])
+        await self.press('user:quiz:'+'0'*32+':rule')
+        self.assertIsNone((await db.get_lesson_quiz(1))['answer'])
+        self.http.post.assert_not_awaited()
+
+    async def test_quiz_discounted_pair_keeps_price_duration_and_offer_after_admin_changes(self):
+        quiz=await self.assert_quiz_result('rule',30,280)
+        snapshot=quiz['quote_json']
+        await db.save_tariff('creative_30','Новый тариф',700,60,True,99)
+        await db.set_offer_url(OFFER+'/changed')
+        with patch.object(bot,'OFFER_VERSION','2'):
+            await self.press('user:buy')
+        self.assertEqual((await db.get_lesson_quiz(1))['quote_json'],snapshot)
+        self.assertIn('К оплате: 280 ₽',self.last()['text'])
+        self.assertIn('30 дней',self.last()['text'])
+        self.assertIn(OFFER,self.last()['text'])
+        self.assertNotIn(OFFER+'/changed',self.last()['text'])
+        self.assertEqual(self.http.post.await_count,2)
+
+    async def test_quiz_uses_exact_kopecks_for_new_admin_price(self):
+        await db.save_tariff('creative_30','Цена с копейками после скидки',999,30,True,99)
+        quiz,_=await self.offer_quiz()
+        await self.press('user:quiz:'+quiz['token']+':rule')
+        self.assertEqual({call.kwargs['json']['amount']['value'] for call in self.http.post.call_args_list},{'699.30'})
+        self.assertIn('К оплате: 699,30 ₽',self.last()['text'])
+        own=[value for key,value in self.provider_payments.items() if key.startswith('quiz-')][0]
+        own.update(status='succeeded',paid=True)
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.stats())['revenue_rub'],699.30)
+
+    async def test_quiz_replaces_known_full_price_invoices_without_rewriting_them(self):
+        quiz,notice=await self.offer_quiz()
+        await self.press('user:buy')
+        before=[dict(row) for row in await self.sql('SELECT * FROM checkout_requests')]
+        self.assertEqual(self.http.post.await_count,2)
+        await self.press('user:quiz:'+quiz['token']+':rule',message_id=notice)
+        self.assertEqual(self.http.post.await_count,4)
+        for row in before:
+            current=await db.get_checkout(row['id'])
+            self.assertEqual(current['request_json'],row['request_json'])
+            self.assertEqual(current['id'],row['id'])
+            self.assertEqual(current['status'],'superseded')
+            self.assertEqual((await db.get_payment(row['payment_id']))['status'],'pending')
+        self.assertEqual([call.kwargs['json']['amount']['value'] for call in self.http.post.call_args_list],['400.00','400.00','280.00','280.00'])
+        await self.press('user:check_payment:p1')
+        self.assertEqual([b.text for b in self.buttons()],['Через СБП','Другие способы'])
+        self.assertIn('К оплате: 280 ₽',self.last()['text'])
+
+    async def test_unknown_quiz_post_recovers_same_key_without_automatic_extra_messages(self):
+        quiz,_=await self.offer_quiz()
+        self.http.post.side_effect=httpx.ReadTimeout('unknown')
+        await self.press('user:quiz:'+quiz['token']+':form')
+        first=copy.deepcopy(self.http.post.call_args.kwargs)
+        self.assertEqual(first['json']['amount']['value'],'340.00')
+        self.assertTrue(all(b.callback_data for b in self.buttons()))
+        sends=self.telegram.send_message.await_count
+        await db.close_db()
+        await db.init_db()
+        self.ctx.user_data={}
+        self.http.post.side_effect=self.provider_post
+        await bot.payment_reconciliation_job(self.ctx)
+        second=self.http.post.call_args.kwargs
+        self.assertEqual(first['headers'],second['headers'])
+        self.assertEqual(first['json'],second['json'])
+        self.assertEqual(self.telegram.send_message.await_count,sends)
+        await self.press('user:quiz_pay:'+quiz['token'])
+        self.assertTrue(all(b.url for b in self.buttons()))
+        self.assertEqual(self.http.post.await_count,3)
+
+    async def test_unknown_old_invoice_is_resolved_before_new_discount_request(self):
+        quiz,_=await self.offer_quiz()
+        self.http.post.side_effect=httpx.ReadTimeout('old outcome unknown')
+        await self.press('user:buy')
+        original=copy.deepcopy(self.http.post.call_args.kwargs)
+        await self.press('user:quiz:'+quiz['token']+':function')
+        self.assertTrue(all(b.callback_data for b in self.buttons()))
+        for call in self.http.post.call_args_list:
+            self.assertEqual(call.kwargs['headers'],original['headers'])
+            self.assertEqual(call.kwargs['json']['amount']['value'],'400.00')
+        self.http.post.side_effect=self.provider_post
+        await self.press('user:quiz_pay:'+quiz['token'])
+        values=[call.kwargs['json']['amount']['value'] for call in self.http.post.call_args_list]
+        self.assertEqual(values,['400.00','400.00','400.00','340.00','340.00'])
+        self.assertIn('К оплате: 340 ₽',self.last()['text'])
+
+    async def test_quiz_success_through_other_methods_grants_access_once_and_redeems_discount(self):
+        quiz=await self.assert_quiz_result('rule',30,280)
+        for pid,value in self.provider_payments.items():
+            if pid.startswith('alt-'):
+                value.update(status='succeeded',paid=True)
+        await bot.payment_reconciliation_job(self.ctx)
+        saved=await db.get_lesson_quiz(1)
+        self.assertTrue(saved['redeemed_payment_id'].startswith('alt-'))
+        until=(await db.get_subscription(1))['access_until']
+        self.assertAlmostEqual((db.parse_dt(until)-db.utcnow()).total_seconds(),30*86400,delta=5)
+        self.assertEqual((await db.stats())['revenue_rub'],280)
+        self.assertTrue(await db.has_accepted_offer(1))
+        self.assertIsNone(await db.get_renewal(1))
+        await self.press('user:quiz:'+quiz['token']+':rule')
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertEqual((await db.get_subscription(1))['access_until'],until)
+        self.assertEqual(self.http.post.await_count,2)
+        self.assertFalse(any(b.text in {'Через СБП','Другие способы'} for b in self.buttons()))
+
+    async def test_quiz_rejects_wrong_provider_amount_and_never_grants_access(self):
+        await self.assert_quiz_result('form',15,340)
+        root=next(value for pid,value in self.provider_payments.items() if pid.startswith('quiz-'))
+        root.update(status='succeeded',paid=True,amount={'value':'1.00','currency':'RUB'})
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertIsNone(await db.get_subscription(1))
+        self.assertIsNone((await db.get_lesson_quiz(1))['redeemed_payment_id'])
+
+    async def test_quiz_definitive_rejection_keeps_the_discount_for_a_new_request(self):
+        quiz,_=await self.offer_quiz()
+        request=httpx.Request('POST',billing.API_URL)
+        self.http.post.side_effect=httpx.HTTPStatusError('rejected',request=request,response=httpx.Response(400,request=request))
+        await self.press('user:quiz:'+quiz['token']+':function')
+        first=copy.deepcopy(self.http.post.call_args.kwargs)
+        self.assertIsNone(await db.pending_checkout(1))
+        self.assertEqual((await db.get_lesson_quiz(1))['discount_percent'],15)
+        self.assertTrue(all(b.callback_data for b in self.buttons()))
+        self.http.post.side_effect=self.provider_post
+        await self.press('user:quiz_pay:'+quiz['token'])
+        second=self.http.post.call_args_list[1].kwargs
+        self.assertEqual(first['json'],second['json'])
+        self.assertNotEqual(first['headers'],second['headers'])
+        self.assertIn('К оплате: 340 ₽',self.last()['text'])
+
+    async def test_purchase_at_old_price_does_not_trap_later_renewal_in_quiz(self):
+        quiz,notice=await self.offer_quiz()
+        await self.press('user:buy')
+        await self.press('user:quiz:'+quiz['token']+':rule',message_id=notice)
+        self.http.get.return_value=self.response(self.payment(status='succeeded'))
+        for value in self.provider_payments.values():
+            if value['id']!='p1':
+                value.update(status='canceled',paid=False)
+        await bot.payment_reconciliation_job(self.ctx)
+        self.assertTrue(bot.active_subscription_until(await db.get_subscription(1)))
+        await self.sql("UPDATE subscriptions SET access_until=?,status='expired' WHERE tg_user_id=1",((db.utcnow()-timedelta(days=1)).isoformat(),))
+        self.http.post.return_value=self.response(self.payment('renewal_new'))
+        await self.press('user:buy')
+        self.assertEqual(self.http.post.call_args_list[-2].kwargs['json']['amount']['value'],'400.00')
+        self.assertNotIn('quiz_token',self.http.post.call_args_list[-2].kwargs['json']['metadata'])
+        self.assertNotIn('Твоя скидка',self.last()['text'])
+
+    async def test_quiz_is_not_reminded_again_if_ignored_or_answered_without_payment(self):
+        quiz,_=await self.offer_quiz()
+        for _ in range(2):
+            await bot.start(self.update,self.ctx)
+            await self.press('user:open_lesson')
+            await self.age_lead()
+            sends=self.telegram.send_message.await_count
+            await bot.followup_job(self.ctx)
+            self.assertEqual(self.telegram.send_message.await_count,sends)
+        await self.press('user:quiz:'+quiz['token']+':form')
+        sends=self.telegram.send_message.await_count
+        await bot.followup_job(self.ctx)
+        self.assertEqual(self.telegram.send_message.await_count,sends)
+        self.assertEqual(len(await self.sql('SELECT * FROM followup_deliveries')),1)
+        self.assertEqual(len(await self.sql('SELECT * FROM lesson_quizzes')),1)
 
 
 class ApplicationTests(unittest.TestCase):
