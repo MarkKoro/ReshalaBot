@@ -1,0 +1,298 @@
+import copy
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import time
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import Mock, patch
+
+import bot
+import db
+import instagram_automation as campaign
+from instagram_gateway import Gateway, GraphError
+import test_bot
+
+
+class CampaignTests(unittest.TestCase):
+    def test_only_creative_keyword_by_default_and_whole_words(self):
+        self.assertEqual(campaign.DEFAULTS["keywords"], ["креатив"])
+        for value in ("КРЕАТИВ!!!", "Можно креатив 🧠", "#креатив", "Креатив"):
+            self.assertTrue(campaign.matches(value, ["креатив"]))
+        for value in ("видео", "ссылка", "некреативный", "креативность", ""):
+            self.assertFalse(campaign.matches(value, ["креатив"]))
+
+    def test_keyword_validation_and_phrases(self):
+        self.assertEqual(campaign.parse_keywords("КРЕАТИВ, креатив; новый урок\nВИДЕО"), ["креатив", "новый урок", "видео"])
+        self.assertTrue(campaign.matches("Новый, урок!", ["новый урок"]))
+        for value in ("a" * 41, ",".join("word" + str(n) for n in range(31))):
+            with self.assertRaises(ValueError):
+                campaign.parse_keywords(value)
+
+    def test_urls_and_text_variants(self):
+        self.assertEqual(campaign.validate_url("https://t.me/BioMozg_agent?start=instagram"), "https://t.me/BioMozg_agent?start=instagram")
+        for value in ("http://t.me/test", "javascript:alert(1)", "https://127.0.0.1/", "https://user:password@example.com/", "https://example.local/", "https://example.com:8443/", "https://example.com/\nsecret", None):
+            with self.assertRaises(ValueError):
+                campaign.validate_url(value)
+        self.assertEqual(campaign.variants("Первый\n---\nВторой"), ["Первый", "Второй"])
+        for value in ("", "a" * 901, "a\n---\nb\n---\nc\n---\nd"):
+            with self.assertRaises(ValueError):
+                campaign.variants(value)
+
+    def test_atomic_persistence_and_empty_list_disables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            settings = copy.deepcopy(campaign.DEFAULTS)
+            settings.update(enabled=True, keywords=[])
+            campaign.save_settings(settings, path)
+            loaded = campaign.load_settings(path)
+            self.assertFalse(loaded["enabled"])
+            before = path.read_bytes()
+            settings["target_url"] = "http://localhost"
+            with self.assertRaises(ValueError):
+                campaign.save_settings(settings, path)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_variants_are_stable_and_stale_status_fails_closed(self):
+        self.assertEqual(campaign.choose(["a", "b", "c"], "person"), campaign.choose(["a", "b", "c"], "person"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.json"
+            path.write_text(json.dumps({"updated_at": time.time() - 121, "connected": True}))
+            self.assertFalse(campaign.connection_status(path)["connected"])
+
+
+class InstagramAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.fixture = test_bot.BotTests(methodName="runTest")
+        await self.fixture.asyncSetUp()
+        self.config_path = Path(self.fixture.temp.name) / "instagram-settings.json"
+        self.paths = patch.multiple(campaign, CONFIG_PATH=self.config_path,
+                                    STATUS_PATH=Path(self.fixture.temp.name) / "status.json")
+        self.paths.start()
+        self.admin = NS(id=99, username="admin", first_name="Admin", last_name=None)
+        self.update = NS(effective_user=self.admin, effective_chat=NS(id=99, type="private"),
+                         effective_message=NS(message_id=9000, text=""))
+
+    async def asyncTearDown(self):
+        self.paths.stop()
+        await self.fixture.asyncTearDown()
+
+    async def press(self, route, user=None):
+        await self.fixture.press(route, user=user or self.admin)
+
+    async def enter(self, text):
+        self.update.effective_message.text = text
+        await bot.handle_admin_input(self.update, self.fixture.ctx)
+
+    async def test_menu_and_preview_are_admin_only_and_never_send_instagram(self):
+        for route in ("admin:instagram", "admin:instagram:toggle", "admin:instagram:edit:target_url",
+                      "admin:instagram:keywords", "admin:instagram:public_toggle", "admin:instagram:preview"):
+            await self.press(route, user=self.fixture.user)
+        self.assertEqual(self.fixture.messages, {})
+        self.assertFalse(self.config_path.exists())
+        self.assertIsNone(await db.get_admin_state(1))
+        await self.press("admin:menu")
+        self.assertIn("admin:instagram", [b.callback_data for b in self.fixture.buttons()])
+        await self.press("admin:instagram:preview")
+        self.assertIn("тест ничего не отправляет", self.fixture.last()["text"])
+        self.assertIn("https://t.me/BioMozg_agent", self.fixture.last()["text"])
+        self.assertFalse(self.config_path.exists())
+        self.fixture.http.post.assert_not_awaited()
+
+    async def test_add_remove_replace_keywords_and_audit(self):
+        await self.press("admin:instagram:edit:keywords_add")
+        await self.enter("ВИДЕО, креатив")
+        self.assertEqual(campaign.load_settings()["keywords"], ["креатив", "видео"])
+        await self.press("admin:instagram:edit:keywords_remove")
+        await self.enter("Видео")
+        self.assertEqual(campaign.load_settings()["keywords"], ["креатив"])
+        await self.press("admin:instagram:toggle")
+        self.assertTrue(campaign.load_settings()["enabled"])
+        await self.press("admin:instagram:edit:keywords")
+        await self.enter("удалить")
+        self.assertFalse(campaign.load_settings()["enabled"])
+        self.assertEqual(campaign.load_settings()["keywords"], [])
+        await self.press("admin:instagram:toggle")
+        self.assertFalse(campaign.load_settings()["enabled"])
+        self.assertEqual(len(await self.fixture.sql("SELECT * FROM admin_audit")), 4)
+
+    async def test_link_text_and_button_validation_persist(self):
+        await self.press("admin:instagram:edit:target_url")
+        await self.enter("http://localhost")
+        self.assertIsNotNone(await db.get_admin_state(99))
+        self.assertFalse(self.config_path.exists())
+        await self.enter("https://t.me/BioMozg_agent?start=ig")
+        await self.press("admin:instagram:edit:opening")
+        await self.enter("Первый\n---\nВторой")
+        await self.press("admin:instagram:edit:link_label")
+        await self.enter("x" * 21)
+        self.assertIsNotNone(await db.get_admin_state(99))
+        await self.enter("Смотреть видео")
+        saved = campaign.load_settings()
+        self.assertEqual(saved["opening"], ["Первый", "Второй"])
+        self.assertEqual(saved["link_label"], "Смотреть видео")
+        self.assertEqual(saved["target_url"], "https://t.me/BioMozg_agent?start=ig")
+
+    async def test_stale_nonadmin_input_and_group_input_cannot_write(self):
+        await db.set_admin_state(1, "instagram", {"key": "target_url"})
+        self.fixture.update.effective_message.text = "https://example.com"
+        self.assertFalse(await bot.handle_admin_input(self.fixture.update, self.fixture.ctx))
+        await self.press("admin:instagram:edit:target_url")
+        self.update.effective_chat = NS(id=-1009, type="supergroup")
+        self.update.effective_message.text = "https://example.com"
+        self.assertFalse(await bot.handle_admin_input(self.update, self.fixture.ctx))
+        self.assertFalse(await bot.instagram_admin_input("https://example.com", {"payload": {"key": "target_url"}}, self.update, self.fixture.ctx))
+        self.assertFalse(self.config_path.exists())
+        self.assertEqual(await self.fixture.sql("SELECT * FROM admin_audit"), [])
+
+
+class GatewayTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        (self.root / "secrets").mkdir()
+        self.credentials = {"ig_user_id": "100", "app_id": "101", "api_version": "v24.0",
+                            "access_token": "test-only", "app_secret": "test-secret", "runner_token": "test-runner"}
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(self.credentials))
+        self.path = self.root / "settings.json"
+        settings = copy.deepcopy(campaign.DEFAULTS)
+        settings["enabled"] = True
+        campaign.save_settings(settings, self.path)
+        self.gateway = Gateway(self.root, self.path)
+        self.gateway.ready = Mock(return_value=True)
+        self.gateway.connected = True
+        self.gateway.graph = Mock(side_effect=self.graph)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def graph(self, method, endpoint, payload=None):
+        if method == "GET":
+            from datetime import datetime, timezone
+            return {"id": "300", "text": "КРЕАТИВ", "timestamp": datetime.now(timezone.utc).isoformat()}
+        if endpoint.endswith("/replies"):
+            return {"id": "reply-300"}
+        return {"message_id": "sent-" + str(self.gateway.graph.call_count), "recipient_id": "200"}
+
+    def comment(self, comment="300", person="200", text="Креатив", stamp=None):
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "100", "time": stamp or time.time(),
+            "changes": [{"field": "comments", "value": {"id": comment, "from": {"id": person}, "text": text}}]}]})
+
+    def message(self, mid="inbound-1", person="200", text="Да", payload=campaign.OPT_IN, stamp=None):
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "100", "messaging": [{
+            "sender": {"id": person}, "timestamp": (stamp or time.time()) * 1000,
+            "message": {"mid": mid, "text": text, "quick_reply": {"payload": payload}},
+        }]}]})
+
+    def rows(self):
+        with sqlite3.connect(self.gateway.database) as con:
+            return con.execute("SELECT id,status,result FROM events ORDER BY id").fetchall()
+
+    def test_hmac_and_wrong_account_are_rejected(self):
+        body = b'{"object":"instagram"}'
+        signature = "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+        self.assertTrue(self.gateway.verify_signature(body, signature))
+        self.assertFalse(self.gateway.verify_signature(body + b" ", signature))
+        self.assertFalse(self.gateway.verify_signature(body, ""))
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "999", "changes": [{"field": "comments", "value": {"id": "300"}}]}]})
+        self.assertEqual(self.rows(), [])
+
+    def test_comments_on_any_post_open_dm_then_consent_uses_latest_link(self):
+        self.comment()
+        self.gateway.tick()
+        sends = [call for call in self.gateway.graph.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0].args[2]["recipient"], {"comment_id": "300"})
+        self.assertIn("quick_replies", sends[0].args[2]["message"])
+        settings = campaign.load_settings(self.path)
+        settings["target_url"] = "https://t.me/BioMozg_agent?start=new"
+        campaign.save_settings(settings, self.path)
+        self.message()
+        self.gateway.tick()
+        link_calls = [call for call in self.gateway.graph.call_args_list if call.args[0] == "POST" and "attachment" in (call.args[2] or {}).get("message", {})]
+        self.assertEqual(len(link_calls), 1)
+        self.assertEqual(link_calls[0].args[2]["message"]["attachment"]["payload"]["buttons"][0]["url"], settings["target_url"])
+        self.comment()
+        self.message()
+        count = self.gateway.graph.call_count
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, count)
+
+    def test_no_consent_no_keyword_url_click_and_old_events_do_not_send(self):
+        self.message(text="Привет", payload="")
+        self.comment(comment="301", text="видео")
+        self.comment(comment="302", stamp=time.time() - 8 * 86400)
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, 0)
+        self.message(mid="old", text="креатив", payload="", stamp=time.time() - 25 * 3600)
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, 0)
+
+    def test_pause_applies_to_queued_messages(self):
+        self.comment()
+        settings = campaign.load_settings(self.path)
+        settings["enabled"] = False
+        campaign.save_settings(settings, self.path)
+        self.gateway.tick()
+        self.gateway.graph.assert_not_called()
+
+    def test_keyword_removal_while_comment_is_checked_stops_the_send(self):
+        self.comment()
+        def changed(method, endpoint, payload=None):
+            result = self.graph(method, endpoint, payload)
+            settings = campaign.load_settings(self.path)
+            settings["keywords"] = ["новый урок"]
+            campaign.save_settings(settings, self.path)
+            return result
+        self.gateway.graph.side_effect = changed
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, 1)
+        self.assertEqual(self.rows()[0][2], "keyword_removed")
+
+    def test_millisecond_comment_timestamp_is_supported(self):
+        self.comment(stamp=time.time() * 1000)
+        self.gateway.tick()
+        self.assertEqual(self.rows()[0][1], "sent")
+
+    def test_optout_human_takeover_cooldown_and_own_comment(self):
+        self.message(text="Стоп", payload="")
+        self.gateway.tick()
+        self.comment()
+        self.gateway.tick()
+        self.gateway.graph.assert_not_called()
+        self.gateway.update_person("201", human_until=time.time() + 86400)
+        self.comment(comment="301", person="201")
+        self.gateway.update_person("202", opened_at=time.time())
+        self.comment(comment="302", person="202")
+        self.comment(comment="303", person="100")
+        self.gateway.tick()
+        self.gateway.graph.assert_not_called()
+
+    def test_ambiguous_send_is_not_retried_and_has_no_public_reply(self):
+        self.comment()
+        real_graph = self.graph
+        self.gateway.graph.side_effect = lambda method, endpoint, payload=None: real_graph(method, endpoint, payload) if method == "GET" else (_ for _ in ()).throw(GraphError(uncertain=True))
+        self.gateway.tick()
+        self.assertEqual(self.rows(), [("comment:300", "unknown", "meta_0")])
+        self.comment()
+        count = self.gateway.graph.call_count
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, count)
+
+    def test_restart_quarantines_interrupted_send_and_missing_meta_never_sends(self):
+        self.comment()
+        self.gateway.finish("comment:300", "sending")
+        fresh = Gateway(self.root, self.path)
+        self.assertEqual(self.rows()[0][1], "unknown")
+        (self.root / "secrets" / "credentials.json").write_text("{}")
+        fresh.graph = Mock()
+        status = fresh.tick()
+        self.assertFalse(status["connected"])
+        fresh.graph.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

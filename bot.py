@@ -32,6 +32,7 @@ from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, C
 import db
 import texts
 import billing
+import instagram_automation as instagram
 
 try:
     from telegram import LinkPreviewOptions
@@ -888,6 +889,7 @@ def is_admin(tg_user_id: int) -> bool:
 def admin_menu_keyboard() -> Mk:
     return Mk([
         [Btn("🎬 Лид-магнит", callback_data="admin:lead_magnet")],
+        [Btn("📸 Instagram · n8n", callback_data="admin:instagram")],
         [Btn("💰 Тарифы и сроки", callback_data="admin:tariffs")],
         [Btn("✍️ Тексты бота", callback_data="admin:texts")],
         [Btn("⚙️ Напоминания и настройки", callback_data="admin:settings")],
@@ -928,6 +930,8 @@ async def admin_router(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await remember_user(query.from_user)
     data = query.data or ""
     await db.clear_admin_state(tg_user_id)
+    if await instagram_admin_route(data, chat_id, tg_user_id, ctx):
+        return
     if await extended_admin_route(data,chat_id,tg_user_id,ctx):
         return
     if data == "admin:offer":
@@ -1006,6 +1010,8 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return False
     await remember_user(user)
     name, raw = state["state"], (message.text or "").strip()
+    if name == "instagram":
+        return await instagram_admin_input(raw, state, update, ctx)
     if await extended_admin_input(name,raw,state,update,ctx):
         return True
     if name in {"lead_magnet_url", "intro_video", "offer_url"}:
@@ -1082,6 +1088,126 @@ async def handle_admin_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return True
     await db.clear_admin_state(user.id)
     await show_admin_menu(chat.id, user.id, ctx, "Это действие больше не используется.")
+    return True
+
+
+async def instagram_admin_route(data, chat_id, uid, ctx):
+    if not (data == "admin:instagram" or data.startswith("admin:instagram:")):
+        return False
+    if chat_id != uid or not is_admin(uid):
+        return True
+    try:
+        settings = instagram.load_settings()
+        action = data.removeprefix("admin:instagram").lstrip(":")
+        if action in {"toggle", "public_toggle"}:
+            key = "enabled" if action == "toggle" else "public_reply_enabled"
+            if key == "enabled" and not settings["enabled"] and not settings["keywords"]:
+                await render_screen(uid, uid, ctx, text="Сначала добавьте хотя бы одно ключевое слово.",
+                                    reply_markup=Mk([[Btn("Ключевые слова", callback_data="admin:instagram:keywords")]]))
+                return True
+            settings[key] = not settings[key]
+            settings = instagram.save_settings(settings)
+            await db.set_admin_setting(instagram.SETTING_KEY, json.dumps(settings, ensure_ascii=False), uid)
+        elif action == "keywords":
+            await render_screen(uid, uid, ctx,
+                text="Ключевые слова Instagram\n\n" + ("\n".join(settings["keywords"]) or "Список пуст — отправка выключена.")
+                     + "\n\nРегистр и знаки препинания не важны. «Некреативный» не совпадёт с «креатив». Фразы тоже поддерживаются.",
+                reply_markup=Mk([[Btn("Добавить слова", callback_data="admin:instagram:edit:keywords_add")],
+                                 [Btn("Убрать слова", callback_data="admin:instagram:edit:keywords_remove")],
+                                 [Btn("Заменить весь список", callback_data="admin:instagram:edit:keywords")],
+                                 [Btn("Назад", callback_data="admin:instagram")]]))
+            return True
+        elif action.startswith("edit:"):
+            key = action.removeprefix("edit:")
+            if key not in {*instagram.TEXT_LABELS, "keywords", "keywords_add", "keywords_remove", "target_url"}:
+                return True
+            await db.set_admin_state(uid, "instagram", {"key": key})
+            if key.startswith("keywords"):
+                current = ", ".join(settings["keywords"]) or "пусто"
+                prompt = ("Добавьте слова" if key.endswith("add") else "Укажите слова для удаления" if key.endswith("remove") else "Отправьте новый полный список")
+                text = f"Сейчас: {current}\n\n{prompt}: через запятую или по одному на строке. До 30 слов/фраз. Чтобы очистить весь список, отправьте «удалить» в режиме замены."
+            elif key == "target_url":
+                text = f"Сейчас: {settings[key]}\n\nОтправьте новую публичную https-ссылку. Она будет использоваться для следующих отправок."
+            elif isinstance(settings[key], list):
+                text = instagram.TEXT_LABELS[key] + "\n\n" + "\n---\n".join(settings[key]) + "\n\nОтправьте 1–3 варианта до 600 знаков каждый. Разделяйте варианты строкой --- . Подстановки и код не исполняются."
+            else:
+                text = instagram.TEXT_LABELS[key] + f"\nСейчас: {settings[key]}\n\nОтправьте новую надпись: 1–20 знаков, одна строка."
+            await render_screen(uid, uid, ctx, text=text, reply_markup=Mk([[Btn("Отмена", callback_data="admin:instagram")]]))
+            return True
+        elif action == "texts":
+            rows = [[Btn(label, callback_data="admin:instagram:edit:" + key)] for key, label in instagram.TEXT_LABELS.items()]
+            rows += [[Btn("Ответ под комментарием: " + ("вкл." if settings["public_reply_enabled"] else "выкл."), callback_data="admin:instagram:public_toggle")],
+                     [Btn("Назад", callback_data="admin:instagram")]]
+            await render_screen(uid, uid, ctx, text="Тексты Instagram\n\nВарианты чередуются между людьми. Ссылка задаётся отдельно и показывается кнопкой. Ответ под комментарием появляется только после подтверждённой отправки первого Direct.", reply_markup=Mk(rows))
+            return True
+        elif action == "preview":
+            text = ("Предпросмотр · тест ничего не отправляет в Instagram\n\n"
+                    "1. Человек пишет ключевое слово под любой публикацией или Reels — старой или новой.\n\n"
+                    + settings["opening"][0] + "\n[" + settings["opt_in_label"] + "]\n\n"
+                    "2. После ответа человека:\n\n" + settings["link_text"][0]
+                    + "\n[" + settings["link_label"] + "] " + settings["target_url"])
+            if settings["public_reply_enabled"]:
+                text += "\n\nОтвет под комментарием:\n" + settings["public_reply"][0]
+            await render_screen(uid, uid, ctx, text=text, reply_markup=Mk([[Btn("Назад", callback_data="admin:instagram")]]))
+            return True
+        status = instagram.connection_status()
+        text = ("📸 Instagram · n8n\n\n"
+                + ("Автоответы разрешены настройкой." if settings["enabled"] else "Автоответы выключены.")
+                + "\n" + str(status.get("label", "Статус Meta не подтверждён."))
+                + "\n\nСлова: " + (", ".join(settings["keywords"]) or "пусто")
+                + "\nСсылка: " + settings["target_url"]
+                + "\n\nВсе старые и новые публикации/Reels. Обрабатываются новые комментарии после включения; старые комментарии не рассылаются задним числом."
+                + "\nОдин запуск человеку за 24 часа. Сначала короткое сообщение, затем ссылка после ответа. Настройки применяются при следующей обработке."
+                + "\nБез подтверждённого подключения Meta отправки не будет.")
+        await render_screen(uid, uid, ctx, text=text, reply_markup=Mk([
+            [Btn("⏸ Выключить" if settings["enabled"] else "▶️ Разрешить автоответы", callback_data="admin:instagram:toggle")],
+            [Btn("🔑 Ключевые слова", callback_data="admin:instagram:keywords")],
+            [Btn("🔗 Изменить ссылку", callback_data="admin:instagram:edit:target_url")],
+            [Btn("✍️ Тексты и кнопки", callback_data="admin:instagram:texts")],
+            [Btn("👁 Предпросмотр", callback_data="admin:instagram:preview")],
+            [Btn("🔄 Обновить статус", callback_data="admin:instagram")],
+            [Btn("Назад", callback_data="admin:menu")],
+        ]))
+    except (OSError, ValueError, TypeError):
+        logger.warning("Instagram settings unavailable; outgoing replies remain gated")
+        await render_screen(uid, uid, ctx, text="Не удалось прочитать или сохранить настройки Instagram. Автоответы не подтверждены. Обратитесь к администратору сервера.", reply_markup=admin_cancel_keyboard())
+    return True
+
+
+async def instagram_admin_input(raw, state, update, ctx):
+    user, chat = update.effective_user, update.effective_chat
+    if not user or not chat or chat.type != "private" or chat.id != user.id or not is_admin(user.id):
+        return False
+    key = state.get("payload", {}).get("key")
+    if key not in {*instagram.TEXT_LABELS, "target_url", "keywords", "keywords_add", "keywords_remove"}:
+        await db.clear_admin_state(user.id)
+        return True
+    try:
+        settings = instagram.load_settings()
+        if key.startswith("keywords"):
+            items = [] if raw.casefold() == "удалить" and key == "keywords" else instagram.parse_keywords(raw)
+            if key == "keywords_add":
+                items = list(dict.fromkeys(settings["keywords"] + items))
+            elif key == "keywords_remove":
+                items = [word for word in settings["keywords"] if word not in items]
+            settings["keywords"] = items
+        elif key == "target_url":
+            settings[key] = instagram.validate_url(raw)
+        elif key in {"opening", "link_text", "public_reply"}:
+            settings[key] = instagram.variants(raw)
+        else:
+            settings[key] = raw
+        settings = instagram.save_settings(settings)
+        await db.set_admin_setting(instagram.SETTING_KEY, json.dumps(settings, ensure_ascii=False), user.id)
+    except (ValueError, TypeError) as exc:
+        await render_screen(user.id, user.id, ctx, text="Не сохранено. " + str(exc), reply_markup=Mk([[Btn("Отмена", callback_data="admin:instagram")]]))
+        return True
+    except OSError:
+        await render_screen(user.id, user.id, ctx, text="Не удалось записать файл настроек. Изменение не подтверждено.", reply_markup=admin_cancel_keyboard())
+        return True
+    await db.clear_admin_state(user.id)
+    await delete_incoming(update, ctx)
+    await instagram_admin_route("admin:instagram:keywords" if key.startswith("keywords") else "admin:instagram", user.id, user.id, ctx)
     return True
 
 

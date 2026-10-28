@@ -587,7 +587,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_menu_stats_and_user_path_routes(self):
         admin_user = NS(id=99, username="admin", first_name="Admin", last_name=None)
         await self.press("admin:menu", admin_user)
-        self.assertEqual(len(self.buttons()), 11)
+        self.assertEqual(len(self.buttons()), 12)
         await self.press("admin:stats", admin_user)
         self.assertIn("Воронка", self.last()["text"])
         await db.record_start(1, "shorts_creative")
@@ -623,7 +623,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.user.id = self.chat.id = 99
         self.update.effective_message.text = "/admin"
         await bot.admin(self.update, self.ctx)
-        self.assertEqual(len(self.buttons()), 11)
+        self.assertEqual(len(self.buttons()), 12)
         await db.set_admin_state(99, "grant")
         self.chat.id = -100123
         self.chat.type = "supergroup"
@@ -665,7 +665,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             assert_menu()
             await self.press("admin:menu")
             self.assertIsNone(await db.get_admin_state(1))
-            self.assertEqual(len(self.buttons()), 11)
+            self.assertEqual(len(self.buttons()), 12)
 
     async def test_regular_user_gets_no_admin_button_and_sees_price_before_consent(self):
         await bot.start(self.update, self.ctx)

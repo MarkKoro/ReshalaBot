@@ -16,6 +16,8 @@ __pycache__/
 
 # Логи
 *.log
+instagram-settings.json
+instagram-status.json
 
 # Системные файлы Windows / Mac
 Thumbs.db
