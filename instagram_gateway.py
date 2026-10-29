@@ -77,7 +77,11 @@ class Gateway:
         version = credentials.get("api_version", "")
         if not re.fullmatch(r"v\d+\.\d+", version):
             raise GraphError()
-        url = "https://graph.instagram.com/" + version + "/" + endpoint
+        mode = credentials.get("api_mode", "instagram_login")
+        hosts = {"instagram_login": "graph.instagram.com", "unified_login": "graph.facebook.com"}
+        if mode not in hosts:
+            raise GraphError()
+        url = "https://" + hosts[mode] + "/" + version + "/" + endpoint
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
         request = Request(url, data=data, method=method, headers={
             "Authorization": "Bearer " + credentials.get("access_token", ""),
@@ -106,8 +110,23 @@ class Gateway:
             return False
         if not str(credentials["ig_user_id"]).isdigit() or not str(credentials["app_id"]).isdigit():
             return False
+        mode = credentials.get("api_mode", "instagram_login")
+        if mode not in {"instagram_login", "unified_login"}:
+            return False
         try:
-            account = self.graph("GET", "me?fields=user_id,username")
+            if mode == "unified_login":
+                expected_business = str(credentials.get("client_business_id", ""))
+                if not expected_business.isdigit():
+                    return False
+                # With a business integration token /me is the system user, not Instagram.
+                business = self.graph("GET", "me?fields=client_business_id")
+                if str(business.get("client_business_id", "")) != expected_business:
+                    return False
+                accounts = self.graph("GET", "me/assigned_instagram_accounts?fields=id,username&limit=100")
+                account = next((item for item in accounts.get("data", [])
+                    if str(item.get("id", "")) == str(credentials["ig_user_id"])), {})
+            else:
+                account = self.graph("GET", "me?fields=user_id,username")
             if (str(account.get("user_id", account.get("id", ""))) != str(credentials["ig_user_id"])
                     or account.get("username", "").casefold() != "biomozg"):
                 return False

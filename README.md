@@ -103,11 +103,22 @@ Bot API позволяет задать URL, размер медиа, позиц
 ключи и не включайте отправку до проверки аккаунта, подписок и реального теста.
 В n8n импортируется заголовочный credential с runner_token и публикуется схема;
 Meta получает callback `https://n8n.telegrambotsforeveryone.duckdns.org/instagram/webhook`.
-Для Instagram Login нужны `instagram_business_basic`, `instagram_business_manage_comments`,
-`instagram_business_manage_messages`, события `comments`, `messages`, `messaging_postbacks`.
+Для новых приложений Meta используется **Unified Login**: `api_mode=unified_login`,
+разрешения `instagram_basic`, `instagram_manage_comments`, `instagram_manage_messages`,
+хост `graph.facebook.com`. Сохраняйте также ожидаемый `client_business_id` портфолио;
+обработчик проверяет его и наличие @biomozg в `/me/assigned_instagram_accounts`.
+У такого токена `/me` обозначает системного пользователя компании, а не Instagram.
+Для старого Instagram Login оставлена совместимость (`api_mode=instagram_login`
+или отсутствие поля): `graph.instagram.com`, разрешения `instagram_business_basic`,
+`instagram_business_manage_comments`, `instagram_business_manage_messages`.
+Для обоих вариантов нужны события `comments`, `messages`, `messaging_postbacks`.
 Проверьте уровень доступа приложения: режим разработки может не обслуживать обычных
-посетителей. Долгоживущий токен имеет срок действия; автоматическое продление пока
-не реализовано — до боевого запуска нужно настроить обновление и проверку срока.
+посетителей. Системный токен Unified Login может быть бессрочным, но его можно отозвать;
+контроль подключения всё равно обязателен. Для старого Instagram Login долгоживущий
+токен имеет срок действия; автоматическое продление пока не реализовано — перед
+постоянным запуском с таким токеном требуется настроить обновление.
+
+См. [официальное начало работы Unified Login](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login/get-started).
 
 Официальные ограничения: [private replies](https://developers.facebook.com/documentation/instagram-platform/private-replies),
 [quick replies](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-instagram-login/messaging-api/quick-replies),

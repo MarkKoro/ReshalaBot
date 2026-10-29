@@ -191,6 +191,57 @@ class GatewayTests(unittest.TestCase):
         with sqlite3.connect(self.gateway.database) as con:
             return con.execute("SELECT id,status,result FROM events ORDER BY id").fetchall()
 
+    def test_graph_hosts_match_token_family_and_unknown_mode_never_sends_credentials(self):
+        for mode, host in (("instagram_login", "graph.instagram.com"), ("unified_login", "graph.facebook.com")):
+            with self.subTest(mode=mode), patch("instagram_gateway.urlopen") as opened:
+                credentials = dict(self.credentials, api_mode=mode)
+                (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+                opened.return_value.__enter__.return_value.read.return_value = b'{}'
+                Gateway(self.root, self.path).graph("GET", "100?fields=id")
+                request = opened.call_args.args[0]
+                self.assertEqual(request.full_url, "https://" + host + "/v24.0/100?fields=id")
+                self.assertEqual(request.get_header("Authorization"), "Bearer test-only")
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(dict(self.credentials, api_mode="unknown")))
+        with patch("instagram_gateway.urlopen") as opened:
+            with self.assertRaises(GraphError):
+                Gateway(self.root, self.path).graph("GET", "100")
+            opened.assert_not_called()
+
+    def test_unified_token_requires_our_business_our_assigned_instagram_and_all_subscriptions(self):
+        credentials = dict(self.credentials, api_mode="unified_login", client_business_id="151")
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+        responses = [{"id": "system-user", "client_business_id": "151"},
+                     {"data": [{"id": "100", "username": "biomozg"}]},
+                     {"data": [{"id": "101", "subscribed_fields": ["comments", "messages", "messaging_postbacks"]}]}]
+        connected = Gateway(self.root, self.path)
+        connected.graph = Mock(side_effect=copy.deepcopy(responses))
+        self.assertTrue(connected.ready())
+        for label, index, replacement in (
+            ("other business", 0, {"client_business_id": "999"}),
+            ("unassigned Instagram", 1, {"data": [{"id": "999", "username": "biomozg"}]}),
+            ("different username", 1, {"data": [{"id": "100", "username": "another_account"}]}),
+            ("other app", 2, {"data": [{"id": "999", "subscribed_fields": ["comments", "messages", "messaging_postbacks"]}]}),
+            ("missing message events", 2, {"data": [{"id": "101", "subscribed_fields": ["comments"]}]}),
+        ):
+            with self.subTest(label=label):
+                bad = copy.deepcopy(responses)
+                bad[index] = replacement
+                disconnected = Gateway(self.root, self.path)
+                disconnected.graph = Mock(side_effect=bad)
+                self.assertFalse(disconnected.ready())
+        credentials.pop("client_business_id")
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+        disconnected = Gateway(self.root, self.path)
+        disconnected.graph = Mock()
+        self.assertFalse(disconnected.ready())
+        disconnected.graph.assert_not_called()
+
+    def test_existing_instagram_login_token_still_checks_instagram_identity(self):
+        connected = Gateway(self.root, self.path)
+        connected.graph = Mock(side_effect=[{"user_id": "100", "username": "biomozg"},
+            {"data": [{"id": "101", "subscribed_fields": ["comments", "messages", "messaging_postbacks"]}]}])
+        self.assertTrue(connected.ready())
+
     def test_hmac_and_wrong_account_are_rejected(self):
         body = b'{"object":"instagram"}'
         signature = "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
