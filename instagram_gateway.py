@@ -414,7 +414,9 @@ class Gateway:
                 return
             consent = (conversation["opened_at"] > now - 86400
                 and payload["timestamp"] >= conversation["opened_at"] - 1
-                and (payload.get("payload") == campaign.OPT_IN or campaign.words(text) in {"да", "да хочу видео", "пришли", "пришлите", "отправь", "отправьте"}))
+                and (payload.get("payload") == campaign.OPT_IN
+                     or campaign.words(text) == campaign.words(settings["opt_in_label"])
+                     or campaign.words(text) in {"да", "да хочу видео", "пришли", "пришлите", "отправь", "отправьте"}))
             if not consent and not campaign.matches(text, settings["keywords"]):
                 self.finish(event_id, "skipped", "no_keyword_or_consent")
                 return

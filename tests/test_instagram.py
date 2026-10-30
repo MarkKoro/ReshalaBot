@@ -241,6 +241,15 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(fresh.graph.call_args.args[1].startswith("thread%3Aone/messages?"))
         self.assertEqual(fresh.sync_status["queued"], 0)
 
+    def test_sync_recognizes_the_opt_in_button_label_configured_in_admin(self):
+        settings = campaign.load_settings(self.path)
+        settings["opt_in_label"] = "Отправить ссылку"
+        campaign.save_settings(settings, self.path)
+        self.sync_fixture([self.api_message(text=settings["opt_in_label"])])
+        self.gateway.tick()
+        self.assertIn(("message:actual-consent", "sent", ""), self.rows())
+        self.assertEqual(sum(c.args[0] == "POST" for c in self.gateway.graph.call_args_list), 1)
+
     def test_sync_requires_both_thread_participants_before_reading_bodies(self):
         self.sync_fixture([self.api_message()], participants=["100", "999"])
         self.gateway.tick()
