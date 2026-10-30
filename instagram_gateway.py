@@ -603,10 +603,14 @@ class Gateway:
             except (OSError, ValueError, TypeError):
                 self.connected = False
                 return self.status("Настройки не прочитаны. Отправка остановлена.")
+            if not settings["enabled"]:
+                # Advance the paused interval even while Meta is unavailable.
+                self.sync_comments(settings)
             if not self.ready():
                 return self.status("Meta ещё не подключён или доступ не подтверждён. Сообщения не отправляются.")
             started = time.monotonic()
-            self.sync_comments(settings)
+            if settings["enabled"]:
+                self.sync_comments(settings)
             if time.monotonic() - started < 10:
                 self.sync_messages()
             with closing(self.connect()) as con:

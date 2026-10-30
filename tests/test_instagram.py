@@ -383,10 +383,14 @@ class GatewayTests(unittest.TestCase):
         self.comment_sync_fixture(comments)
         settings=campaign.load_settings(self.path)
         settings["enabled"]=False
-        self.gateway.sync_comments(settings)
+        campaign.save_settings(settings,self.path)
+        self.gateway.ready=Mock(return_value=False)
+        self.gateway.tick()
         self.gateway.graph.assert_not_called()
         settings["enabled"]=True
-        self.gateway.sync_comments(settings)
+        campaign.save_settings(settings,self.path)
+        self.gateway.ready=Mock(return_value=True)
+        self.gateway.tick()
         self.assertEqual(self.rows(),[])
         comments[:]=[self.api_comment(comment="405",stamp=time.time())]
         self.gateway.last_comment_sync=0
