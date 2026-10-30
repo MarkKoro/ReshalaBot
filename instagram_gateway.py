@@ -6,6 +6,7 @@ access to the Telegram token, customer/payment database or n8n database.
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,7 +19,7 @@ import sqlite3
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 import instagram_automation as campaign
@@ -44,6 +45,8 @@ class Gateway:
         self.last_ingress = 0
         self.ingress_counts = {"comments": 0, "legacy_messaging": 0,
                                "changes_messages": 0, "changes_postbacks": 0}
+        self.last_sync = 0
+        self.sync_status = {"checked_at": 0, "checks": 0, "queued": 0, "errors": 0, "last_error": ""}
         with closing(self.connect()) as con:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS events (
@@ -57,6 +60,10 @@ class Gateway:
                     human_until REAL NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS sent_messages (id TEXT PRIMARY KEY, created_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS message_sync (
+                    person TEXT PRIMARY KEY, thread TEXT NOT NULL DEFAULT '',
+                    checked_at REAL NOT NULL DEFAULT 0
+                );
                 UPDATE events SET status='unknown',result='process_interrupted'
                     WHERE status='sending';
             """)
@@ -173,9 +180,10 @@ class Gateway:
     def enqueue(self, event_id, kind, payload):
         now = time.time()
         with closing(self.connect()) as con:
-            con.execute("INSERT OR IGNORE INTO events(id,kind,payload,created_at,updated_at) VALUES(?,?,?,?,?)",
+            inserted = con.execute("INSERT OR IGNORE INTO events(id,kind,payload,created_at,updated_at) VALUES(?,?,?,?,?)",
                         (event_id, kind, json.dumps(payload, ensure_ascii=False), now, now))
             con.commit()
+            return inserted.rowcount == 1
 
     def ingest(self, value):
         if value.get("object") != "instagram":
@@ -203,23 +211,119 @@ class Gateway:
                         "text": str(item.get("text", ""))[:2200], "timestamp": self.timestamp(entry.get("time", 0)),
                     })
             for item in messages:
-                if not isinstance(item, dict):
-                    continue
-                message = item.get("message") or {}
-                postback = item.get("postback") or {}
-                person = str((item.get("sender") or {}).get("id", ""))
-                echo = bool(message.get("is_echo")) or person == own_id
-                if echo:
-                    person = str((item.get("recipient") or {}).get("id", ""))
-                mid = str(message.get("mid") or postback.get("mid") or "")
-                if not mid:
-                    continue
-                self.enqueue("message:" + mid, "echo" if echo else "message", {
-                    "person": person, "mid": mid, "text": str(message.get("text", ""))[:2200],
-                    "payload": (message.get("quick_reply") or {}).get("payload", "") or postback.get("payload", ""),
-                    "timestamp": self.timestamp(item.get("timestamp", 0)),
-                })
+                self.queue_message(item, own_id)
         self.last_ingress = time.time()
+
+    def queue_message(self, item, own_id):
+        if not isinstance(item, dict):
+            return
+        message = item.get("message") or {}
+        postback = item.get("postback") or {}
+        person = str((item.get("sender") or {}).get("id", ""))
+        echo = bool(message.get("is_echo")) or person == own_id
+        if echo:
+            person = str((item.get("recipient") or {}).get("id", ""))
+        mid = str(message.get("mid") or postback.get("mid") or "")
+        if not mid:
+            return
+        return self.enqueue("message:" + mid, "echo" if echo else "message", {
+            "person": person, "mid": mid, "text": str(message.get("text", ""))[:2200],
+            "payload": (message.get("quick_reply") or {}).get("payload", "") or postback.get("payload", ""),
+            "timestamp": self.timestamp(item.get("timestamp", 0)),
+        })
+
+    def sync_messages(self):
+        """Recover real messages only for a recent comment-initiated conversation.
+
+        One known contact per tick, at least 30 seconds between its reads. No inbox
+        body scan, pagination, invented consent, or independent sending path.
+        """
+        now = time.time()
+        credentials = self.credentials()
+        if credentials.get("api_mode") != "business_system_user" or now - self.last_sync < 15:
+            return
+        with closing(self.connect()) as con:
+            contact = con.execute("""
+                SELECT c.*,coalesce(s.thread,'') AS thread
+                FROM conversations c LEFT JOIN message_sync s ON s.person=c.person
+                WHERE c.opened_at>? AND c.opened_at<=? AND c.opted_out=0
+                    AND c.human_until<=? AND coalesce(s.checked_at,0)<=?
+                ORDER BY coalesce(s.checked_at,0),c.opened_at DESC LIMIT 1
+            """, (now - 86400, now, now, now - 30)).fetchone()
+            if contact is None:
+                return
+            person = contact["person"]
+            own_id = str(credentials.get("ig_user_id", ""))
+            if not str(person).isdigit() or person == own_id:
+                return
+            con.execute("INSERT INTO message_sync(person,checked_at) VALUES(?,?) "
+                        "ON CONFLICT(person) DO UPDATE SET checked_at=excluded.checked_at", (person, now))
+            con.commit()
+        self.last_sync = now
+        self.sync_status.update(checked_at=now, checks=self.sync_status["checks"] + 1)
+        try:
+            ownership = self.graph("GET", own_id + "/thread_owner?" + urlencode({"recipient": person}))
+            owners = {str(item.get("thread_owner", {}).get("app_id", ""))
+                      for item in ownership.get("data", [])}
+            if str(credentials.get("app_id", "")) not in owners:
+                # A pending private reply may not have a message thread yet.
+                self.sync_status["last_error"] = "not_thread_owner" if owners else ""
+                return
+            thread = contact["thread"]
+            if not thread:
+                # user_id filtering is not supported consistently by this token route.
+                # Read only IDs/participants of at most 20 recent threads, then match
+                # both participants before reading any message bodies.
+                result = self.graph("GET", own_id + "/conversations?" + urlencode({
+                    "platform": "instagram", "fields": "id,participants{id}", "limit": 20}))
+                matches = [item for item in result.get("data", [])[:20]
+                           if {str(p.get("id")) for p in item.get("participants", {}).get("data", [])}
+                           == {own_id, person} and item.get("id")]
+                if len(matches) != 1:
+                    self.sync_status["last_error"] = "conversation_not_found"
+                    return
+                thread = str(matches[0]["id"])
+                with closing(self.connect()) as con:
+                    con.execute("UPDATE message_sync SET thread=? WHERE person=?", (thread, person))
+                    con.commit()
+            result = self.graph("GET", quote(thread, safe="") + "/messages?" + urlencode({
+                "fields": "id,from,to,created_time,message", "limit": 20}))
+            normalized = []
+            for item in result.get("data", [])[:20]:
+                sender = str(item.get("from", {}).get("id", ""))
+                recipients = {str(p.get("id")) for p in item.get("to", {}).get("data", [])}
+                if ((sender == person and recipients == {own_id})
+                        or (sender == own_id and recipients == {person})):
+                    stamp = datetime.fromisoformat(item["created_time"].replace("Z", "+00:00")).timestamp()
+                    if contact["opened_at"] - 1 <= stamp <= now and now - stamp < 86400 and item.get("id"):
+                        normalized.append({"sender": {"id": sender},
+                            "recipient": {"id": own_id if sender == person else person},
+                            "timestamp": stamp, "message": {
+                                "mid": str(item["id"]), "text": str(item.get("message", ""))[:2200]}})
+            # Apply later stop/manual messages before an earlier consent can send.
+            # This runs under the tick lock, so our own in-flight POST cannot be
+            # mistaken for an administrator's message before remember_sent().
+            with closing(self.connect()) as con:
+                for item in normalized:
+                    message = item["message"]
+                    if item["sender"]["id"] == person:
+                        if campaign.words(message["text"]) in {"стоп", "stop", "отписаться", "не пишите"}:
+                            self.update_person(person, opted_out=1)
+                    elif not con.execute("SELECT 1 FROM sent_messages WHERE id=?", (message["mid"],)).fetchone():
+                        self.update_person(person, human_until=max(contact["human_until"], item["timestamp"] + 86400))
+            for item in sorted(normalized, key=lambda message: message["timestamp"]):
+                self.sync_status["queued"] += bool(self.queue_message(item, own_id))
+            self.sync_status["last_error"] = ""
+        except GraphError as error:
+            self.sync_status["errors"] += 1
+            self.sync_status["last_error"] = "meta_" + str(error.code)
+            if error.code in {400, 404}:
+                with closing(self.connect()) as con:
+                    con.execute("UPDATE message_sync SET thread='' WHERE person=?", (person,))
+                    con.commit()
+        except (ValueError, KeyError, TypeError, AttributeError):
+            self.sync_status["errors"] += 1
+            self.sync_status["last_error"] = "invalid_meta_response"
 
     @staticmethod
     def timestamp(value):
@@ -279,6 +383,14 @@ class Gateway:
         if not settings["enabled"] or conversation["opted_out"] or conversation["human_until"] > now:
             self.finish(event_id, "skipped", "paused_or_human_or_opt_out")
             return
+        if kind in {"comment", "message"}:
+            with closing(self.connect()) as con:
+                uncertain = con.execute("SELECT 1 FROM events WHERE id<>? AND kind IN ('comment','message') "
+                    "AND status IN ('unknown','sending') AND json_extract(payload,'$.person')=? LIMIT 1",
+                    (event_id, person)).fetchone()
+            if uncertain:
+                self.finish(event_id, "skipped", "delivery_requires_review")
+                return
         if kind == "comment":
             age = now - payload["timestamp"]
             if not 0 <= age < 7 * 86400 or not campaign.matches(text, settings["keywords"]):
@@ -289,7 +401,6 @@ class Gateway:
                 return
             # Re-read the actual comment: deleted/edited comments and old events cannot start a campaign.
             current = self.graph("GET", payload["comment"] + "?fields=id,text,timestamp")
-            from datetime import datetime
             created = datetime.fromisoformat(current["timestamp"].replace("Z", "+00:00")).timestamp()
             if not 0 <= time.time() - created < 7 * 86400 or not campaign.matches(current.get("text", ""), settings["keywords"]):
                 self.finish(event_id, "skipped", "comment_changed_or_old")
@@ -366,7 +477,7 @@ class Gateway:
             counts = dict(con.execute("SELECT status,count(*) FROM events GROUP BY status").fetchall())
         value = {"updated_at": time.time(), "connected": self.connected, "label": label,
                  "counts": counts, "last_webhook_at": self.last_ingress,
-                 "ingress_counts": self.ingress_counts.copy()}
+                 "ingress_counts": self.ingress_counts.copy(), "message_sync": self.sync_status.copy()}
         temporary = self.state_dir / ".status.tmp"
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.state_dir / "status.json")
@@ -384,6 +495,7 @@ class Gateway:
             if not self.ready():
                 return self.status("Meta ещё не подключён или доступ не подтверждён. Сообщения не отправляются.")
             started = time.monotonic()
+            self.sync_messages()
             with closing(self.connect()) as con:
                 events = con.execute("SELECT * FROM events WHERE status='pending' ORDER BY created_at,id LIMIT 3").fetchall()
             for event in events:
@@ -403,6 +515,8 @@ class Gateway:
                 con.execute("DELETE FROM sent_messages WHERE created_at<?", (time.time() - 30 * 86400,))
                 con.commit()
             label = ("Meta @biomozg: аккаунт и подписки API подтверждены. " + ("Автоответы включены." if settings["enabled"] else "Автоответы выключены.")) if self.connected else "Meta не подтвердил запрос. Отправка остановлена; требуется проверка подключения."
+            if self.sync_status["last_error"]:
+                label += " Резервная проверка Direct требует внимания."
             return self.status(label)
         finally:
             self.lock.release()

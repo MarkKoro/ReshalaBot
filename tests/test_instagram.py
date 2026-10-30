@@ -191,6 +191,139 @@ class GatewayTests(unittest.TestCase):
         with sqlite3.connect(self.gateway.database) as con:
             return con.execute("SELECT id,status,result FROM events ORDER BY id").fetchall()
 
+    def sync_fixture(self, messages, participants=None):
+        credentials = dict(self.credentials, api_mode="business_system_user")
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+        self.gateway.update_person("200", opened_at=time.time() - 10)
+        def graph(method, endpoint, payload=None):
+            if method == "GET" and "/thread_owner?" in endpoint:
+                return {"data": [{"thread_owner": {"app_id": "101"}}]}
+            if method == "GET" and "/conversations?" in endpoint:
+                return {"data": [{"id": "thread:one", "participants": {"data": [
+                    {"id": person} for person in (participants or ["100", "200"])]}}]}
+            if method == "GET" and "/messages?" in endpoint:
+                return {"data": messages}
+            return self.graph(method, endpoint, payload)
+        self.gateway.graph.side_effect = graph
+
+    @staticmethod
+    def api_message(mid="actual-consent", text="Да, хочу видео", sender="200", recipient="100", stamp=None):
+        from datetime import datetime, timezone
+        return {"id": mid, "from": {"id": sender}, "to": {"data": [{"id": recipient}]},
+                "created_time": datetime.fromtimestamp(stamp or time.time() - 1, timezone.utc).isoformat(),
+                "message": text}
+
+    def test_sync_recovers_actual_consent_without_webhook_and_deduplicates_later_webhook(self):
+        self.sync_fixture([self.api_message()])
+        self.gateway.tick()
+        self.assertIn(("message:actual-consent", "sent", ""), self.rows())
+        self.assertEqual(self.gateway.last_ingress, 0)  # API sync is not reported as a delivered webhook.
+        self.assertEqual(self.gateway.sync_status["queued"], 1)
+        self.message(mid="actual-consent")
+        self.gateway.tick()
+        sends = [c for c in self.gateway.graph.call_args_list if c.args[:2] == ("POST", "100/messages")]
+        self.assertEqual(len(sends), 1)
+        self.assertGreater(self.gateway.conversation("200")["link_sent_at"], 0)
+
+    def test_sync_plain_check_does_not_send_and_uses_cached_thread_after_restart(self):
+        self.sync_fixture([self.api_message(text="проверка")])
+        self.gateway.tick()
+        self.assertIn(("message:actual-consent", "skipped", "no_keyword_or_consent"), self.rows())
+        self.assertFalse(any(c.args[0] == "POST" for c in self.gateway.graph.call_args_list))
+        fresh = Gateway(self.root, self.path)
+        fresh.graph = Mock(side_effect=self.gateway.graph.side_effect)
+        fresh.sync_messages()
+        fresh.graph.assert_not_called()  # The 30-second contact limit survives a restart.
+        with sqlite3.connect(self.gateway.database) as con:
+            con.execute("UPDATE message_sync SET checked_at=0")
+        fresh.sync_messages()
+        self.assertEqual(fresh.graph.call_count, 2)
+        self.assertTrue(fresh.graph.call_args.args[1].startswith("thread%3Aone/messages?"))
+        self.assertEqual(fresh.sync_status["queued"], 0)
+
+    def test_sync_requires_both_thread_participants_before_reading_bodies(self):
+        self.sync_fixture([self.api_message()], participants=["100", "999"])
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, 2)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.gateway.sync_status["last_error"], "conversation_not_found")
+
+    def test_sync_does_not_read_or_answer_a_thread_owned_by_another_app(self):
+        self.sync_fixture([self.api_message()])
+        self.gateway.graph.side_effect = lambda *_args: {"data": [{"thread_owner": {"app_id": "999"}}]}
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, 1)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.gateway.sync_status["last_error"], "not_thread_owner")
+
+    def test_sync_rejects_foreign_recipients_old_and_future_messages(self):
+        self.sync_fixture([self.api_message(mid="foreign", recipient="999"),
+                           self.api_message(mid="old", stamp=time.time()-100),
+                           self.api_message(mid="future", stamp=time.time()+100)])
+        self.gateway.tick()
+        self.assertEqual(self.rows(), [])
+        self.assertFalse(any(c.args[0] == "POST" for c in self.gateway.graph.call_args_list))
+
+    def test_sync_later_stop_prevents_sending_an_earlier_consent_even_while_paused(self):
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                self.sync_fixture([self.api_message(mid="stop", text="Стоп"),
+                                   self.api_message(stamp=time.time()-3)])
+                self.gateway.update_person("200", opted_out=0)
+                self.gateway.last_sync = 0
+                with sqlite3.connect(self.gateway.database) as con:
+                    con.execute("DELETE FROM message_sync")
+                settings = campaign.load_settings(self.path)
+                settings["enabled"] = not paused
+                campaign.save_settings(settings, self.path)
+                self.gateway.tick()
+                self.assertTrue(self.gateway.conversation("200")["opted_out"])
+                self.assertFalse(any(c.args[0] == "POST" for c in self.gateway.graph.call_args_list))
+
+    def test_sync_known_bot_echo_is_safe_but_later_manual_reply_pauses_consent(self):
+        self.gateway.remember_sent({"message_id": "our-opening"})
+        self.sync_fixture([self.api_message(mid="manual", text="Отвечу лично", sender="100", recipient="200"),
+                           self.api_message(stamp=time.time()-3),
+                           self.api_message(mid="our-opening", text="Прислать?", sender="100", recipient="200", stamp=time.time()-5)])
+        self.gateway.tick()
+        self.assertGreater(self.gateway.conversation("200")["human_until"], time.time())
+        self.assertFalse(any(c.args[0] == "POST" for c in self.gateway.graph.call_args_list))
+
+    def test_sync_does_not_bypass_unknown_delivery_using_another_consent_id(self):
+        self.sync_fixture([self.api_message()])
+        self.gateway.enqueue("message:uncertain", "message", {"person": "200", "mid": "uncertain", "text": "Да", "timestamp": time.time()-2})
+        self.gateway.finish("message:uncertain", "unknown")
+        self.gateway.tick()
+        self.assertIn(("message:actual-consent", "skipped", "delivery_requires_review"), self.rows())
+        self.assertFalse(any(c.args[0] == "POST" for c in self.gateway.graph.call_args_list))
+
+    def test_sync_does_not_read_contacts_outside_window_or_after_optout_or_human_reply(self):
+        self.sync_fixture([])
+        for fields in ({"opened_at": time.time()-86401}, {"opened_at": time.time()+100},
+                       {"opened_at": time.time()-10, "opted_out": 1},
+                       {"opted_out": 0, "human_until": time.time()+100}):
+            self.gateway.update_person("200", **fields)
+            self.gateway.sync_messages()
+        self.gateway.graph.assert_not_called()
+
+    def test_sync_meta_read_error_does_not_send_and_is_rate_limited(self):
+        self.sync_fixture([])
+        self.gateway.graph.side_effect = GraphError(code=403)
+        self.gateway.tick()
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count, 1)
+        self.assertEqual(self.gateway.sync_status["last_error"], "meta_403")
+        self.assertEqual(self.rows(), [])
+
+    def test_sync_global_limit_is_one_contact_per_tick(self):
+        self.sync_fixture([])
+        self.gateway.update_person("201", opened_at=time.time()-20)
+        self.gateway.sync_messages()
+        first = self.gateway.graph.call_count
+        self.gateway.sync_messages()
+        self.assertEqual(first, 3)
+        self.assertEqual(self.gateway.graph.call_count, first)
+
     def test_graph_hosts_match_token_family_and_unknown_mode_never_sends_credentials(self):
         for mode, host in (("instagram_login", "graph.instagram.com"), ("unified_login", "graph.facebook.com"),
                            ("business_system_user", "graph.facebook.com")):
