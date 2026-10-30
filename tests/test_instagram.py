@@ -342,6 +342,59 @@ class GatewayTests(unittest.TestCase):
         self.gateway.tick()
         self.assertEqual(self.gateway.graph.call_count, count)
 
+    def test_v26_change_message_delivers_link_once_across_both_envelopes(self):
+        self.comment()
+        self.gateway.tick()
+        self.gateway.graph.reset_mock()
+        value = {"sender": {"id": "200"}, "recipient": {"id": "100"},
+                 "timestamp": time.time() * 1000,
+                 "message": {"mid": "v26-opt-in", "text": "Да, хочу видео",
+                             "quick_reply": {"payload": campaign.OPT_IN}}}
+        current = {"object": "instagram", "entry": [{"id": "100", "changes": [
+            {"field": "messages", "value": value}]}]}
+        self.gateway.ingest(current)
+        self.assertIn(("message:v26-opt-in", "pending", ""), self.rows())
+        # The same message may be delivered twice or through both supported envelopes.
+        self.gateway.ingest(current)
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "100", "messaging": [value]}]})
+        settings = campaign.load_settings(self.path)
+        settings["target_url"] = "https://t.me/BioMozg_agent?start=changed"
+        campaign.save_settings(settings, self.path)
+        self.gateway.tick()
+        sends = [call for call in self.gateway.graph.call_args_list
+                 if call.args[:2] == ("POST", "100/messages")]
+        self.assertEqual(len(sends), 1)
+        button = sends[0].args[2]["message"]["attachment"]["payload"]["buttons"][0]
+        self.assertEqual(button["url"], settings["target_url"])
+        self.assertEqual(button["title"], settings["link_label"])
+        self.assertGreater(self.gateway.conversation("200")["link_sent_at"], 0)
+        self.assertIn(("message:v26-opt-in", "sent", ""), self.rows())
+
+    def test_v26_change_postback_continues_an_opened_conversation(self):
+        self.comment()
+        self.gateway.tick()
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "100", "changes": [{
+            "field": "messaging_postbacks", "value": {
+                "sender": {"id": "200"}, "recipient": {"id": "100"},
+                "timestamp": time.time() * 1000,
+                "postback": {"mid": "v26-postback", "payload": campaign.OPT_IN},
+            }}]}]})
+        self.gateway.tick()
+        self.assertIn(("message:v26-postback", "sent", ""), self.rows())
+        self.assertGreater(self.gateway.conversation("200")["link_sent_at"], 0)
+
+    def test_v26_other_account_and_standby_do_not_enter_the_send_queue(self):
+        value = {"sender": {"id": "200"}, "recipient": {"id": "100"},
+                 "timestamp": time.time() * 1000,
+                 "message": {"mid": "foreign-or-standby", "text": "креатив"}}
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "999", "changes": [
+            {"field": "messages", "value": value}]}]})
+        self.gateway.ingest({"object": "instagram", "entry": [{"id": "100", "changes": [
+            {"field": "standby", "value": value}], "standby": [value]}]})
+        self.gateway.tick()
+        self.assertEqual(self.rows(), [])
+        self.gateway.graph.assert_not_called()
+
     def test_no_consent_no_keyword_url_click_and_old_events_do_not_send(self):
         self.message(text="Привет", payload="")
         self.comment(comment="301", text="видео")

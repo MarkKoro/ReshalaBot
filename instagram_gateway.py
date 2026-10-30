@@ -42,6 +42,8 @@ class Gateway:
         self.checked_at = 0
         self.credentials_stamp = None
         self.last_ingress = 0
+        self.ingress_counts = {"comments": 0, "legacy_messaging": 0,
+                               "changes_messages": 0, "changes_postbacks": 0}
         with closing(self.connect()) as con:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS events (
@@ -182,15 +184,27 @@ class Gateway:
         for entry in value.get("entry", []):
             if str(entry.get("id")) != own_id:
                 continue
+            messages = list(entry.get("messaging", []))
+            self.ingress_counts["legacy_messaging"] += len(messages)
             for change in entry.get("changes", []):
                 item = change.get("value", {})
+                # Graph v26 also delivers messaging fields inside entry.changes.
+                # Normalize both envelopes before the same consent/window/dedup checks.
+                field = change.get("field")
+                if field in {"messages", "messaging_postbacks"} and isinstance(item, dict):
+                    messages.append(item)
+                    counter = "changes_messages" if field == "messages" else "changes_postbacks"
+                    self.ingress_counts[counter] += 1
                 if change.get("field") == "comments" and re.fullmatch(r"\d+", str(item.get("id", ""))):
+                    self.ingress_counts["comments"] += 1
                     person = str((item.get("from") or {}).get("id", ""))
                     self.enqueue("comment:" + str(item["id"]), "comment", {
                         "comment": str(item["id"]), "person": person,
                         "text": str(item.get("text", ""))[:2200], "timestamp": self.timestamp(entry.get("time", 0)),
                     })
-            for item in entry.get("messaging", []):
+            for item in messages:
+                if not isinstance(item, dict):
+                    continue
                 message = item.get("message") or {}
                 postback = item.get("postback") or {}
                 person = str((item.get("sender") or {}).get("id", ""))
@@ -351,7 +365,8 @@ class Gateway:
         with closing(self.connect()) as con:
             counts = dict(con.execute("SELECT status,count(*) FROM events GROUP BY status").fetchall())
         value = {"updated_at": time.time(), "connected": self.connected, "label": label,
-                 "counts": counts, "last_webhook_at": self.last_ingress}
+                 "counts": counts, "last_webhook_at": self.last_ingress,
+                 "ingress_counts": self.ingress_counts.copy()}
         temporary = self.state_dir / ".status.tmp"
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.state_dir / "status.json")
