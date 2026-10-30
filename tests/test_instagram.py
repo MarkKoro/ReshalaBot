@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import hmac
+from io import BytesIO
 import json
 from pathlib import Path
 import sqlite3
@@ -9,6 +10,7 @@ import time
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import bot
 import db
@@ -458,6 +460,45 @@ class GatewayTests(unittest.TestCase):
         self.gateway.last_comment_sync=0
         self.gateway.sync_comments(settings)
         self.assertEqual(self.rows(),[])
+
+    def test_graph_recognizes_meta_rate_limit_code_four_even_when_http_is_403(self):
+        error=HTTPError('https://graph.instagram.com/test',403,'rate limited',
+                        {'Retry-After':'60'},BytesIO(b'{"error":{"code":4,"is_transient":true}}'))
+        with patch('instagram_gateway.urlopen',side_effect=error):
+            with self.assertRaises(GraphError) as raised:
+                Gateway(self.root,self.path).graph('GET','100/messages')
+        self.assertTrue(raised.exception.rate_limited)
+        self.assertEqual(raised.exception.retry_after,60)
+        self.assertFalse(raised.exception.uncertain)
+
+    def test_sync_rate_limit_backoff_survives_restart(self):
+        self.sync_fixture([])
+        self.gateway.graph.side_effect=GraphError(code=403,api_code=4,retry_after=60)
+        self.gateway.sync_messages()
+        self.assertGreater(self.gateway.backoff_until('messages'),time.time())
+        fresh=Gateway(self.root,self.path)
+        fresh.graph=Mock()
+        fresh.sync_messages()
+        fresh.graph.assert_not_called()
+
+    def test_definite_send_rate_limit_keeps_event_pending_until_backoff_then_sends_once(self):
+        self.comment()
+        def limited(method,endpoint,payload=None):
+            if method=='POST':
+                raise GraphError(code=403,api_code=4,retry_after=60)
+            return self.graph(method,endpoint,payload)
+        self.gateway.graph.side_effect=limited
+        self.gateway.tick()
+        self.assertIn(('comment:300','pending','meta_rate_limit'),self.rows())
+        calls=self.gateway.graph.call_count
+        self.gateway.tick()
+        self.assertEqual(self.gateway.graph.call_count,calls)
+        with sqlite3.connect(self.gateway.database) as con:
+            con.execute('UPDATE api_backoff SET until_at=0')
+        self.gateway.graph=Mock(side_effect=self.graph)
+        self.gateway.tick()
+        self.assertIn(('comment:300','sent',''),self.rows())
+        self.assertEqual(sum(c.args[:2]==('POST','100/messages') for c in self.gateway.graph.call_args_list),1)
 
     def test_graph_hosts_match_token_family_and_unknown_mode_never_sends_credentials(self):
         for mode, host in (("instagram_login", "graph.instagram.com"), ("unified_login", "graph.facebook.com"),

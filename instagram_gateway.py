@@ -26,8 +26,10 @@ import instagram_automation as campaign
 
 
 class GraphError(Exception):
-    def __init__(self, uncertain=False, code=0):
+    def __init__(self, uncertain=False, code=0, api_code=0, retry_after=300):
         self.uncertain, self.code = uncertain, code
+        self.api_code, self.retry_after = api_code, retry_after
+        self.rate_limited = code == 429 or api_code in {4, 17, 32, 613}
         super().__init__("Meta request did not confirm delivery")
 
 
@@ -75,6 +77,7 @@ class Gateway:
                     checked_at REAL NOT NULL DEFAULT 0, watermark REAL NOT NULL DEFAULT 0,
                     cursor TEXT NOT NULL DEFAULT '', started_at REAL NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS api_backoff (kind TEXT PRIMARY KEY, until_at REAL NOT NULL);
                 UPDATE events SET status='unknown',result='process_interrupted'
                     WHERE status='sending';
             """)
@@ -122,7 +125,17 @@ class Gateway:
             return result
         except HTTPError as error:
             # A 5xx can follow a successful side effect. Never blindly retry it.
-            raise GraphError(uncertain=method == "POST" and error.code >= 500, code=error.code) from None
+            api_code, retry_after = 0, 300
+            try:
+                api_code = int(json.loads(error.read(16384)).get("error", {}).get("code", 0))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            try:
+                retry_after = max(30, min(3600, int(error.headers.get("Retry-After", "300"))))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            raise GraphError(uncertain=method == "POST" and error.code >= 500, code=error.code,
+                             api_code=api_code, retry_after=retry_after) from None
         except (URLError, TimeoutError, socket.timeout, OSError, ValueError):
             raise GraphError(uncertain=method == "POST") from None
 
@@ -245,6 +258,18 @@ class Gateway:
             "timestamp": self.timestamp(item.get("timestamp", 0)),
         })
 
+    def backoff_until(self, kind):
+        with closing(self.connect()) as con:
+            row = con.execute("SELECT until_at FROM api_backoff WHERE kind=?", (kind,)).fetchone()
+        return row[0] if row else 0
+
+    def backoff(self, kind, seconds):
+        with closing(self.connect()) as con:
+            con.execute("INSERT INTO api_backoff(kind,until_at) VALUES(?,?) "
+                        "ON CONFLICT(kind) DO UPDATE SET until_at=max(until_at,excluded.until_at)",
+                        (kind, time.time() + max(30, min(3600, seconds))))
+            con.commit()
+
     def sync_messages(self):
         """Recover real messages only for a recent comment-initiated conversation.
 
@@ -254,7 +279,8 @@ class Gateway:
         """
         now = time.time()
         credentials = self.credentials()
-        if credentials.get("api_mode") != "business_system_user" or now - self.last_sync < 5:
+        if (credentials.get("api_mode") != "business_system_user" or now - self.last_sync < 5
+                or self.backoff_until("messages") > now):
             return
         with closing(self.connect()) as con:
             contact = con.execute("""
@@ -333,8 +359,8 @@ class Gateway:
         except GraphError as error:
             self.sync_status["errors"] += 1
             self.sync_status["last_error"] = "meta_" + str(error.code)
-            if error.code == 429:
-                self.last_sync = now + 295
+            if error.rate_limited:
+                self.backoff("messages", error.retry_after)
             if error.code in {400, 404}:
                 with closing(self.connect()) as con:
                     con.execute("UPDATE message_sync SET thread='' WHERE person=?", (person,))
@@ -368,7 +394,7 @@ class Gateway:
                 con.execute("UPDATE comment_poll SET since=? WHERE id=1", (now,))
                 con.commit()
             return
-        if now - self.last_comment_sync < 5:
+        if now - self.last_comment_sync < 5 or self.backoff_until("comments") > now:
             return
         self.last_comment_sync = now
         self.comments_status["checked_at"] = now
@@ -427,8 +453,8 @@ class Gateway:
         except GraphError as error:
             self.comments_status["errors"] += 1
             self.comments_status["last_error"] = "meta_" + str(error.code)
-            if error.code == 429:
-                self.last_comment_sync = now + 295
+            if error.rate_limited:
+                self.backoff("comments", error.retry_after)
         except (ValueError, KeyError, TypeError, AttributeError):
             self.comments_status["errors"] += 1
             self.comments_status["last_error"] = "invalid_meta_response"
@@ -585,10 +611,11 @@ class Gateway:
     def status(self, label):
         with closing(self.connect()) as con:
             counts = dict(con.execute("SELECT status,count(*) FROM events GROUP BY status").fetchall())
+            limits = dict(con.execute("SELECT kind,until_at FROM api_backoff WHERE until_at>?", (time.time(),)).fetchall())
         value = {"updated_at": time.time(), "connected": self.connected, "label": label,
                  "counts": counts, "last_webhook_at": self.last_ingress,
                  "ingress_counts": self.ingress_counts.copy(), "message_sync": self.sync_status.copy(),
-                 "comment_sync": self.comments_status.copy()}
+                 "comment_sync": self.comments_status.copy(), "api_backoff": limits}
         temporary = self.state_dir / ".status.tmp"
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.state_dir / "status.json")
@@ -618,9 +645,15 @@ class Gateway:
             for event in events:
                 if time.monotonic() - started > 25:
                     break
+                if self.backoff_until("send") > time.time():
+                    break
                 try:
                     self.process(event)
                 except GraphError as error:
+                    if error.rate_limited and not error.uncertain:
+                        self.backoff("send", error.retry_after)
+                        self.finish(event["id"], "pending", "meta_rate_limit")
+                        break
                     self.finish(event["id"], "unknown" if error.uncertain else "failed", "meta_" + str(error.code))
                     self.connected, self.checked_at = False, 0
                     break
