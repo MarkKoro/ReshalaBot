@@ -192,7 +192,8 @@ class GatewayTests(unittest.TestCase):
             return con.execute("SELECT id,status,result FROM events ORDER BY id").fetchall()
 
     def test_graph_hosts_match_token_family_and_unknown_mode_never_sends_credentials(self):
-        for mode, host in (("instagram_login", "graph.instagram.com"), ("unified_login", "graph.facebook.com")):
+        for mode, host in (("instagram_login", "graph.instagram.com"), ("unified_login", "graph.facebook.com"),
+                           ("business_system_user", "graph.facebook.com")):
             with self.subTest(mode=mode), patch("instagram_gateway.urlopen") as opened:
                 credentials = dict(self.credentials, api_mode=mode)
                 (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
@@ -206,6 +207,75 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(GraphError):
                 Gateway(self.root, self.path).graph("GET", "100")
             opened.assert_not_called()
+
+    def test_app_auth_is_restricted_to_own_business_token_debug(self):
+        credentials = dict(self.credentials, api_mode="business_system_user")
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+        with patch("instagram_gateway.urlopen") as opened:
+            opened.return_value.__enter__.return_value.read.return_value = b'{"data": {}}'
+            Gateway(self.root, self.path).graph("GET", "debug_token?input_token=test-only", app_auth=True)
+            request = opened.call_args.args[0]
+            self.assertEqual(request.full_url, "https://graph.facebook.com/v24.0/debug_token?input_token=test-only")
+            self.assertEqual(request.get_header("Authorization"), "Bearer 101|test-secret")
+        for mode, method, endpoint in (
+            ("instagram_login", "GET", "debug_token?input_token=test-only"),
+            ("unified_login", "GET", "debug_token?input_token=test-only"),
+            ("unknown", "GET", "debug_token?input_token=test-only"),
+            ("business_system_user", "GET", "me"),
+            ("business_system_user", "POST", "debug_token?input_token=test-only"),
+        ):
+            with self.subTest(mode=mode, method=method, endpoint=endpoint):
+                (self.root / "secrets" / "credentials.json").write_text(json.dumps(dict(self.credentials, api_mode=mode)))
+                with patch("instagram_gateway.urlopen") as opened:
+                    with self.assertRaises(GraphError):
+                        Gateway(self.root, self.path).graph(method, endpoint, app_auth=True)
+                    opened.assert_not_called()
+
+    def test_own_business_token_binds_app_principal_account_and_subscription_fields(self):
+        credentials = dict(self.credentials, api_mode="business_system_user", system_user_id="500")
+        (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+        token_info = {"is_valid": True, "type": "SYSTEM_USER", "app_id": "101", "user_id": "500",
+                      "scopes": ["instagram_basic", "instagram_manage_comments", "instagram_manage_messages",
+                                 "pages_read_engagement", "pages_show_list"]}
+        responses = [{"data": token_info}, {"id": "100", "username": "biomozg"},
+                     {"data": [{"subscribed_fields": ["comments", "messages", "messaging_postbacks"]}]}]
+        connected = Gateway(self.root, self.path)
+        connected.graph = Mock(side_effect=copy.deepcopy(responses))
+        self.assertTrue(connected.ready())
+        self.assertEqual(connected.graph.call_args_list[0].kwargs, {"app_auth": True})
+        for key, value in (("is_valid", False), ("type", "USER"), ("app_id", "999"),
+                           ("user_id", "999"), ("scopes", ["instagram_basic"])):
+            with self.subTest(token_field=key):
+                bad = copy.deepcopy(responses)
+                bad[0]["data"][key] = value
+                disconnected = Gateway(self.root, self.path)
+                disconnected.graph = Mock(side_effect=bad)
+                self.assertFalse(disconnected.ready())
+                self.assertEqual(disconnected.graph.call_count, 1)
+        for label, index, replacement in (
+            ("other Instagram ID", 1, {"id": "999", "username": "biomozg"}),
+            ("other Instagram name", 1, {"id": "100", "username": "another_account"}),
+            ("other subscription app", 2, {"data": [{"id": "999", "subscribed_fields": ["comments", "messages", "messaging_postbacks"]}]}),
+            ("missing private messages", 2, {"data": [{"subscribed_fields": ["comments"]}]}),
+        ):
+            with self.subTest(label=label):
+                bad = copy.deepcopy(responses)
+                bad[index] = replacement
+                disconnected = Gateway(self.root, self.path)
+                disconnected.graph = Mock(side_effect=bad)
+                self.assertFalse(disconnected.ready())
+
+    def test_own_business_mode_requires_an_expected_app_scoped_principal(self):
+        for principal in (None, "", "not-an-id"):
+            with self.subTest(principal=principal):
+                credentials = dict(self.credentials, api_mode="business_system_user")
+                if principal is not None:
+                    credentials["system_user_id"] = principal
+                (self.root / "secrets" / "credentials.json").write_text(json.dumps(credentials))
+                disconnected = Gateway(self.root, self.path)
+                disconnected.graph = Mock()
+                self.assertFalse(disconnected.ready())
+                disconnected.graph.assert_not_called()
 
     def test_unified_token_requires_our_business_our_assigned_instagram_and_all_subscriptions(self):
         credentials = dict(self.credentials, api_mode="unified_login", client_business_id="151")

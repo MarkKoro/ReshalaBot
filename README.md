@@ -103,22 +103,35 @@ Bot API позволяет задать URL, размер медиа, позиц
 ключи и не включайте отправку до проверки аккаунта, подписок и реального теста.
 В n8n импортируется заголовочный credential с runner_token и публикуется схема;
 Meta получает callback `https://n8n.telegrambotsforeveryone.duckdns.org/instagram/webhook`.
-Для новых приложений Meta используется **Unified Login**: `api_mode=unified_login`,
-разрешения `instagram_basic`, `instagram_manage_comments`, `instagram_manage_messages`,
-хост `graph.facebook.com`. Сохраняйте также ожидаемый `client_business_id` портфолио;
-обработчик проверяет его и наличие @biomozg в `/me/assigned_instagram_accounts`.
-У такого токена `/me` обозначает системного пользователя компании, а не Instagram.
+Для собственного @biomozg используется **служебный пользователь своей компании**:
+`api_mode=business_system_user`, хост `graph.facebook.com`. Нужны пять разрешений:
+`instagram_basic`, `instagram_manage_comments`, `instagram_manage_messages`,
+`pages_read_engagement`, `pages_show_list`. Два последних — зависимости подключения
+через связанную Facebook-страницу; рекламные разрешения и публикация контента не нужны.
+В credentials сохраняется ожидаемый `system_user_id` из `debug_token.user_id` —
+это app-scoped ID, он отличается от ID пользователя, показанного в Business Suite.
+Обработчик проверяет действительность токена, приложение, служебного пользователя,
+разрешения, ID/имя Instagram и все три подписки. В v26 ответ `subscribed_apps`
+содержит поля подписки без ID приложения; принадлежность ключа проверяется отдельно.
+
+Для интеграции компаний-клиентов оставлен `api_mode=unified_login`: ожидаемый
+`client_business_id` и @biomozg в `/me/assigned_instagram_accounts`. По требованиям
+Facebook Login for Business портфолио приложения не должно совпадать с портфолио
+компании-клиента. Этот путь не используется для подключения своего Instagram
+в том же портфолио. У такого токена `/me` обозначает системного пользователя.
 Для старого Instagram Login оставлена совместимость (`api_mode=instagram_login`
 или отсутствие поля): `graph.instagram.com`, разрешения `instagram_business_basic`,
 `instagram_business_manage_comments`, `instagram_business_manage_messages`.
-Для обоих вариантов нужны события `comments`, `messages`, `messaging_postbacks`.
+Для всех вариантов нужны события `comments`, `messages`, `messaging_postbacks`.
 Проверьте уровень доступа приложения: режим разработки может не обслуживать обычных
 посетителей. Системный токен Unified Login может быть бессрочным, но его можно отозвать;
 контроль подключения всё равно обязателен. Для старого Instagram Login долгоживущий
 токен имеет срок действия; автоматическое продление пока не реализовано — перед
 постоянным запуском с таким токеном требуется настроить обновление.
 
-См. [официальное начало работы Unified Login](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login/get-started).
+См. [служебные пользователи Meta](https://developers.facebook.com/docs/business-management-apis/system-users/install-apps-and-generate-tokens),
+[требования Facebook Login for Business](https://developers.facebook.com/documentation/facebook-login/facebook-login-for-business)
+и [начало работы Unified Login](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login/get-started).
 
 Официальные ограничения: [private replies](https://developers.facebook.com/documentation/instagram-platform/private-replies),
 [quick replies](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-instagram-login/messaging-api/quick-replies),

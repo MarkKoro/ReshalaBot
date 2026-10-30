@@ -72,19 +72,24 @@ class Gateway:
         except (OSError, ValueError):
             return {}
 
-    def graph(self, method, endpoint, payload=None):
+    def graph(self, method, endpoint, payload=None, *, app_auth=False):
         credentials = self.credentials()
         version = credentials.get("api_version", "")
         if not re.fullmatch(r"v\d+\.\d+", version):
             raise GraphError()
         mode = credentials.get("api_mode", "instagram_login")
-        hosts = {"instagram_login": "graph.instagram.com", "unified_login": "graph.facebook.com"}
+        hosts = {"instagram_login": "graph.instagram.com", "unified_login": "graph.facebook.com",
+                 "business_system_user": "graph.facebook.com"}
         if mode not in hosts:
+            raise GraphError()
+        if app_auth and (mode != "business_system_user" or method != "GET"
+                         or endpoint.split("?", 1)[0] != "debug_token"):
             raise GraphError()
         url = "https://" + hosts[mode] + "/" + version + "/" + endpoint
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
+        token = (str(credentials.get("app_id", "")) + "|" + credentials.get("app_secret", "")) if app_auth else credentials.get("access_token", "")
         request = Request(url, data=data, method=method, headers={
-            "Authorization": "Bearer " + credentials.get("access_token", ""),
+            "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
         })
         try:
@@ -111,10 +116,25 @@ class Gateway:
         if not str(credentials["ig_user_id"]).isdigit() or not str(credentials["app_id"]).isdigit():
             return False
         mode = credentials.get("api_mode", "instagram_login")
-        if mode not in {"instagram_login", "unified_login"}:
+        if mode not in {"instagram_login", "unified_login", "business_system_user"}:
             return False
         try:
-            if mode == "unified_login":
+            if mode == "business_system_user":
+                expected_principal = str(credentials.get("system_user_id", ""))
+                if not expected_principal.isdigit():
+                    return False
+                # Bind the token to our app and its app-scoped system user before reading Instagram.
+                token_info = self.graph("GET", "debug_token?" + urlencode({
+                    "input_token": credentials["access_token"]}), app_auth=True).get("data", {})
+                scopes = {"instagram_basic", "instagram_manage_comments", "instagram_manage_messages",
+                          "pages_read_engagement", "pages_show_list"}
+                if (token_info.get("is_valid") is not True or token_info.get("type") != "SYSTEM_USER"
+                        or str(token_info.get("app_id", "")) != str(credentials["app_id"])
+                        or str(token_info.get("user_id", "")) != expected_principal
+                        or not scopes.issubset(set(token_info.get("scopes", [])))):
+                    return False
+                account = self.graph("GET", str(credentials["ig_user_id"]) + "?fields=id,username")
+            elif mode == "unified_login":
                 expected_business = str(credentials.get("client_business_id", ""))
                 if not expected_business.isdigit():
                     return False
@@ -131,7 +151,10 @@ class Gateway:
                     or account.get("username", "").casefold() != "biomozg"):
                 return False
             subscribed = self.graph("GET", str(credentials["ig_user_id"]) + "/subscribed_apps")
-            self.connected = any(str(app.get("id")) == str(credentials["app_id"])
+            # v26 returns only the caller app's fields for this edge. Its identity is
+            # verified via debug_token above; an explicit conflicting app ID still fails.
+            self.connected = any((str(app.get("id")) == str(credentials["app_id"])
+                or (mode == "business_system_user" and "id" not in app))
                 and {"comments", "messages", "messaging_postbacks"}.issubset(set(app.get("subscribed_fields", [])))
                 for app in subscribed.get("data", []))
         except (GraphError, TypeError, AttributeError):
