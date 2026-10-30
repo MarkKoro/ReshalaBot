@@ -17,8 +17,15 @@ CONFIG_PATH = Path(os.getenv("INSTAGRAM_CONFIG_PATH", Path(__file__).with_name("
 STATUS_PATH = Path(os.getenv("INSTAGRAM_STATUS_PATH", Path(__file__).with_name("instagram-status.json")))
 SETTING_KEY = "instagram_automation"
 OPT_IN = "BIOMOZG_LINK_OPTIN"
+DELIVERY_MODES = {"direct_link": "Ссылка сразу", "two_step": "Сначала подтверждение"}
+LEGACY_LINK_TEXTS = [
+    "Держи бесплатное видео «Биомозга». Нажми кнопку ниже, а в Telegram — «Запустить».",
+    "Вот ссылка на бесплатное видео. Открой бота и нажми «Запустить» — видео придёт туда.",
+    "Готово! Видео ждёт в Telegram-боте. Перейди по кнопке и нажми «Запустить».",
+]
 DEFAULTS = {
     "enabled": False,
+    "delivery_mode": "two_step",
     "keywords": ["креатив"],
     "target_url": "https://t.me/BioMozg_agent",
     "opening": [
@@ -27,9 +34,9 @@ DEFAULTS = {
         "В «Биомозге» есть бесплатное видео про креатив. Отправить ссылку?",
     ],
     "link_text": [
-        "Держи бесплатное видео «Биомозга». Нажми кнопку ниже, а в Telegram — «Запустить».",
+        "Держи бесплатное видео «Биомозга». Открой Telegram-бота и нажми «Запустить» — видео придёт туда.",
         "Вот ссылка на бесплатное видео. Открой бота и нажми «Запустить» — видео придёт туда.",
-        "Готово! Видео ждёт в Telegram-боте. Перейди по кнопке и нажми «Запустить».",
+        "Готово! Бесплатное видео ждёт в Telegram-боте. Открой его и нажми «Запустить».",
     ],
     "public_reply": [
         "Ответ уже в личных сообщениях. Если не видно — загляни в «Запросы».",
@@ -115,6 +122,8 @@ def validate(settings: dict) -> dict:
     for key in ("enabled", "public_reply_enabled"):
         if not isinstance(result[key], bool):
             raise ValueError("Некорректный переключатель Instagram.")
+    if not isinstance(result["delivery_mode"], str) or result["delivery_mode"] not in DELIVERY_MODES:
+        raise ValueError("Выберите режим: ссылка сразу или сначала подтверждение.")
     if not isinstance(result["keywords"], list) or any(not isinstance(x, str) for x in result["keywords"]):
         raise ValueError("Некорректные ключевые слова.")
     result["keywords"] = parse_keywords("\n".join(result["keywords"]))
@@ -140,6 +149,14 @@ def load_settings(path: Path | None = None) -> dict:
     if path.stat().st_size > 40000:
         raise ValueError("Файл настроек Instagram слишком большой.")
     return validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def select_delivery_mode(settings: dict, mode: str) -> dict:
+    result = validate(settings)
+    result["delivery_mode"] = mode
+    if mode == "direct_link" and result["link_text"] == LEGACY_LINK_TEXTS:
+        result["link_text"] = copy.deepcopy(DEFAULTS["link_text"])
+    return validate(result)
 
 
 def save_settings(settings: dict, path: Path | None = None) -> dict:

@@ -15,11 +15,23 @@ from urllib.error import HTTPError
 import bot
 import db
 import instagram_automation as campaign
+import instagram_limit_notifications as limit_notices
 from instagram_gateway import Gateway, GraphError
 import test_bot
 
 
 class CampaignTests(unittest.TestCase):
+    def test_delivery_mode_keeps_legacy_settings_and_rejects_unknown_modes(self):
+        self.assertEqual(campaign.validate({})["delivery_mode"], "two_step")
+        self.assertEqual(campaign.validate({"delivery_mode":"direct_link"})["delivery_mode"],"direct_link")
+        migrated=campaign.select_delivery_mode({"link_text":campaign.LEGACY_LINK_TEXTS},"direct_link")
+        self.assertEqual(migrated["link_text"],campaign.DEFAULTS["link_text"])
+        custom=campaign.select_delivery_mode({"link_text":["Мой текст"]},"direct_link")
+        self.assertEqual(custom["link_text"],["Мой текст"])
+        for mode in (None, True, [], {}, "unknown"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                campaign.validate({"delivery_mode":mode})
+
     def test_only_creative_keyword_by_default_and_whole_words(self):
         self.assertEqual(campaign.DEFAULTS["keywords"], ["креатив"])
         for value in ("КРЕАТИВ!!!", "Можно креатив 🧠", "#креатив", "Креатив"):
@@ -91,7 +103,8 @@ class InstagramAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_menu_and_preview_are_admin_only_and_never_send_instagram(self):
         for route in ("admin:instagram", "admin:instagram:toggle", "admin:instagram:edit:target_url",
-                      "admin:instagram:keywords", "admin:instagram:public_toggle", "admin:instagram:preview"):
+                      "admin:instagram:keywords", "admin:instagram:public_toggle", "admin:instagram:preview",
+                      "admin:instagram:mode", "admin:instagram:mode:direct_link", "admin:instagram:mode:two_step"):
             await self.press(route, user=self.fixture.user)
         self.assertEqual(self.fixture.messages, {})
         self.assertFalse(self.config_path.exists())
@@ -102,6 +115,116 @@ class InstagramAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("тест ничего не отправляет", self.fixture.last()["text"])
         self.assertIn("https://t.me/BioMozg_agent", self.fixture.last()["text"])
         self.assertFalse(self.config_path.exists())
+        self.fixture.http.post.assert_not_awaited()
+
+    def quota_snapshot(self, kind="send", mode="direct_link", **changes):
+        notice={"kind":kind,"operation":"private_reply" if kind=="send" else kind,"episode":"a"*32,
+                "limited_at":time.time()-10,"last_limited_at":time.time()-10,"next_check_at":time.time()+300,
+                "cleared_at":0,"provider_retry_at":0,"estimated_regain_at":0}
+        notice.update(changes)
+        status={"updated_at":time.time(),"connected":True,"delivery_mode":mode,
+                "quota_notices":[notice],"private_replies_last_hour":3}
+        campaign.STATUS_PATH.write_text(json.dumps(status),encoding="utf-8")
+        return status
+
+    async def test_quota_alert_once_to_admin_and_recovery_only_after_confirmed_success(self):
+        status=self.quota_snapshot()
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertEqual(self.fixture.telegram.send_message.await_count,1)
+        call=self.fixture.telegram.send_message.call_args.kwargs
+        self.assertEqual(call["chat_id"],99)
+        self.assertIn("Meta не указала точный срок",call["text"])
+        self.assertIn("Следующая автоматическая проверка",call["text"])
+        status["quota_notices"][0]["next_check_at"]=time.time()-1
+        campaign.STATUS_PATH.write_text(json.dumps(status))
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertEqual(self.fixture.telegram.send_message.await_count,1)
+        status["quota_notices"][0]["cleared_at"]=time.time()
+        campaign.STATUS_PATH.write_text(json.dumps(status))
+        await bot.instagram_limits_job(self.fixture.ctx)
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertEqual(self.fixture.telegram.send_message.await_count,2)
+        self.assertIn("успешный запрос подтверждён",self.fixture.telegram.send_message.call_args.kwargs["text"])
+
+    async def test_irrelevant_direct_read_quota_does_not_notify_in_direct_link_mode(self):
+        status=self.quota_snapshot(kind="messages")
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.fixture.telegram.send_message.assert_not_awaited()
+        status["delivery_mode"]="two_step"
+        campaign.STATUS_PATH.write_text(json.dumps(status))
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertEqual(self.fixture.telegram.send_message.await_count,1)
+        self.assertIn("Чтение Direct",self.fixture.telegram.send_message.call_args.kwargs["text"])
+
+    async def test_alert_subscription_is_private_admin_only_and_can_be_disabled(self):
+        self.quota_snapshot()
+        for route in ("admin:instagram:limits","admin:instagram:limits_toggle","admin:instagram:limits_test"):
+            await self.press(route,user=self.fixture.user)
+        self.assertIsNone(await db.get_setting(limit_notices.SUBSCRIBERS_KEY))
+        self.fixture.telegram.send_message.assert_not_awaited()
+        await self.press("admin:instagram:limits_toggle")
+        self.assertNotIn(99,await limit_notices.recipients(bot.ADMIN_IDS))
+        before=self.fixture.telegram.send_message.await_count
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertEqual(self.fixture.telegram.send_message.await_count,before)
+        await self.press("admin:instagram:limits_toggle")
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertIn(99,await limit_notices.recipients(bot.ADMIN_IDS))
+        self.assertIn("лимит Meta",self.fixture.telegram.send_message.call_args.kwargs["text"])
+
+    async def test_multiple_admins_require_self_subscription_and_nonadmin_ids_are_filtered(self):
+        self.assertEqual(await limit_notices.recipients({99,100}),set())
+        await limit_notices.toggle_recipient(99,{99,100})
+        self.assertEqual(await limit_notices.recipients({99,100}),{99})
+        await db.set_setting(limit_notices.SUBSCRIBERS_KEY,json.dumps([99,1]))
+        self.assertEqual(await limit_notices.recipients({99}),{99})
+        self.assertFalse(await limit_notices.toggle_recipient(1,{99}))
+
+    async def test_stale_status_and_ambiguous_telegram_delivery_do_not_create_repeats(self):
+        status=self.quota_snapshot()
+        status["updated_at"]=time.time()-121
+        campaign.STATUS_PATH.write_text(json.dumps(status))
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.fixture.telegram.send_message.assert_not_awaited()
+        status["updated_at"]=time.time()
+        campaign.STATUS_PATH.write_text(json.dumps(status))
+        self.fixture.telegram.send_message.side_effect=test_bot.TimedOut()
+        await bot.instagram_limits_job(self.fixture.ctx)
+        await bot.instagram_limits_job(self.fixture.ctx)
+        self.assertEqual(self.fixture.telegram.send_message.await_count,1)
+
+    async def test_quota_dates_distinguish_provider_time_estimate_and_unknown(self):
+        status=self.quota_snapshot(provider_retry_at=time.time()+3600)
+        self.assertIn("Meta просит подождать до",limit_notices.limit_text(status["quota_notices"][0]))
+        status=self.quota_snapshot(estimated_regain_at=time.time()+3600)
+        text=limit_notices.limit_text(status["quota_notices"][0])
+        self.assertIn("Оценка Meta",text)
+        self.assertIn("Время может измениться",text)
+        self.assertIn("Бангкок, UTC+7",text)
+        await self.press("admin:instagram:limits_test")
+        self.assertTrue(any("Это тестовое сообщение" in item["text"] for item in self.fixture.messages.values()))
+
+    async def test_admin_can_choose_direct_mode_and_preview_the_single_message(self):
+        await self.press("admin:instagram:mode:direct_link")
+        self.assertEqual(campaign.load_settings()["delivery_mode"],"direct_link")
+        self.assertIn("Ссылка сразу",self.fixture.last()["text"])
+        await self.press("admin:instagram:preview")
+        text=self.fixture.last()["text"]
+        self.assertIn("Одно личное сообщение со ссылкой",text)
+        self.assertIn(campaign.DEFAULTS["link_text"][0],text)
+        self.assertNotIn(campaign.DEFAULTS["opt_in_label"],text)
+        self.assertNotIn(campaign.DEFAULTS["opening"][0],text)
+        await self.press("admin:instagram:texts")
+        callbacks=[button.callback_data for button in self.fixture.buttons()]
+        self.assertNotIn("admin:instagram:edit:opening",callbacks)
+        self.assertNotIn("admin:instagram:edit:opt_in_label",callbacks)
+        before=self.config_path.read_bytes()
+        await self.press("admin:instagram:mode:unknown")
+        self.assertEqual(self.config_path.read_bytes(),before)
+        await self.press("admin:instagram:mode:two_step")
+        await self.press("admin:instagram:preview")
+        self.assertIn(campaign.DEFAULTS["opt_in_label"],self.fixture.last()["text"])
+        self.assertEqual(len(await self.fixture.sql("SELECT * FROM admin_audit")),2)
         self.fixture.http.post.assert_not_awaited()
 
     async def test_add_remove_replace_keywords_and_audit(self):
@@ -193,6 +316,147 @@ class GatewayTests(unittest.TestCase):
     def rows(self):
         with sqlite3.connect(self.gateway.database) as con:
             return con.execute("SELECT id,status,result FROM events ORDER BY id").fetchall()
+
+    def direct_mode(self):
+        settings=campaign.load_settings(self.path)
+        settings["delivery_mode"]="direct_link"
+        campaign.save_settings(settings,self.path)
+        return settings
+
+    def test_provider_retry_headers_and_minutes_are_kept_separate_from_local_recheck(self):
+        now=time.time()
+        headers={"Retry-After":"60","X-Business-Use-Case-Usage":json.dumps({"business":[{
+            "call_count":92,"estimated_time_to_regain_access":19}]})}
+        details=Gateway.rate_details(headers,now)
+        self.assertEqual(details["provider_retry_at"],now+60)
+        self.assertEqual(details["estimated_regain_at"],now+19*60)
+        self.assertEqual(details["retry_after"],19*60)
+        self.assertEqual(details["usage_percent"],92)
+        self.assertEqual(Gateway.rate_details({},now)["provider_retry_at"],0)
+        self.assertTrue(GraphError(api_code=80002).rate_limited)
+
+    def test_quota_episode_persists_and_expired_timer_is_not_recovery(self):
+        error=GraphError(code=403,api_code=4,operation="private_reply")
+        self.gateway.backoff("send",60,error=error)
+        first=self.gateway.status("ok")["quota_notices"][0]
+        self.gateway.backoff("send",180,error=error)
+        second=self.gateway.status("ok")["quota_notices"][0]
+        self.assertEqual(first["episode"],second["episode"])
+        with sqlite3.connect(self.gateway.database) as con:
+            con.execute("UPDATE api_backoff SET until_at=0")
+        self.gateway.clear_quota("send","comment_reply")
+        self.assertEqual(self.gateway.status("ok")["quota_notices"][0]["cleared_at"],0)
+        self.gateway.clear_quota("send","private_reply")
+        fresh=Gateway(self.root,self.path)
+        self.assertGreater(fresh.status("ok")["quota_notices"][0]["cleared_at"],0)
+        fresh.backoff("send",60,error=error)
+        self.assertNotEqual(first["episode"],fresh.status("ok")["quota_notices"][0]["episode"])
+
+    def test_connection_rate_limit_is_persisted_and_not_retried_before_deadline(self):
+        fresh=Gateway(self.root,self.path)
+        fresh.graph=Mock(side_effect=GraphError(code=400,api_code=4,operation="connection"))
+        self.assertFalse(fresh.ready())
+        self.assertFalse(fresh.ready())
+        self.assertEqual(fresh.graph.call_count,1)
+        restarted=Gateway(self.root,self.path)
+        restarted.graph=Mock()
+        self.assertFalse(restarted.ready())
+        restarted.graph.assert_not_called()
+
+    def test_direct_comment_uses_latest_url_records_recipient_alias_and_never_sends_a_second_link(self):
+        self.comment()
+        def graph(method,endpoint,payload=None):
+            if method=="GET":
+                settings=self.direct_mode()
+                settings.update(target_url="https://t.me/BioMozg_agent?start=direct",link_label="Смотреть видео")
+                campaign.save_settings(settings,self.path)
+                return self.graph(method,endpoint,payload)
+            return {"message_id":"direct-sent","recipient_id":"201"} if endpoint=="100/messages" else {"id":"public-reply"}
+        self.gateway.graph.side_effect=graph
+        self.gateway.tick()
+        sends=[call for call in self.gateway.graph.call_args_list if call.args[:2]==("POST","100/messages")]
+        self.assertEqual(len(sends),1)
+        self.assertEqual(sends[0].args[2]["recipient"],{"comment_id":"300"})
+        message=sends[0].args[2]["message"]
+        self.assertNotIn("quick_replies",message)
+        button=message["attachment"]["payload"]["buttons"][0]
+        self.assertEqual(button["url"],"https://t.me/BioMozg_agent?start=direct")
+        self.assertEqual(button["title"],"Смотреть видео")
+        for person in ("200","201"):
+            self.assertGreater(self.gateway.conversation(person)["link_sent_at"],0)
+        self.message(mid="no-second-link",person="201",text="креатив",payload="")
+        self.comment(comment="301")
+        self.gateway.tick()
+        self.assertEqual(sum(c.args[:2]==("POST","100/messages") for c in self.gateway.graph.call_args_list),1)
+
+    def test_direct_mode_does_not_poll_messages_or_show_their_old_rate_warning(self):
+        self.sync_fixture([])
+        self.direct_mode()
+        self.gateway.backoff("messages",600)
+        self.gateway.sync_status["last_error"]="meta_403"
+        value=self.gateway.tick()
+        self.gateway.graph.assert_not_called()
+        self.assertFalse(value["message_sync"]["active"])
+        self.assertEqual(value["delivery_mode"],"direct_link")
+        self.assertNotIn("messages",value["api_backoff"])
+        self.assertNotIn("Direct требует внимания",value["label"])
+        self.assertGreater(self.gateway.backoff_until("messages"),time.time())
+
+    def test_direct_template_parameter_rejection_falls_back_once_to_a_text_link(self):
+        settings=self.direct_mode()
+        self.comment()
+        def graph(method,endpoint,payload=None):
+            if method=="POST" and endpoint=="100/messages" and "attachment" in payload["message"]:
+                raise GraphError(code=400,api_code=100)
+            return self.graph(method,endpoint,payload)
+        self.gateway.graph.side_effect=graph
+        self.gateway.tick()
+        sends=[call for call in self.gateway.graph.call_args_list if call.args[:2]==("POST","100/messages")]
+        self.assertEqual(len(sends),2)
+        self.assertIn(settings["target_url"],sends[1].args[2]["message"]["text"])
+        self.assertIn(("comment:300","sent",""),self.rows())
+        with sqlite3.connect(self.gateway.database) as con:
+            self.assertEqual(con.execute("SELECT count(*) FROM sent_messages").fetchone()[0],1)
+
+    def test_direct_uncertain_send_is_never_retried_as_plain_text(self):
+        self.direct_mode()
+        self.comment()
+        def graph(method,endpoint,payload=None):
+            if method=="POST":
+                raise GraphError(code=502,uncertain=True)
+            return self.graph(method,endpoint,payload)
+        self.gateway.graph.side_effect=graph
+        self.gateway.tick()
+        self.assertEqual(sum(c.args[0]=="POST" for c in self.gateway.graph.call_args_list),1)
+        self.assertEqual(self.rows(),[("comment:300","unknown","meta_502")])
+        self.assertEqual(self.gateway.conversation("200")["link_sent_at"],0)
+
+    def test_direct_fallback_obeys_pause_that_happens_after_template_rejection(self):
+        self.direct_mode()
+        self.comment()
+        def graph(method,endpoint,payload=None):
+            if method=="POST":
+                settings=campaign.load_settings(self.path)
+                settings["enabled"]=False
+                campaign.save_settings(settings,self.path)
+                raise GraphError(code=400,api_code=100)
+            return self.graph(method,endpoint,payload)
+        self.gateway.graph.side_effect=graph
+        self.gateway.tick()
+        self.assertEqual(sum(c.args[0]=="POST" for c in self.gateway.graph.call_args_list),1)
+        self.assertEqual(self.rows(),[("comment:300","skipped","settings_changed")])
+
+    def test_direct_comment_still_honors_optout_human_takeover_cooldown_and_age(self):
+        self.direct_mode()
+        self.gateway.update_person("200",opted_out=1)
+        self.gateway.update_person("201",human_until=time.time()+86400)
+        self.gateway.update_person("202",opened_at=time.time())
+        for comment,person in (("300","200"),("301","201"),("302","202")):
+            self.comment(comment=comment,person=person)
+        self.comment(comment="303",person="203",stamp=time.time()-8*86400)
+        self.gateway.tick()
+        self.gateway.tick()
+        self.gateway.graph.assert_not_called()
 
     def sync_fixture(self, messages, participants=None):
         credentials = dict(self.credentials, api_mode="business_system_user")

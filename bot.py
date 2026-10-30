@@ -33,6 +33,7 @@ import db
 import texts
 import billing
 import instagram_automation as instagram
+import instagram_limit_notifications as instagram_limits
 
 try:
     from telegram import LinkPreviewOptions
@@ -1099,7 +1100,35 @@ async def instagram_admin_route(data, chat_id, uid, ctx):
     try:
         settings = instagram.load_settings()
         action = data.removeprefix("admin:instagram").lstrip(":")
-        if action in {"toggle", "public_toggle"}:
+        if action == "limits_toggle":
+            await instagram_limits.toggle_recipient(uid, ADMIN_IDS)
+            action = "limits"
+        elif action == "limits_test":
+            await instagram_limits.send_test(ctx, uid)
+            action = "limits"
+        if action == "limits":
+            subscribed = uid in await instagram_limits.recipients(ADMIN_IDS)
+            await render_screen(uid, uid, ctx, text=instagram_limits.status_text(instagram.connection_status())
+                + "\n\nВаши уведомления: " + ("включены" if subscribed else "выключены"), reply_markup=Mk([
+                    [Btn("🔕 Выключить мои уведомления" if subscribed else "🔔 Получать уведомления сюда", callback_data="admin:instagram:limits_toggle")],
+                    [Btn("Проверить уведомление", callback_data="admin:instagram:limits_test")],
+                    [Btn("Назад", callback_data="admin:instagram")]]))
+            return True
+        if action == "mode":
+            await render_screen(uid, uid, ctx, text="Как отправлять ссылку\n\nСсылка сразу — одно личное сообщение с видео в Telegram.\nСначала подтверждение — предложение прислать видео, затем ссылка после ответа.",
+                reply_markup=Mk([[Btn(("✅ " if settings["delivery_mode"] == mode else "") + label,
+                                      callback_data="admin:instagram:mode:" + mode)]
+                                 for mode, label in instagram.DELIVERY_MODES.items()]
+                                + [[Btn("Назад", callback_data="admin:instagram")]]))
+            return True
+        elif action.startswith("mode:"):
+            mode = action.removeprefix("mode:")
+            if mode not in instagram.DELIVERY_MODES:
+                return True
+            settings = instagram.select_delivery_mode(settings, mode)
+            settings = instagram.save_settings(settings)
+            await db.set_admin_setting(instagram.SETTING_KEY, json.dumps(settings, ensure_ascii=False), uid)
+        elif action in {"toggle", "public_toggle"}:
             key = "enabled" if action == "toggle" else "public_reply_enabled"
             if key == "enabled" and not settings["enabled"] and not settings["keywords"]:
                 await render_screen(uid, uid, ctx, text="Сначала добавьте хотя бы одно ключевое слово.",
@@ -1135,17 +1164,21 @@ async def instagram_admin_route(data, chat_id, uid, ctx):
             await render_screen(uid, uid, ctx, text=text, reply_markup=Mk([[Btn("Отмена", callback_data="admin:instagram")]]))
             return True
         elif action == "texts":
-            rows = [[Btn(label, callback_data="admin:instagram:edit:" + key)] for key, label in instagram.TEXT_LABELS.items()]
+            rows = [[Btn(label, callback_data="admin:instagram:edit:" + key)] for key, label in instagram.TEXT_LABELS.items()
+                    if settings["delivery_mode"] != "direct_link" or key not in {"opening", "opt_in_label"}]
             rows += [[Btn("Ответ под комментарием: " + ("вкл." if settings["public_reply_enabled"] else "выкл."), callback_data="admin:instagram:public_toggle")],
                      [Btn("Назад", callback_data="admin:instagram")]]
-            await render_screen(uid, uid, ctx, text="Тексты Instagram\n\nВарианты чередуются между людьми. Ссылка задаётся отдельно и показывается кнопкой. Ответ под комментарием появляется только после подтверждённой отправки первого Direct.", reply_markup=Mk(rows))
+            await render_screen(uid, uid, ctx, text="Тексты Instagram\n\nВарианты чередуются между людьми. Ссылка задаётся отдельно. Ответ под комментарием появляется только после подтверждённой отправки первого Direct.", reply_markup=Mk(rows))
             return True
         elif action == "preview":
             text = ("Предпросмотр · тест ничего не отправляет в Instagram\n\n"
-                    "1. Человек пишет ключевое слово под любой публикацией или Reels — старой или новой.\n\n"
-                    + settings["opening"][0] + "\n[" + settings["opt_in_label"] + "]\n\n"
-                    "2. После ответа человека:\n\n" + settings["link_text"][0]
-                    + "\n[" + settings["link_label"] + "] " + settings["target_url"])
+                    "Человек пишет ключевое слово под любой публикацией или Reels — старой или новой.\n\n")
+            if settings["delivery_mode"] == "direct_link":
+                text += "Одно личное сообщение со ссылкой:\n\n"
+            else:
+                text += ("1. Первое сообщение:\n\n" + settings["opening"][0] + "\n[" + settings["opt_in_label"]
+                         + "]\n\n2. После ответа человека:\n\n")
+            text += settings["link_text"][0] + "\n[" + settings["link_label"] + "] " + settings["target_url"]
             if settings["public_reply_enabled"]:
                 text += "\n\nОтвет под комментарием:\n" + settings["public_reply"][0]
             await render_screen(uid, uid, ctx, text=text, reply_markup=Mk([[Btn("Назад", callback_data="admin:instagram")]]))
@@ -1156,13 +1189,18 @@ async def instagram_admin_route(data, chat_id, uid, ctx):
                 + "\n" + str(status.get("label", "Статус Meta не подтверждён."))
                 + "\n\nСлова: " + (", ".join(settings["keywords"]) or "пусто")
                 + "\nСсылка: " + settings["target_url"]
+                + "\nРежим: " + instagram.DELIVERY_MODES[settings["delivery_mode"]]
                 + "\n\nВсе старые и новые публикации/Reels. Обрабатываются новые комментарии после включения; старые комментарии не рассылаются задним числом."
-                + "\nОдин запуск человеку за 24 часа. Сначала короткое сообщение, затем ссылка после ответа. Настройки применяются при следующей обработке."
+                + "\nОдин запуск человеку за 24 часа. "
+                + ("Ссылка сразу в первом личном сообщении." if settings["delivery_mode"] == "direct_link" else "Сначала короткое сообщение, затем ссылка после ответа.")
+                + " Настройки применяются при следующей обработке."
                 + "\nБез подтверждённого подключения Meta отправки не будет.")
         await render_screen(uid, uid, ctx, text=text, reply_markup=Mk([
             [Btn("⏸ Выключить" if settings["enabled"] else "▶️ Разрешить автоответы", callback_data="admin:instagram:toggle")],
             [Btn("🔑 Ключевые слова", callback_data="admin:instagram:keywords")],
             [Btn("🔗 Изменить ссылку", callback_data="admin:instagram:edit:target_url")],
+            [Btn("⚡ Режим отправки", callback_data="admin:instagram:mode")],
+            [Btn("📊 Лимиты и уведомления", callback_data="admin:instagram:limits")],
             [Btn("✍️ Тексты и кнопки", callback_data="admin:instagram:texts")],
             [Btn("👁 Предпросмотр", callback_data="admin:instagram:preview")],
             [Btn("🔄 Обновить статус", callback_data="admin:instagram")],
@@ -2114,6 +2152,13 @@ async def cancel_subscription(update,ctx):
     await disable_auto_and_render(update.effective_chat.id,uid,ctx)
 
 
+async def instagram_limits_job(ctx):
+    try:
+        await instagram_limits.monitor(ctx, ADMIN_IDS)
+    except (OSError, ValueError, TypeError, KeyError):
+        logger.warning("Instagram quota status could not be read")
+
+
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
@@ -2137,6 +2182,7 @@ def build_application() -> Application:
     app.job_queue.run_repeating(renewal_notices_job, interval=300, first=15, name="renewal_notices")
     app.job_queue.run_repeating(expire_subscriptions_job, interval=60, first=45, name="expire_subscriptions")
     app.job_queue.run_repeating(followup_job, interval=3600, first=180, name="lead_followup")
+    app.job_queue.run_repeating(instagram_limits_job, interval=30, first=20, name="instagram_limit_alerts")
     return app
 
 

@@ -2418,7 +2418,7 @@ class ApplicationTests(unittest.TestCase):
         with patch.object(bot, "BOT_TOKEN", "123456:TEST_ONLY_PLACEHOLDER"):
             app = bot.build_application()
         self.assertEqual({job.name for job in app.job_queue.jobs()},
-                         {"renewal_notices", "expire_subscriptions", "lead_followup", "payment_reconciliation", "automatic_renewals"})
+                         {"renewal_notices", "expire_subscriptions", "lead_followup", "payment_reconciliation", "automatic_renewals", "instagram_limit_alerts"})
         self.assertTrue(app.error_handlers)
         commands = {command for handler in app.handlers[0] for command in getattr(handler, "commands", [])}
         self.assertTrue({"start", "admin", "set_lead_magnet", "set_intro_video", "grant", "revoke", "stats"}.issubset(commands))

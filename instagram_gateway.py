@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import threading
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -26,10 +27,13 @@ import instagram_automation as campaign
 
 
 class GraphError(Exception):
-    def __init__(self, uncertain=False, code=0, api_code=0, retry_after=300):
+    def __init__(self, uncertain=False, code=0, api_code=0, retry_after=300,
+                 provider_retry_at=0, estimated_regain_at=0, usage_percent=None, operation=""):
         self.uncertain, self.code = uncertain, code
         self.api_code, self.retry_after = api_code, retry_after
-        self.rate_limited = code == 429 or api_code in {4, 17, 32, 613}
+        self.rate_limited = code == 429 or api_code in {4, 17, 32, 613, 80001, 80002, 80006}
+        self.provider_retry_at, self.estimated_regain_at = provider_retry_at, estimated_regain_at
+        self.usage_percent, self.operation = usage_percent, operation
         super().__init__("Meta request did not confirm delivery")
 
 
@@ -50,6 +54,7 @@ class Gateway:
         self.last_sync = 0
         self.sync_status = {"checked_at": 0, "checks": 0, "queued": 0, "errors": 0, "last_error": ""}
         self.last_comment_sync = 0
+        self.delivery_mode = "two_step"
         self.comments_status = {"checked_at": 0, "scanned": 0, "queued": 0, "errors": 0, "last_error": ""}
         with closing(self.connect()) as con:
             con.executescript("""
@@ -78,6 +83,7 @@ class Gateway:
                     cursor TEXT NOT NULL DEFAULT '', started_at REAL NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS api_backoff (kind TEXT PRIMARY KEY, until_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS quota_notices (kind TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 UPDATE events SET status='unknown',result='process_interrupted'
                     WHERE status='sending';
             """)
@@ -125,21 +131,20 @@ class Gateway:
             return result
         except HTTPError as error:
             # A 5xx can follow a successful side effect. Never blindly retry it.
-            api_code, retry_after = 0, 300
+            api_code = 0
             try:
                 api_code = int(json.loads(error.read(16384)).get("error", {}).get("code", 0))
             except (ValueError, TypeError, AttributeError):
                 pass
-            try:
-                retry_after = max(30, min(3600, int(error.headers.get("Retry-After", "300"))))
-            except (ValueError, TypeError, AttributeError):
-                pass
+            details = self.rate_details(error.headers, time.time())
             raise GraphError(uncertain=method == "POST" and error.code >= 500, code=error.code,
-                             api_code=api_code, retry_after=retry_after) from None
+                             api_code=api_code, operation=self.operation(method, endpoint, payload), **details) from None
         except (URLError, TimeoutError, socket.timeout, OSError, ValueError):
             raise GraphError(uncertain=method == "POST") from None
 
     def ready(self):
+        if self.backoff_until("connection") > time.time():
+            return False
         credentials = self.credentials()
         stamp = hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).digest()
         if stamp == self.credentials_stamp and time.time() - self.checked_at < 600:
@@ -192,9 +197,72 @@ class Gateway:
                 or (mode == "business_system_user" and "id" not in app))
                 and {"comments", "messages", "messaging_postbacks"}.issubset(set(app.get("subscribed_fields", [])))
                 for app in subscribed.get("data", []))
-        except (GraphError, TypeError, AttributeError):
+        except GraphError as error:
+            if error.rate_limited:
+                self.backoff("connection", error.retry_after, error=error)
+                self.checked_at = 0
             self.connected = False
+        except (TypeError, AttributeError):
+            self.connected = False
+        if self.connected:
+            self.clear_quota("connection")
         return self.connected
+
+    @staticmethod
+    def operation(method, endpoint, payload=None):
+        path = endpoint.split("?", 1)[0]
+        if method == "POST":
+            if path.endswith("/replies"):
+                return "comment_reply"
+            if path.endswith("/messages"):
+                return "private_reply" if (payload or {}).get("recipient", {}).get("comment_id") else "direct_message"
+        for suffix, name in (("/media", "media_list"), ("/comments", "comment_list"),
+                             ("/messages", "message_list"), ("/conversations", "conversation_list"),
+                             ("/thread_owner", "thread_owner")):
+            if path.endswith(suffix):
+                return name
+        return "comment_detail" if "fields=id,text,timestamp" in endpoint else "connection"
+
+    @staticmethod
+    def rate_details(headers, now):
+        from email.utils import parsedate_to_datetime
+        import math
+        retry_at, estimate_at, peak = 0, 0, None
+        raw = headers.get("Retry-After", "") if headers else ""
+        if raw:
+            try:
+                seconds = float(raw)
+                if math.isfinite(seconds) and 0 < seconds <= 604800:
+                    retry_at = now + seconds
+            except (ValueError, TypeError):
+                try:
+                    retry_at = parsedate_to_datetime(raw).timestamp()
+                    if not now < retry_at <= now + 604800:
+                        retry_at = 0
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        def visit(value):
+            nonlocal peak, estimate_at
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if type(item) in {int, float} and math.isfinite(item):
+                        if key in {"call_count", "total_time", "total_cputime"} and item >= 0:
+                            peak = max(peak or 0, item)
+                        elif key == "estimated_time_to_regain_access" and 0 < item <= 10080:
+                            estimate_at = max(estimate_at, now + item * 60)
+                    elif isinstance(item, (dict, list)):
+                        visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+        for name in ("X-App-Usage", "X-Business-Use-Case-Usage"):
+            try:
+                visit(json.loads(headers.get(name, "{}")))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        wait = max(retry_at, estimate_at) - now if retry_at or estimate_at else 300
+        return {"retry_after": max(30, min(604800, wait)), "provider_retry_at": retry_at,
+                "estimated_regain_at": estimate_at, "usage_percent": peak}
 
     def verify_signature(self, body: bytes, signature: str) -> bool:
         secret = self.credentials().get("app_secret", "")
@@ -263,14 +331,43 @@ class Gateway:
             row = con.execute("SELECT until_at FROM api_backoff WHERE kind=?", (kind,)).fetchone()
         return row[0] if row else 0
 
-    def backoff(self, kind, seconds):
+    def backoff(self, kind, seconds, *, error=None):
+        now = time.time()
+        until = now + max(30, min(604800, seconds))
         with closing(self.connect()) as con:
             con.execute("INSERT INTO api_backoff(kind,until_at) VALUES(?,?) "
                         "ON CONFLICT(kind) DO UPDATE SET until_at=max(until_at,excluded.until_at)",
-                        (kind, time.time() + max(30, min(3600, seconds))))
+                        (kind, until))
+            until = con.execute("SELECT until_at FROM api_backoff WHERE kind=?", (kind,)).fetchone()[0]
+            row = con.execute("SELECT payload FROM quota_notices WHERE kind=?", (kind,)).fetchone()
+            previous = json.loads(row[0]) if row else {}
+            ongoing = previous and not previous.get("cleared_at")
+            notice = {"kind": kind, "episode": previous["episode"] if ongoing else uuid.uuid4().hex,
+                "limited_at": previous["limited_at"] if ongoing else now,
+                "last_limited_at": now, "next_check_at": until, "cleared_at": 0,
+                "operation": getattr(error, "operation", "") or kind,
+                "api_code": getattr(error, "api_code", 0), "http_code": getattr(error, "code", 0),
+                "provider_retry_at": getattr(error, "provider_retry_at", 0),
+                "estimated_regain_at": getattr(error, "estimated_regain_at", 0),
+                "usage_percent": getattr(error, "usage_percent", None)}
+            con.execute("INSERT INTO quota_notices(kind,payload) VALUES(?,?) "
+                        "ON CONFLICT(kind) DO UPDATE SET payload=excluded.payload", (kind, json.dumps(notice)))
             con.commit()
 
-    def sync_messages(self):
+    def clear_quota(self, kind, operation=None):
+        with closing(self.connect()) as con:
+            row = con.execute("SELECT payload FROM quota_notices WHERE kind=?", (kind,)).fetchone()
+            if not row:
+                return
+            notice = json.loads(row[0])
+            if notice.get("cleared_at") or (operation and notice.get("operation") not in {operation, kind}):
+                return
+            notice["cleared_at"] = time.time()
+            con.execute("UPDATE quota_notices SET payload=? WHERE kind=?", (json.dumps(notice), kind))
+            con.execute("UPDATE api_backoff SET until_at=0 WHERE kind=?", (kind,))
+            con.commit()
+
+    def sync_messages(self, settings=None):
         """Recover real messages only for a recent comment-initiated conversation.
 
         One known contact per tick; pending links are checked faster than completed
@@ -278,6 +375,11 @@ class Gateway:
         body scan, pagination, invented consent, or independent sending path.
         """
         now = time.time()
+        settings = settings or campaign.load_settings(self.config_path)
+        if settings["delivery_mode"] == "direct_link":
+            self.sync_status.update(active=False, last_error="")
+            return
+        self.sync_status["active"] = True
         credentials = self.credentials()
         if (credentials.get("api_mode") != "business_system_user" or now - self.last_sync < 5
                 or self.backoff_until("messages") > now):
@@ -356,11 +458,12 @@ class Gateway:
             for item in sorted(normalized, key=lambda message: message["timestamp"]):
                 self.sync_status["queued"] += bool(self.queue_message(item, own_id))
             self.sync_status["last_error"] = ""
+            self.clear_quota("messages")
         except GraphError as error:
             self.sync_status["errors"] += 1
             self.sync_status["last_error"] = "meta_" + str(error.code)
             if error.rate_limited:
-                self.backoff("messages", error.retry_after)
+                self.backoff("messages", error.retry_after, error=error)
             if error.code in {400, 404}:
                 with closing(self.connect()) as con:
                     con.execute("UPDATE message_sync SET thread='' WHERE person=?", (person,))
@@ -450,11 +553,12 @@ class Gateway:
                 con.commit()
             self.comments_status["scanned"] += 1
             self.comments_status["last_error"] = ""
+            self.clear_quota("comments")
         except GraphError as error:
             self.comments_status["errors"] += 1
             self.comments_status["last_error"] = "meta_" + str(error.code)
             if error.rate_limited:
-                self.backoff("comments", error.retry_after)
+                self.backoff("comments", error.retry_after, error=error)
         except (ValueError, KeyError, TypeError, AttributeError):
             self.comments_status["errors"] += 1
             self.comments_status["last_error"] = "invalid_meta_response"
@@ -490,6 +594,13 @@ class Gateway:
         with closing(self.connect()) as con:
             con.execute("INSERT OR IGNORE INTO sent_messages VALUES(?,?)", (str(mid), time.time()))
             con.commit()
+
+    @staticmethod
+    def link_message(settings, person):
+        return {"attachment": {"type": "template", "payload": {
+            "template_type": "button", "text": campaign.choose(settings["link_text"], person),
+            "buttons": [{"type": "web_url", "title": settings["link_label"], "url": settings["target_url"]}],
+        }}}
 
     def process(self, event):
         payload, kind, event_id = json.loads(event["payload"]), event["kind"], event["id"]
@@ -558,10 +669,7 @@ class Gateway:
                 self.finish(event_id, "skipped", "link_already_sent")
                 return
             recipient = {"id": person}
-            message = {"attachment": {"type": "template", "payload": {
-                "template_type": "button", "text": campaign.choose(settings["link_text"], person),
-                "buttons": [{"type": "web_url", "title": settings["link_label"], "url": settings["target_url"]}],
-            }}}
+            message = self.link_message(settings, person)
         elif kind == "public":
             if not settings["public_reply_enabled"]:
                 self.finish(event_id, "skipped", "public_reply_paused")
@@ -579,29 +687,47 @@ class Gateway:
             if not campaign.matches(current.get("text", ""), latest["keywords"]):
                 self.finish(event_id, "skipped", "keyword_removed")
                 return
-            message = {"text": campaign.choose(latest["opening"], person), "quick_replies": [{
-                "content_type": "text", "title": latest["opt_in_label"], "payload": campaign.OPT_IN}]}
+            link_in_comment = latest["delivery_mode"] == "direct_link"
+            message = self.link_message(latest, person) if link_in_comment else {
+                "text": campaign.choose(latest["opening"], person), "quick_replies": [{
+                    "content_type": "text", "title": latest["opt_in_label"], "payload": campaign.OPT_IN}]}
         elif kind == "message":
             if not consent and not campaign.matches(text, latest["keywords"]):
                 self.finish(event_id, "skipped", "keyword_removed")
                 return
-            message = {"attachment": {"type": "template", "payload": {
-                "template_type": "button", "text": campaign.choose(latest["link_text"], person),
-                "buttons": [{"type": "web_url", "title": latest["link_label"], "url": latest["target_url"]}],
-            }}}
+            message = self.link_message(latest, person)
         self.finish(event_id, "sending")
         if kind == "public":
             response = self.graph("POST", payload["comment"] + "/replies", {"message": campaign.choose(latest["public_reply"], person)})
             if not response.get("id"):
                 raise GraphError(uncertain=True)
+            self.clear_quota("send", "comment_reply")
         else:
-            response = self.graph("POST", own_id + "/messages", {"recipient": recipient, "message": message})
+            try:
+                response = self.graph("POST", own_id + "/messages", {"recipient": recipient, "message": message})
+            except GraphError as error:
+                # Some private-reply clients accept text but reject templates. A
+                # definitive parameter rejection cannot have delivered a message;
+                # retry once as text. Never retry timeouts, rate limits or 5xx.
+                if not (kind == "comment" and link_in_comment and error.code == 400
+                        and error.api_code == 100 and not error.uncertain and not error.rate_limited):
+                    raise
+                fallback_settings = campaign.load_settings(self.config_path)
+                if (not fallback_settings["enabled"] or fallback_settings["delivery_mode"] != "direct_link"
+                        or not campaign.matches(current.get("text", ""), fallback_settings["keywords"])):
+                    self.finish(event_id, "skipped", "settings_changed")
+                    return
+                fallback = {"text": campaign.choose(fallback_settings["link_text"], person) + "\n\n"
+                            + fallback_settings["link_label"] + ": " + fallback_settings["target_url"]}
+                response = self.graph("POST", own_id + "/messages", {"recipient": recipient, "message": fallback})
             self.remember_sent(response)
+            self.clear_quota("send", "private_reply" if kind == "comment" else "direct_message")
             if kind == "comment":
                 actual_person = str(response.get("recipient_id", person))
-                self.update_person(person, opened_at=now, link_sent_at=0)
+                link_sent = now if link_in_comment else 0
+                self.update_person(person, opened_at=now, link_sent_at=link_sent)
                 if actual_person.isdigit() and actual_person != person:
-                    self.update_person(actual_person, opened_at=now, link_sent_at=0)
+                    self.update_person(actual_person, opened_at=now, link_sent_at=link_sent)
                 if latest["public_reply_enabled"]:
                     self.enqueue("public:" + payload["comment"], "public", payload)
             else:
@@ -612,10 +738,17 @@ class Gateway:
         with closing(self.connect()) as con:
             counts = dict(con.execute("SELECT status,count(*) FROM events GROUP BY status").fetchall())
             limits = dict(con.execute("SELECT kind,until_at FROM api_backoff WHERE until_at>?", (time.time(),)).fetchall())
+            notices = [json.loads(row[0]) for row in con.execute("SELECT payload FROM quota_notices")]
+            private_hour = con.execute("SELECT count(*) FROM events WHERE kind='comment' AND status='sent' AND updated_at>?", (time.time()-3600,)).fetchone()[0]
+        if self.delivery_mode == "direct_link":
+            limits.pop("messages", None)  # Reading Direct is not used in this mode.
+            notices = [notice for notice in notices if notice["kind"] != "messages"]
         value = {"updated_at": time.time(), "connected": self.connected, "label": label,
                  "counts": counts, "last_webhook_at": self.last_ingress,
                  "ingress_counts": self.ingress_counts.copy(), "message_sync": self.sync_status.copy(),
-                 "comment_sync": self.comments_status.copy(), "api_backoff": limits}
+                 "comment_sync": self.comments_status.copy(), "api_backoff": limits,
+                 "delivery_mode": self.delivery_mode, "quota_notices": notices,
+                 "private_replies_last_hour": private_hour}
         temporary = self.state_dir / ".status.tmp"
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.state_dir / "status.json")
@@ -630,6 +763,7 @@ class Gateway:
             except (OSError, ValueError, TypeError):
                 self.connected = False
                 return self.status("Настройки не прочитаны. Отправка остановлена.")
+            self.delivery_mode = settings["delivery_mode"]
             if not settings["enabled"]:
                 # Advance the paused interval even while Meta is unavailable.
                 self.sync_comments(settings)
@@ -639,7 +773,7 @@ class Gateway:
             if settings["enabled"]:
                 self.sync_comments(settings)
             if time.monotonic() - started < 10:
-                self.sync_messages()
+                self.sync_messages(settings)
             with closing(self.connect()) as con:
                 events = con.execute("SELECT * FROM events WHERE status='pending' ORDER BY created_at,id LIMIT 3").fetchall()
             for event in events:
@@ -651,7 +785,7 @@ class Gateway:
                     self.process(event)
                 except GraphError as error:
                     if error.rate_limited and not error.uncertain:
-                        self.backoff("send", error.retry_after)
+                        self.backoff("send", error.retry_after, error=error)
                         self.finish(event["id"], "pending", "meta_rate_limit")
                         break
                     self.finish(event["id"], "unknown" if error.uncertain else "failed", "meta_" + str(error.code))
@@ -665,7 +799,7 @@ class Gateway:
                 con.execute("DELETE FROM sent_messages WHERE created_at<?", (time.time() - 30 * 86400,))
                 con.commit()
             label = ("Meta @biomozg: аккаунт и подписки API подтверждены. " + ("Автоответы включены." if settings["enabled"] else "Автоответы выключены.")) if self.connected else "Meta не подтвердил запрос. Отправка остановлена; требуется проверка подключения."
-            if self.sync_status["last_error"]:
+            if settings["delivery_mode"] == "two_step" and self.sync_status["last_error"]:
                 label += " Резервная проверка Direct требует внимания."
             if self.comments_status["last_error"]:
                 label += " Резервная проверка комментариев требует внимания."
