@@ -47,6 +47,8 @@ class Gateway:
                                "changes_messages": 0, "changes_postbacks": 0}
         self.last_sync = 0
         self.sync_status = {"checked_at": 0, "checks": 0, "queued": 0, "errors": 0, "last_error": ""}
+        self.last_comment_sync = 0
+        self.comments_status = {"checked_at": 0, "scanned": 0, "queued": 0, "errors": 0, "last_error": ""}
         with closing(self.connect()) as con:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS events (
@@ -64,9 +66,20 @@ class Gateway:
                     person TEXT PRIMARY KEY, thread TEXT NOT NULL DEFAULT '',
                     checked_at REAL NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS comment_poll (
+                    id INTEGER PRIMARY KEY CHECK(id=1), since REAL NOT NULL,
+                    inventory_at REAL NOT NULL DEFAULT 0, cursor TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS comment_media (
+                    id TEXT PRIMARY KEY, comments_count INTEGER NOT NULL DEFAULT 0,
+                    checked_at REAL NOT NULL DEFAULT 0, watermark REAL NOT NULL DEFAULT 0,
+                    cursor TEXT NOT NULL DEFAULT '', started_at REAL NOT NULL DEFAULT 0
+                );
                 UPDATE events SET status='unknown',result='process_interrupted'
                     WHERE status='sending';
             """)
+            # Start from installation, never bulk-message historical comments.
+            con.execute("INSERT OR IGNORE INTO comment_poll(id,since) VALUES(1,?)", (time.time() - 1,))
             con.commit()
 
     def connect(self):
@@ -235,21 +248,24 @@ class Gateway:
     def sync_messages(self):
         """Recover real messages only for a recent comment-initiated conversation.
 
-        One known contact per tick, at least 30 seconds between its reads. No inbox
+        One known contact per tick; pending links are checked faster than completed
+        conversations. No inbox
         body scan, pagination, invented consent, or independent sending path.
         """
         now = time.time()
         credentials = self.credentials()
-        if credentials.get("api_mode") != "business_system_user" or now - self.last_sync < 15:
+        if credentials.get("api_mode") != "business_system_user" or now - self.last_sync < 5:
             return
         with closing(self.connect()) as con:
             contact = con.execute("""
                 SELECT c.*,coalesce(s.thread,'') AS thread
                 FROM conversations c LEFT JOIN message_sync s ON s.person=c.person
                 WHERE c.opened_at>? AND c.opened_at<=? AND c.opted_out=0
-                    AND c.human_until<=? AND coalesce(s.checked_at,0)<=?
-                ORDER BY coalesce(s.checked_at,0),c.opened_at DESC LIMIT 1
-            """, (now - 86400, now, now, now - 30)).fetchone()
+                    AND c.human_until<=? AND coalesce(s.checked_at,0)<=? - CASE
+                        WHEN c.link_sent_at>0 THEN 60
+                        WHEN c.opened_at>? THEN 5 ELSE 15 END
+                ORDER BY (c.link_sent_at>0),coalesce(s.checked_at,0),c.opened_at DESC LIMIT 1
+            """, (now - 86400, now, now, now, now - 600)).fetchone()
             if contact is None:
                 return
             person = contact["person"]
@@ -317,6 +333,8 @@ class Gateway:
         except GraphError as error:
             self.sync_status["errors"] += 1
             self.sync_status["last_error"] = "meta_" + str(error.code)
+            if error.code == 429:
+                self.last_sync = now + 295
             if error.code in {400, 404}:
                 with closing(self.connect()) as con:
                     con.execute("UPDATE message_sync SET thread='' WHERE person=?", (person,))
@@ -324,6 +342,96 @@ class Gateway:
         except (ValueError, KeyError, TypeError, AttributeError):
             self.sync_status["errors"] += 1
             self.sync_status["last_error"] = "invalid_meta_response"
+
+    @staticmethod
+    def next_cursor(result):
+        paging = result.get("paging") or {}
+        cursor = (paging.get("cursors") or {}).get("after", "") if paging.get("next") else ""
+        if not isinstance(cursor, str) or len(cursor) > 2000:
+            raise ValueError("Invalid pagination cursor")
+        if paging.get("next") and not cursor:
+            raise ValueError("Missing pagination cursor")
+        return cursor
+
+    def sync_comments(self, settings):
+        """Poll own media through the granted API when real-time delivery is unavailable.
+
+        Inventory is paginated, so old and new posts are included. One comments
+        page per tick bounds work. Watermarks advance only after a full scan.
+        """
+        now = time.time()
+        credentials = self.credentials()
+        if credentials.get("api_mode") != "business_system_user":
+            return
+        if not settings["enabled"]:
+            with closing(self.connect()) as con:
+                con.execute("UPDATE comment_poll SET since=? WHERE id=1", (now,))
+                con.commit()
+            return
+        if now - self.last_comment_sync < 5:
+            return
+        self.last_comment_sync = now
+        self.comments_status["checked_at"] = now
+        try:
+            with closing(self.connect()) as con:
+                state = con.execute("SELECT * FROM comment_poll WHERE id=1").fetchone()
+            if state["cursor"] or now - state["inventory_at"] >= 15:
+                parameters = {"fields": "id,comments_count", "limit": 100}
+                if state["cursor"]:
+                    parameters["after"] = state["cursor"]
+                result = self.graph("GET", str(credentials["ig_user_id"]) + "/media?" + urlencode(parameters))
+                cursor = self.next_cursor(result)
+                with closing(self.connect()) as con:
+                    for item in result.get("data", [])[:100]:
+                        media = str(item.get("id", ""))
+                        if media.isdigit():
+                            con.execute("INSERT INTO comment_media(id,comments_count) VALUES(?,?) "
+                                "ON CONFLICT(id) DO UPDATE SET comments_count=excluded.comments_count",
+                                (media, max(0, int(item.get("comments_count", 0)))))
+                    con.execute("UPDATE comment_poll SET inventory_at=?,cursor=? WHERE id=1", (now, cursor))
+                    con.commit()
+            with closing(self.connect()) as con:
+                media = con.execute("SELECT * FROM comment_media WHERE comments_count>0 "
+                                    "ORDER BY checked_at,id LIMIT 1").fetchone()
+                if media is None:
+                    self.comments_status["last_error"] = ""
+                    return
+                con.execute("UPDATE comment_media SET checked_at=? WHERE id=?", (now, media["id"]))
+                con.commit()
+            parameters = {"fields": "id,from,text,timestamp,hidden", "limit": 50}
+            if media["cursor"]:
+                parameters["after"] = media["cursor"]
+            started = media["started_at"] if media["cursor"] else now
+            result = self.graph("GET", media["id"] + "/comments?" + urlencode(parameters))
+            cursor = self.next_cursor(result)
+            for item in result.get("data", [])[:50]:
+                comment = str(item.get("id", ""))
+                person = str((item.get("from") or {}).get("id", ""))
+                if (not comment.isdigit() or not person.isdigit()
+                        or person == str(credentials["ig_user_id"]) or item.get("hidden")):
+                    continue
+                stamp = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")).timestamp()
+                text = str(item.get("text", ""))[:2200]
+                if (max(state["since"], media["watermark"]) <= stamp <= time.time()
+                        and 0 <= time.time() - stamp < 7 * 86400
+                        and campaign.matches(text, settings["keywords"])):
+                    self.comments_status["queued"] += self.enqueue("comment:" + comment, "comment", {
+                        "comment": comment, "person": person, "text": text, "timestamp": stamp})
+            with closing(self.connect()) as con:
+                con.execute("UPDATE comment_media SET cursor=?,started_at=?,watermark=? WHERE id=?", (
+                    cursor, started if cursor else 0,
+                    media["watermark"] if cursor else max(media["watermark"], started - 1), media["id"]))
+                con.commit()
+            self.comments_status["scanned"] += 1
+            self.comments_status["last_error"] = ""
+        except GraphError as error:
+            self.comments_status["errors"] += 1
+            self.comments_status["last_error"] = "meta_" + str(error.code)
+            if error.code == 429:
+                self.last_comment_sync = now + 295
+        except (ValueError, KeyError, TypeError, AttributeError):
+            self.comments_status["errors"] += 1
+            self.comments_status["last_error"] = "invalid_meta_response"
 
     @staticmethod
     def timestamp(value):
@@ -479,7 +587,8 @@ class Gateway:
             counts = dict(con.execute("SELECT status,count(*) FROM events GROUP BY status").fetchall())
         value = {"updated_at": time.time(), "connected": self.connected, "label": label,
                  "counts": counts, "last_webhook_at": self.last_ingress,
-                 "ingress_counts": self.ingress_counts.copy(), "message_sync": self.sync_status.copy()}
+                 "ingress_counts": self.ingress_counts.copy(), "message_sync": self.sync_status.copy(),
+                 "comment_sync": self.comments_status.copy()}
         temporary = self.state_dir / ".status.tmp"
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.state_dir / "status.json")
@@ -497,7 +606,9 @@ class Gateway:
             if not self.ready():
                 return self.status("Meta ещё не подключён или доступ не подтверждён. Сообщения не отправляются.")
             started = time.monotonic()
-            self.sync_messages()
+            self.sync_comments(settings)
+            if time.monotonic() - started < 10:
+                self.sync_messages()
             with closing(self.connect()) as con:
                 events = con.execute("SELECT * FROM events WHERE status='pending' ORDER BY created_at,id LIMIT 3").fetchall()
             for event in events:
@@ -519,6 +630,8 @@ class Gateway:
             label = ("Meta @biomozg: аккаунт и подписки API подтверждены. " + ("Автоответы включены." if settings["enabled"] else "Автоответы выключены.")) if self.connected else "Meta не подтвердил запрос. Отправка остановлена; требуется проверка подключения."
             if self.sync_status["last_error"]:
                 label += " Резервная проверка Direct требует внимания."
+            if self.comments_status["last_error"]:
+                label += " Резервная проверка комментариев требует внимания."
             return self.status(label)
         finally:
             self.lock.release()

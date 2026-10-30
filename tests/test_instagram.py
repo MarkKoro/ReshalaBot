@@ -165,6 +165,7 @@ class GatewayTests(unittest.TestCase):
         self.gateway.ready = Mock(return_value=True)
         self.gateway.connected = True
         self.gateway.graph = Mock(side_effect=self.graph)
+        self.gateway.sync_comments = Mock()  # Message tests isolate the other API source.
 
     def tearDown(self):
         self.temp.cleanup()
@@ -233,7 +234,7 @@ class GatewayTests(unittest.TestCase):
         fresh = Gateway(self.root, self.path)
         fresh.graph = Mock(side_effect=self.gateway.graph.side_effect)
         fresh.sync_messages()
-        fresh.graph.assert_not_called()  # The 30-second contact limit survives a restart.
+        fresh.graph.assert_not_called()  # The per-contact limit survives a restart.
         with sqlite3.connect(self.gateway.database) as con:
             con.execute("UPDATE message_sync SET checked_at=0")
         fresh.sync_messages()
@@ -332,6 +333,127 @@ class GatewayTests(unittest.TestCase):
         self.gateway.sync_messages()
         self.assertEqual(first, 3)
         self.assertEqual(self.gateway.graph.call_count, first)
+
+    def test_sync_pending_link_is_due_after_five_seconds_and_precedes_completed_chat(self):
+        self.sync_fixture([self.api_message()])
+        self.gateway.update_person("201", opened_at=time.time()-20, link_sent_at=time.time()-10)
+        with sqlite3.connect(self.gateway.database) as con:
+            con.executemany("INSERT INTO message_sync(person,checked_at) VALUES(?,?)",
+                            [("200",time.time()-6),("201",time.time()-100)])
+        self.gateway.sync_messages()
+        self.assertIn("recipient=200", self.gateway.graph.call_args_list[0].args[1])
+        self.assertIn(("message:actual-consent", "pending", ""), self.rows())
+
+    @staticmethod
+    def api_comment(comment="400", person="200", text="Креатив", stamp=None, hidden=False):
+        from datetime import datetime, timezone
+        return {"id":comment,"from":{"id":person},"text":text,"hidden":hidden,
+                "timestamp":datetime.fromtimestamp(stamp or time.time()-1,timezone.utc).isoformat()}
+
+    def comment_sync_fixture(self, comments):
+        del self.gateway.sync_comments
+        (self.root/"secrets"/"credentials.json").write_text(json.dumps(dict(self.credentials,api_mode="business_system_user")))
+        with sqlite3.connect(self.gateway.database) as con:
+            con.execute("UPDATE comment_poll SET since=?,inventory_at=0,cursor=''", (time.time()-60,))
+        def graph(method,endpoint,payload=None):
+            if method=="GET" and "/media?" in endpoint:
+                return {"data":[{"id":"900","comments_count":len(comments)}]}
+            if method=="GET" and "/comments?" in endpoint:
+                return {"data":comments}
+            if method=="GET" and "/thread_owner?" in endpoint:
+                return {"data":[]}
+            return self.graph(method,endpoint,payload)
+        self.gateway.graph.side_effect=graph
+
+    def test_comment_sync_starts_new_keyword_flow_once_without_webhook(self):
+        self.comment_sync_fixture([self.api_comment(),self.api_comment(comment="401",stamp=time.time()-3600),
+            self.api_comment(comment="402",person="100"),self.api_comment(comment="403",hidden=True),
+            self.api_comment(comment="404",text="Видео")])
+        self.gateway.tick()
+        self.assertIn(("comment:400","sent",""),self.rows())
+        self.assertEqual(self.gateway.comments_status["queued"],1)
+        self.assertEqual(self.gateway.last_ingress,0)
+        self.comment(comment="400")
+        self.gateway.tick()
+        self.assertEqual(sum(c.args[:2]==("POST","100/messages") for c in self.gateway.graph.call_args_list),1)
+        self.assertFalse(any(row[0] in {"comment:401","comment:402","comment:403","comment:404"} for row in self.rows()))
+
+    def test_comment_sync_pause_advances_cutoff_and_does_not_backfill_paused_comments(self):
+        comments=[self.api_comment(stamp=time.time()-5)]
+        self.comment_sync_fixture(comments)
+        settings=campaign.load_settings(self.path)
+        settings["enabled"]=False
+        self.gateway.sync_comments(settings)
+        self.gateway.graph.assert_not_called()
+        settings["enabled"]=True
+        self.gateway.sync_comments(settings)
+        self.assertEqual(self.rows(),[])
+        comments[:]=[self.api_comment(comment="405",stamp=time.time())]
+        self.gateway.last_comment_sync=0
+        self.gateway.sync_comments(settings)
+        self.assertIn(("comment:405","pending",""),self.rows())
+
+    def test_comment_sync_preserves_watermark_until_all_comment_pages_are_read(self):
+        self.comment_sync_fixture([])
+        first={"data":[self.api_comment(stamp=time.time()-3600)],"paging":{
+            "next":"https://untrusted.invalid/not-followed","cursors":{"after":"next-comments"}}}
+        def graph(method,endpoint,payload=None):
+            if "/media?" in endpoint:
+                return {"data":[{"id":"900","comments_count":70}]}
+            if "/comments?" in endpoint:
+                return {"data":[self.api_comment()]} if "after=next-comments" in endpoint else first
+            return self.graph(method,endpoint,payload)
+        self.gateway.graph.side_effect=graph
+        self.gateway.sync_comments(campaign.load_settings(self.path))
+        with sqlite3.connect(self.gateway.database) as con:
+            self.assertEqual(con.execute("SELECT watermark,cursor FROM comment_media").fetchone(),(0,"next-comments"))
+        self.gateway.last_comment_sync=0
+        self.gateway.sync_comments(campaign.load_settings(self.path))
+        self.assertIn(("comment:400","pending",""),self.rows())
+        self.assertTrue(self.gateway.graph.call_args.args[1].startswith("900/comments?"))
+        with sqlite3.connect(self.gateway.database) as con:
+            watermark,cursor=con.execute("SELECT watermark,cursor FROM comment_media").fetchone()
+        self.assertGreater(watermark,0)
+        self.assertEqual(cursor,"")
+
+    def test_comment_sync_paginates_media_and_rotates_old_and_new_posts(self):
+        self.comment_sync_fixture([])
+        checked=[]
+        def graph(method,endpoint,payload=None):
+            if "/media?" in endpoint:
+                if "after=next-media" in endpoint:
+                    return {"data":[{"id":"901","comments_count":1}]}
+                return {"data":[{"id":"900","comments_count":1}],"paging":{
+                    "next":"https://untrusted.invalid/ignored","cursors":{"after":"next-media"}}}
+            checked.append(endpoint.split("/",1)[0])
+            return {"data":[]}
+        self.gateway.graph.side_effect=graph
+        self.gateway.sync_comments(campaign.load_settings(self.path))
+        self.gateway.last_comment_sync=0
+        self.gateway.sync_comments(campaign.load_settings(self.path))
+        self.assertEqual(checked,["900","901"])
+        with sqlite3.connect(self.gateway.database) as con:
+            self.assertEqual(con.execute("SELECT count(*) FROM comment_media").fetchone()[0],2)
+
+    def test_comment_sync_rate_limit_waits_and_malformed_cursor_never_follows_next_url(self):
+        self.comment_sync_fixture([])
+        self.gateway.graph.side_effect=GraphError(code=429)
+        self.gateway.sync_comments(campaign.load_settings(self.path))
+        self.gateway.sync_comments(campaign.load_settings(self.path))
+        self.assertEqual(self.gateway.graph.call_count,1)
+        self.assertEqual(self.gateway.comments_status["last_error"],"meta_429")
+        self.assertEqual(self.rows(),[])
+        with self.assertRaises(ValueError):
+            Gateway.next_cursor({"paging":{"next":"https://untrusted.invalid/ignored"}})
+
+    def test_comment_sync_keyword_change_does_not_replay_already_scanned_old_comments(self):
+        self.comment_sync_fixture([self.api_comment(text="Видео",stamp=time.time()-5)])
+        settings=campaign.load_settings(self.path)
+        self.gateway.sync_comments(settings)
+        settings["keywords"]=["видео"]
+        self.gateway.last_comment_sync=0
+        self.gateway.sync_comments(settings)
+        self.assertEqual(self.rows(),[])
 
     def test_graph_hosts_match_token_family_and_unknown_mode_never_sends_credentials(self):
         for mode, host in (("instagram_login", "graph.instagram.com"), ("unified_login", "graph.facebook.com"),
