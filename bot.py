@@ -49,6 +49,7 @@ PROJECT_KEY = os.getenv("PROJECT_KEY", "creative_brain")
 OFFER_VERSION = os.getenv("OFFER_VERSION", "1")
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002468345259"))
+CLUB_SPOOL_DIR = os.getenv("CLUB_SPOOL_DIR", "/srv/mozg_webapp/spool")
 ENV_OFFER_URL = os.getenv("OFFER_URL", "").strip()
 YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@").strip()
@@ -2159,6 +2160,26 @@ async def instagram_limits_job(ctx):
         logger.warning("Instagram quota status could not be read")
 
 
+async def club_feed_spool(update, ctx):
+    """Передаёт посты закрытого канала веб-аппу BioMozg+ через папку-очередь.
+
+    Веб-апп не может сам получать обновления: polling на токен один. Здесь только
+    запись файла; содержимое обрабатывает служба mozg_webapp. Ошибка записи не
+    влияет на работу бота.
+    """
+    post = update.channel_post or update.edited_channel_post
+    if not post or post.chat.id != CHANNEL_ID or not os.path.isdir(CLUB_SPOOL_DIR):
+        return
+    name = f"{update.update_id:020d}.json"
+    tmp = os.path.join(CLUB_SPOOL_DIR, f".{name}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(update.to_dict(), fh, ensure_ascii=False)
+        os.replace(tmp, os.path.join(CLUB_SPOOL_DIR, name))
+    except OSError:
+        logger.warning("club feed spool write failed")
+
+
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
@@ -2173,6 +2194,7 @@ def build_application() -> Application:
     app.add_handler(ChatMemberHandler(channel_member_updated, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(channel_join_request))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND,group_activity),group=1)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, club_feed_spool), group=2)
     app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, fallback_message))
     if app.job_queue is None:
