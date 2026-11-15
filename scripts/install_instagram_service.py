@@ -133,4 +133,4 @@ if __name__ == "__main__":
     if parser.parse_args().apply:
         install()
     else:
-        print("Plan: install isolated adapter + two n8n HTTPS routes + Telegram admin config paths. Use --apply to install.")
+        print("Plan: install isolated adapter + two HTTPS routes on the n8n.* domain + Telegram admin config paths. Use --apply to install.")

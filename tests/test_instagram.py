@@ -1043,3 +1043,37 @@ class GatewayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TickerTests(unittest.TestCase):
+    def test_ticker_posts_runner_token_to_local_gateway(self):
+        import importlib.util
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        spec = importlib.util.spec_from_file_location(
+            "instagram_ticker", Path(__file__).resolve().parents[1] / "automation" / "instagram_ticker.py")
+        ticker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ticker)
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen["path"] = self.path
+                seen["auth"] = self.headers.get("Authorization")
+                seen["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        with tempfile.TemporaryDirectory() as tmp:
+            creds = Path(tmp) / "credentials.json"
+            creds.write_text(json.dumps({"runner_token": "t0k"}))
+            url = "http://127.0.0.1:%d/instagram/runner" % server.server_port
+            self.assertEqual(ticker.tick(str(creds), url), 200)
+        server.server_close()
+        self.assertEqual(seen, {"path": "/instagram/runner", "auth": "Bearer t0k", "body": b"{}"})

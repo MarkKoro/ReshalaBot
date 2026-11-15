@@ -1,7 +1,7 @@
-"""Small isolated Meta webhook/queue adapter, driven by the n8n runner workflow.
+"""Small isolated Meta webhook/queue adapter, driven by biomozg-instagram-ticker (every 5 s).
 
 Only campaign settings are shared with the Telegram admin. This process has no
-access to the Telegram token, customer/payment database or n8n database.
+access to the Telegram token, customer/payment database.
 """
 from __future__ import annotations
 

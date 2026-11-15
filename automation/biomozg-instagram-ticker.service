@@ -1,0 +1,23 @@
+[Unit]
+Description=Biomozg Instagram runner tick every 5s (replaces n8n schedule)
+After=biomozg-instagram.service
+Wants=biomozg-instagram.service
+
+[Service]
+Type=simple
+User=biomozg-instagram
+Group=biomozg-instagram
+ExecStart=/usr/bin/python3 -u /usr/local/lib/biomozg-instagram/ticker.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=48M
+CPUQuota=5%
+TasksMax=8
+
+[Install]
+WantedBy=multi-user.target
