@@ -893,14 +893,20 @@ async def save_invite_link(tg_user_id: int, invite_link: str, payment_id: str | 
     await db.commit()
 
 
+# Тестовые оплаты ЮKassa (raw_json.test = true) не деньги: их не считаем в оплатах, выручке и воронке.
+IS_TEST_PAYMENT_SQL = "(CASE WHEN json_valid(raw_json) THEN COALESCE(json_extract(raw_json, '$.test'), 0) ELSE 0 END = 1)"
+REAL_PAID_SQL = f"finalized_at IS NOT NULL AND NOT {IS_TEST_PAYMENT_SQL}"
+TEST_PAID_EVENT_KEYS_SQL = f"SELECT 'paid:' || payment_id FROM payments WHERE {IS_TEST_PAYMENT_SQL}"
+
+
 @serialized
 async def stats() -> dict[str, Any]:
     db = await connection()
     queries = {
         "users_count": "SELECT COUNT(*) AS value FROM users",
         "accepted_offer_count": "SELECT COUNT(*) AS value FROM users WHERE accepted_offer_at IS NOT NULL",
-        "paid_count": "SELECT COUNT(*) AS value FROM payments WHERE finalized_at IS NOT NULL",
-        "revenue_rub": "SELECT COALESCE(SUM(amount_rub), 0) AS value FROM payments WHERE finalized_at IS NOT NULL",
+        "paid_count": f"SELECT COUNT(*) AS value FROM payments WHERE {REAL_PAID_SQL}",
+        "revenue_rub": f"SELECT COALESCE(SUM(amount_rub), 0) AS value FROM payments WHERE {REAL_PAID_SQL}",
         "active_subscriptions_count": "SELECT COUNT(*) AS value FROM subscriptions WHERE status = 'active' AND julianday(access_until) > julianday(?)",
     }
     result: dict[str, Any] = {}
@@ -1162,21 +1168,23 @@ async def get_user_path(tg_user_id: int, limit: int = 25) -> list[dict]:
 async def funnel_stats() -> dict:
     db = await connection()
     result = await stats()
-    async with db.execute("SELECT event_name, COUNT(*) total, COUNT(DISTINCT tg_user_id) users FROM funnel_events GROUP BY event_name") as cur:
+    async with db.execute(f"SELECT event_name, COUNT(*) total, COUNT(DISTINCT tg_user_id) users FROM funnel_events "
+                          f"WHERE COALESCE(event_key, '') NOT IN ({TEST_PAID_EVENT_KEYS_SQL}) GROUP BY event_name") as cur:
         result["events"] = {row["event_name"]: dict(row) for row in await cur.fetchall()}
     result["conversions"] = {}
     for event in ("start", "product_opened"):
-        async with db.execute("""
+        async with db.execute(f"""
             SELECT COUNT(DISTINCT e.tg_user_id) FROM funnel_events e
             WHERE e.event_name = ? AND EXISTS (
                 SELECT 1 FROM funnel_events p WHERE p.event_name = 'payment_succeeded'
-                AND p.tg_user_id = e.tg_user_id AND p.created_at >= e.created_at)
+                AND p.tg_user_id = e.tg_user_id AND p.created_at >= e.created_at
+                AND COALESCE(p.event_key, '') NOT IN ({TEST_PAID_EVENT_KEYS_SQL}))
         """, (event,)) as cur:
             result["conversions"][event] = int((await cur.fetchone())[0])
-    async with db.execute("""
+    async with db.execute(f"""
         SELECT COALESCE(u.first_source, 'unknown') source,
             SUM(EXISTS(SELECT 1 FROM funnel_events e WHERE e.tg_user_id = u.tg_user_id AND e.event_name = 'start')) starts,
-            SUM(EXISTS(SELECT 1 FROM payments p WHERE p.tg_user_id = u.tg_user_id AND p.finalized_at IS NOT NULL)) paid
+            SUM(EXISTS(SELECT 1 FROM payments p WHERE p.tg_user_id = u.tg_user_id AND {REAL_PAID_SQL.replace('raw_json', 'p.raw_json').replace('finalized_at', 'p.finalized_at')})) paid
         FROM users u GROUP BY COALESCE(u.first_source, 'unknown') ORDER BY starts DESC, source
     """) as cur:
         result["sources"] = [dict(row) for row in await cur.fetchall()]
@@ -1578,10 +1586,12 @@ async def funnel_breakdown(days=30):
     stages = ['start','lead_magnet_sent','product_opened','tariffs_opened','buy_clicked','offer_accepted','payment_created','payment_succeeded','channel_joined']
     con = await connection()
     since = (utcnow()-timedelta(days=days)).isoformat() if days else '0001-01-01'
-    async with con.execute("""WITH cohort AS (SELECT tg_user_id,MIN(created_at) entry FROM funnel_events
-        WHERE event_name='start' GROUP BY tg_user_id HAVING MIN(created_at)>=?)
+    async with con.execute(f"""WITH cohort AS (SELECT tg_user_id,MIN(created_at) entry FROM funnel_events
+        WHERE event_name='start' GROUP BY tg_user_id HAVING MIN(created_at)>=?),
+        test_paid AS ({TEST_PAID_EVENT_KEYS_SQL})
         SELECT e.tg_user_id,e.event_name FROM funnel_events e JOIN cohort c USING(tg_user_id)
-        WHERE e.created_at>=c.entry GROUP BY e.tg_user_id,e.event_name""",(since,)) as cur:
+        WHERE e.created_at>=c.entry AND COALESCE(e.event_key,'') NOT IN (SELECT * FROM test_paid)
+        GROUP BY e.tg_user_id,e.event_name""",(since,)) as cur:
         rows = await cur.fetchall()
     users = {}
     for row in rows:
